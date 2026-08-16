@@ -1,0 +1,42 @@
+packaging/ElectionTest/stub_out/
+x64/
+Binaries/
+
+# Visual Studio user/cache
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Build outputs
+[Dd]ebug/
+[Rr]elease/
+[xX]64/
+[xX]86/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.idb
+*.ipdb
+*.iobj
+*.log
+*.tlog
+*.recipe
+*.lastbuildstate
+
+# MSBuild intermediate folders with hashed names
+*.vcxproj.FileListAbsolute.txt
+*.Build.CppClean.log
+*.unsuccessfulbuild
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+tools/out/
+
+# Local leftovers
+example1.log
