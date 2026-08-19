@@ -18,6 +18,8 @@ Binaries/
 *.pdb
 *.ilk
 *.lib
+!DllLoader/resources/
+!DllLoader/resources/*.lib
 *.exp
 *.idb
 *.ipdb
