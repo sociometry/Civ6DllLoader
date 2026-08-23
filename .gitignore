@@ -1,6 +1,7 @@
 packaging/ElectionTest/stub_out/
 x64/
 Binaries/
+docs/
 
 # Visual Studio user/cache
 .vs/
@@ -8,6 +9,7 @@ Binaries/
 *.suo
 *.VC.db
 *.VC.opendb
+*.aps
 
 # Build outputs
 [Dd]ebug/

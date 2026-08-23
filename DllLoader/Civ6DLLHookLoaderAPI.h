@@ -22,6 +22,5 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
 bool InitializeLoader(HMODULE hModule);
 HMODULE Create();
 bool AttachGameCore(HMODULE gameCore);
-void LoadPlugins();
 void CleanupLoader();
 void BroadcastLoaderMessage(const char* topic, const void* data, size_t len);

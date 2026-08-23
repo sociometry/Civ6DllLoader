@@ -1,3 +1,4 @@
+#include "pch.h"
 #include "EnabledMods.h"
 #include "../DllLoader/Logger.h"
 #include "../third_party/sqlite/sqlite3.h"

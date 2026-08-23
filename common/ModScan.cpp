@@ -1,3 +1,4 @@
+#include "pch.h"
 #include "ModScan.h"
 #include "EnabledMods.h"
 #include "LoaderProtocol.h"
@@ -84,30 +85,6 @@ void CollectRuntimesUnderContentRoot(const fs::path& contentRoot, std::vector<st
     }
 }
 
-void CollectPluginsUnderContentRoot(const fs::path& contentRoot, std::vector<std::wstring>& out) {
-    std::error_code rootEc;
-    if (!fs::is_directory(contentRoot, rootEc)) return;
-
-    std::error_code iterEc;
-    for (fs::directory_iterator it(contentRoot, iterEc), end; !iterEc && it != end; it.increment(iterEc)) {
-        std::error_code entryEc;
-        if (!it->is_directory(entryEc)) continue;
-
-        const fs::path pluginDir = it->path() / L"Binaries" / L"Win64" / L"Plugins";
-        std::error_code pluginEc;
-        if (!fs::is_directory(pluginDir, pluginEc)) continue;
-
-        std::error_code dllEc;
-        for (fs::directory_iterator dit(pluginDir, dllEc), dend; !dllEc && dit != dend; dit.increment(dllEc)) {
-            std::error_code fileEc;
-            if (!dit->is_regular_file(fileEc)) continue;
-            if (!ShouldSkipPluginFile(dit->path())) {
-                AddUniqueNormalized(out, dit->path());
-            }
-        }
-    }
-}
-
 void DedupPluginsByFilename(std::vector<std::wstring>& paths) {
     std::set<std::wstring> seenNames;
     std::vector<std::wstring> filtered;
@@ -169,6 +146,63 @@ void FilterByEnabledMods(std::vector<std::wstring>& paths, HMODULE shellModule, 
         Logger::Log("Skipping disabled/absent mod %s: %s", what, WideToNarrow(path).c_str());
     }
     paths.swap(filtered);
+}
+
+}  // namespace
+
+namespace {
+
+// v2: collect <mod>/Binaries/Win64/Plugins/<pluginSubdir>/*.dll candidates under one content root
+// (Plugins\Global\ and Plugins\GameCore\ hierarchy one level deeper than the legacy flat Plugins\ scan).
+void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::path& pluginSubdir,
+                                       std::vector<std::wstring>& out) {
+    std::error_code rootEc;
+    if (!fs::is_directory(contentRoot, rootEc)) return;
+
+    std::error_code iterEc;
+    for (fs::directory_iterator it(contentRoot, iterEc), end; !iterEc && it != end; it.increment(iterEc)) {
+        std::error_code entryEc;
+        if (!it->is_directory(entryEc)) continue;
+
+        const fs::path pluginDir = it->path() / L"Binaries" / L"Win64" / L"Plugins" / pluginSubdir;
+        std::error_code pluginEc;
+        if (!fs::is_directory(pluginDir, pluginEc)) continue;
+
+        std::error_code dllEc;
+        for (fs::directory_iterator dit(pluginDir, dllEc), dend; !dllEc && dit != dend; dit.increment(dllEc)) {
+            std::error_code fileEc;
+            if (!dit->is_regular_file(fileEc)) continue;
+            if (!ShouldSkipPluginFile(dit->path())) {
+                AddUniqueNormalized(out, dit->path());
+            }
+        }
+    }
+}
+
+// v2 shared pipeline: scan roots -> EnabledMods filter -> case-insensitive lexicographic sort ->
+// basename dedup (order/filter/dedup mirrors the legacy flat Plugins scan).
+std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir) {
+    // v2 运行时无 shell 模块句柄可传：以当前进程可执行模块为锚（游戏进程内 Loader/version.dll 场景）。
+    HMODULE anchor = GetModuleHandleW(nullptr);
+    std::vector<std::wstring> out;
+    for (const auto& root : CollectScanRoots(anchor)) {
+        CollectPluginsUnderContentRootDir(root, pluginSubdir, out);
+    }
+    FilterByEnabledMods(out, anchor, "plugin");
+
+    std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
+        // Case-insensitive lexicographic order for stable load order (mirrors legacy flat scan).
+        const size_t n = (std::min)(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) {
+            const wchar_t ca = towlower(a[i]);
+            const wchar_t cb = towlower(b[i]);
+            if (ca != cb) return ca < cb;
+        }
+        return a.size() < b.size();
+    });
+
+    DedupPluginsByFilename(out);
+    return out;
 }
 
 }  // namespace
@@ -242,43 +276,12 @@ std::vector<std::wstring> FindRuntimeCandidates(HMODULE shellModule) {
     return out;
 }
 
-std::vector<std::wstring> FindPluginCandidates(HMODULE shellModule) {
-    std::vector<std::wstring> out;
-    const std::wstring shellDir = GetModuleDirectory(shellModule);
+std::vector<std::wstring> FindGlobalPluginCandidates() {
+    return FindSubdirPluginCandidates(L"Global");
+}
 
-    std::error_code localEc;
-    const fs::path localPlugins = fs::path(shellDir) / L"Plugins";
-    if (fs::is_directory(localPlugins, localEc)) {
-        std::error_code dllEc;
-        for (fs::directory_iterator dit(localPlugins, dllEc), dend; !dllEc && dit != dend; dit.increment(dllEc)) {
-            std::error_code fileEc;
-            if (!dit->is_regular_file(fileEc)) continue;
-            if (!ShouldSkipPluginFile(dit->path())) {
-                AddUniqueNormalized(out, dit->path());
-            }
-        }
-    }
-
-    for (const auto& root : CollectScanRoots(shellModule)) {
-        CollectPluginsUnderContentRoot(root, out);
-    }
-
-    // Filter before basename dedup so a disabled mod cannot win the slot.
-    FilterByEnabledMods(out, shellModule, "plugin");
-
-    std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
-        // Case-insensitive lexicographic order for stable load order.
-        const size_t n = (std::min)(a.size(), b.size());
-        for (size_t i = 0; i < n; ++i) {
-            const wchar_t ca = towlower(a[i]);
-            const wchar_t cb = towlower(b[i]);
-            if (ca != cb) return ca < cb;
-        }
-        return a.size() < b.size();
-    });
-
-    DedupPluginsByFilename(out);
-    return out;
+std::vector<std::wstring> FindGameCorePluginCandidates() {
+    return FindSubdirPluginCandidates(L"GameCore");
 }
 
 bool ShouldSkipPluginFile(const fs::path& path) {

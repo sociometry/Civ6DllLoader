@@ -1,19 +1,19 @@
+#include "pch.h"
 #include "ShellBootstrap.h"
 #include "../common/LoaderProtocol.h"
 #include "../common/ModScan.h"
+#include "../common/RestartGame.h"
 #include "Logger.h"
 
 #include <algorithm>
 #include <string>
-#include <utility>
 #include <vector>
+
+#pragma comment(lib, "user32.lib")
 
 namespace ShellBootstrap {
 
 namespace {
-
-HMODULE g_electedRuntime = nullptr;
-LoaderShutdownFn g_loaderShutdown = nullptr;
 
 struct RuntimeCandidate {
     std::wstring path;
@@ -31,6 +31,7 @@ bool BetterThan(const RuntimeCandidate& a, const RuntimeCandidate& b) {
     return a.path < b.path;
 }
 
+// Probe a candidate runtime module: LoadLibrary + GetLoaderVersion export + read version.
 bool ProbeRuntimeVersion(const std::wstring& path, uint32_t& outVersion) {
     HMODULE mod = LoadModuleFromPath(path);
     if (!mod) {
@@ -39,15 +40,22 @@ bool ProbeRuntimeVersion(const std::wstring& path, uint32_t& outVersion) {
     }
 
     auto getVersion = reinterpret_cast<GetLoaderVersionFn>(GetProcAddress(mod, "GetLoaderVersion"));
-    auto start = reinterpret_cast<LoaderStartFn>(GetProcAddress(mod, "LoaderStart"));
-    const bool ok = getVersion && start;
+    const bool ok = getVersion != nullptr;
     if (ok) {
         outVersion = getVersion();
     } else {
-        Logger::Log("Runtime missing exports: %ls", path.c_str());
+        Logger::Log("Runtime missing GetLoaderVersion export: %ls", path.c_str());
     }
     FreeLibrary(mod);
     return ok;
+}
+
+// Full path of the running process executable (e.g. ...\CivilizationVI.exe).
+std::wstring GetProcessExePath() {
+    wchar_t buf[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    return std::wstring(buf, n);
 }
 
 }  // namespace
@@ -95,82 +103,82 @@ HMODULE LoadRealGameCore() {
     return gameCore;
 }
 
-HMODULE ElectAndStartRuntime(HMODULE shellModule, HMODULE gameCoreModule, void* baseDllCreateGameContext) {
-    if (g_electedRuntime) {
-        return g_electedRuntime;
+bool InstallLoaderIfMissing(HMODULE shellModule) {
+    // Install at most once per process; the game may create/destroy game
+    // contexts repeatedly within one session (reload cycles).
+    static bool s_attempted = false;
+    static bool s_installed = false;
+    if (s_attempted) return s_installed;
+    s_attempted = true;
+
+    // a. Compute the exe directory from the current process image.
+    const std::wstring exePath = GetProcessExePath();
+    const size_t slash = exePath.find_last_of(L"\\/");
+    if (exePath.empty() || slash == std::wstring::npos) {
+        Logger::Log("InstallLoaderIfMissing: cannot resolve exe directory (path=%ls)", exePath.c_str());
+        return false;
+    }
+    const std::wstring exeDir = exePath.substr(0, slash);
+    const std::wstring versionDll = exeDir + L"\\version.dll";
+
+    // b. Loader already installed -> zero action (no copy, no message box).
+    const DWORD attr = GetFileAttributesW(versionDll.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        Logger::Log("InstallLoaderIfMissing: already installed: %ls", versionDll.c_str());
+        s_installed = true;
+        return s_installed;
     }
 
+    // c. Collect candidates from enabled mods (ModScan applies the EnabledMods
+    //    filter internally), probe versions, elect the highest
+    //    (tie -> lexicographically smaller path).
     const auto paths = ModScan::FindRuntimeCandidates(shellModule);
-    Logger::Log("Found %zu runtime candidate(s)", paths.size());
+    Logger::Log("InstallLoaderIfMissing: found %zu runtime candidate(s)", paths.size());
 
     std::vector<RuntimeCandidate> ranked;
     ranked.reserve(paths.size());
     for (const auto& path : paths) {
         uint32_t version = 0;
         if (!ProbeRuntimeVersion(path, version)) continue;
-        Logger::Log("Candidate %ls version=0x%08X", path.c_str(), version);
+        Logger::Log("InstallLoaderIfMissing: candidate %ls version=0x%08X", path.c_str(), version);
         ranked.push_back(RuntimeCandidate{path, version});
     }
 
     if (ranked.empty()) {
-        Logger::Log("No usable Civ6DllLoader.runtime.dll found");
-        return nullptr;
+        // e. No usable candidate -> silent + log only (never a message box).
+        Logger::Log("InstallLoaderIfMissing: no usable Civ6DllLoader.runtime.dll found; loader stays missing");
+        return false;
     }
-
-    // Ranked list already preferred highest version; try elected first, then fallbacks.
     std::sort(ranked.begin(), ranked.end(), BetterThan);
+    const std::wstring& bestPath = ranked.front().path;
+    Logger::Log("InstallLoaderIfMissing: elected %ls (version=0x%08X)", bestPath.c_str(), ranked.front().version);
 
-    LoaderHost host{};
-    host.hostAbiVersion = CIV6_DLL_LOADER_HOST_ABI;
-    host.structSize = static_cast<uint32_t>(sizeof(host));
-    host.shellModule = shellModule;
-    host.gameCoreModule = gameCoreModule;
-    host.baseDllCreateGameContext = reinterpret_cast<DllCreateGameContextFn>(baseDllCreateGameContext);
+    // d. Copy to exe-dir\version.tmp, atomic rename to version.dll, cleanup,
+    //    then announce. Any failure below is silent + logged only.
+    const std::wstring tmp = exeDir + L"\\version.tmp";
+    if (!CopyFileW(bestPath.c_str(), tmp.c_str(), FALSE)) {
+        Logger::Log("InstallLoaderIfMissing: CopyFileW failed for %ls (err=%lu)", bestPath.c_str(), GetLastError());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), versionDll.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        Logger::Log("InstallLoaderIfMissing: MoveFileExW failed (err=%lu); removing tmp", GetLastError());
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    // Best-effort stale-backup cleanup; failure is ignored.
+    DeleteFileW((exeDir + L"\\version_Old.dll").c_str());
 
-    for (const auto& candidate : ranked) {
-        HMODULE mod = LoadModuleFromPath(candidate.path);
-        if (!mod) {
-            Logger::Log("LoadLibrary failed for %ls (err=%lu)", candidate.path.c_str(), GetLastError());
-            continue;
-        }
-
-        auto getVersion = reinterpret_cast<GetLoaderVersionFn>(GetProcAddress(mod, "GetLoaderVersion"));
-        auto start = reinterpret_cast<LoaderStartFn>(GetProcAddress(mod, "LoaderStart"));
-        auto shutdown = reinterpret_cast<LoaderShutdownFn>(GetProcAddress(mod, "LoaderShutdown"));
-        if (!getVersion || !start) {
-            Logger::Log("Runtime exports missing after load: %ls", candidate.path.c_str());
-            FreeLibrary(mod);
-            continue;
-        }
-
-        const int rc = start(&host);
-        if (rc != 0) {
-            Logger::Log("LoaderStart failed (%d) for %ls", rc, candidate.path.c_str());
-            FreeLibrary(mod);
-            continue;
-        }
-
-        g_electedRuntime = mod;
-        g_loaderShutdown = shutdown;
-        Logger::Log("Runtime started: %ls", candidate.path.c_str());
-        return g_electedRuntime;
+    MessageBoxW(nullptr,
+        L"Civ6 DLL Loader 已安装，点击确定立即重启游戏。\nCiv6 DLL Loader installed. Click OK to restart the game now.",
+        L"Civ6 DLL Loader",
+        MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    if (!RestartGame::LaunchAndExit()) {
+        Logger::Log("InstallLoaderIfMissing: restart failed err=%lu; session continues", GetLastError());
     }
 
-    Logger::Log("All runtime candidates failed to start");
-    return nullptr;
-}
-
-void ShutdownRuntime() {
-    // Idempotent: normal teardown runs from DllDestroyGameContext.
-    LoaderShutdownFn shutdown = g_loaderShutdown;
-    g_loaderShutdown = nullptr;
-    if (shutdown) {
-        shutdown();
-    }
-    if (g_electedRuntime) {
-        FreeLibrary(g_electedRuntime);
-        g_electedRuntime = nullptr;
-    }
+    s_installed = true;
+    Logger::Log("InstallLoaderIfMissing: installed %ls -> %ls", bestPath.c_str(), versionDll.c_str());
+    return s_installed;
 }
 
 }  // namespace ShellBootstrap

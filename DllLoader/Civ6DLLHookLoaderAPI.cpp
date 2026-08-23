@@ -21,13 +21,68 @@
 
 #include <cstdarg>
 #include <cstdlib>
+#include <cwchar>
+#include <cwctype>
+#include <unordered_set>
+
+#include "../DllLoaderRuntime/PatchRegistry.h"
+#include "../DllLoaderRuntime/LoaderCore.h"
 
 using namespace std;
 
 static Civ6MessageBus g_bus;
 
 static HMODULE g_loaderModule = NULL;
-static vector<HMODULE> g_pluginHandles;
+
+// v2 插件跟踪项：路径 + 句柄 + 名字(stem，作 Patch owner / OnMessage 注册名) + 类别(Global/GameCore)。
+struct PluginEntry {
+    HMODULE handle = nullptr;
+    std::wstring path;
+    std::wstring name;
+    LoaderCore::PluginCategory category = LoaderCore::PluginCategory::Global;
+};
+static vector<PluginEntry> g_plugins;
+
+// 当前正在加载/卸载的插件名（去扩展名的文件名 stem）。OnLoad/OnUnload 期间由
+// SetActivePluginName 设置；HookPatch 与 InstallHookImpl 用它作 owner，使卸载时能对上号。
+static wchar_t g_activePluginName[64];
+
+static void SetActivePluginName(const wchar_t* name) {
+    if (!name || !*name) {
+        g_activePluginName[0] = L'\0';
+        return;
+    }
+    wcsncpy_s(g_activePluginName, _countof(g_activePluginName), name, _TRUNCATE);
+}
+
+// 插件通过 HookAPI.InstallHook 注册的 MinHook 目标 → owner 插件名。
+// owner 为空串 = Loader 自身（非插件）在加载阶段注册的钩子，插件卸载时不撤销。
+// 插件卸载时据此精确 MH_DisableHook + MH_RemoveHook，避免 GameCore 重载后
+// 同一 target 再次 MH_CreateHook 报 MH_ERROR_ALREADY_CREATED。
+static std::unordered_map<void*, std::wstring> g_pluginHookOwners;
+
+// 阶段 B 是否已完成（InitializeGameCorePhase 成功置 true；ResetForReload 复位）。
+static bool g_gameCorePhaseReady = false;
+
+// 规范化路径比较：小写 + '/'→'\\'（候选均为绝对路径，词法规范化即可）。
+static std::wstring NormalizePluginPath(const std::wstring& path) {
+    std::wstring norm = path;
+    for (wchar_t& ch : norm) {
+        if (ch == L'/') {
+            ch = L'\\';
+        } else {
+            ch = std::towlower(ch);
+        }
+    }
+    return norm;
+}
+
+// 按路径含 \Plugins\Global\（大小写不敏感）判类别；其余视为 GameCore。
+static LoaderCore::PluginCategory CategoryForPath(const std::wstring& path) {
+    return NormalizePluginPath(path).find(L"\\plugins\\global\\") != std::wstring::npos
+        ? LoaderCore::PluginCategory::Global
+        : LoaderCore::PluginCategory::GameCore;
+}
 
 static HMODULE g_GameCore;
 static uintptr_t g_GameCoreAddress;
@@ -40,10 +95,6 @@ HANDLE GameProcess;
 uintptr_t BaseAddress;
 
 
-//static unordered_map<string, uintptr_t> g_PushMethodsAddresses = {
-//    {"GameCore::Cache::Lua::IQuestsManager", 0x6B8750},
-//    {"GameCore::Lua::IQuestsManager", 0x6FA1A0},
-//};
 static unordered_map<string, PushMethodSigType> g_MethodSignatureTable = {
     {"GameCore::Cache::Lua::IQuestsManager", PushMethodSigType::WithManager},
     {"GameCore::Lua::IQuestsManager", PushMethodSigType::NoManager},
@@ -68,73 +119,6 @@ static unordered_map<string, vector<LuaMethodInfo>> g_LuaMethodLists;
 // ????detour????????????????
 static unordered_map<string, void*> g_OriginalFunctions;
 
-//void InitLuaMethodHooks(HookAPI* api) {
-//    for (const auto& [targetName, methodList] : g_LuaMethodLists) {
-//        auto it = g_PushMethodAddresses.find(targetName);
-//        if (it == g_PushMethodAddresses.end()) {
-//            cerr << "[Hook] Target " << targetName << " not found.\n";
-//            continue;
-//        }
-//
-//        void* target = api->GetFunctionByName(targetName.c_str());
-//        if (!target) {
-//            cerr << "[Hook] Function " << targetName << " address is null.\n";
-//            continue;
-//        }
-//
-//        // ???? detour ????
-//        auto detour = CreateLuaPushDetour(targetName);
-//        if (!detour) {
-//            cerr << "[Hook] Failed to create detour for " << targetName << "\n";
-//            continue;
-//        }
-//
-//        void* original = nullptr;
-//        if (MH_CreateHook(target, detour, &original) != MH_OK ||
-//            MH_EnableHook(target) != MH_OK) {
-//            cerr << "[Hook] MH hook failed for " << targetName << "\n";
-//            continue;
-//        }
-//
-//        g_OriginalFunctions[targetName] = original;
-//        cout << "[Hook] Hooked " << targetName << "\n";
-//    }
-//}
-
-//void RegisterLuaMethods(const LuaMethodRegistration& registration) {
-//    g_PushMethodAddresses[registration.name] = (void*)registration.pushMethodOffset;
-//    g_LuaMethodLists[registration.name] = registration.methods;
-//}
-
-//void* CreateLuaPushDetour(const string& targetName) {
-//    auto it = g_LuaMethodLists.find(targetName);
-//    if (it == g_LuaMethodLists.end()) return nullptr;
-//
-//    const auto& methodList = it->second;
-//    void* originalFunc = nullptr;
-//
-//    // lambda???????????????????detour
-//    if (targetName.starts_with("Cache::")) {
-//        // ????? Cache ????
-//        return (void*)__fastcall + [](void* manager, hks::lua_State* L, int stackOffset) {
-//            auto orig = reinterpret_cast<CachePushMethodFunc>(g_OriginalFunctions[targetName]);
-//            for (auto& m : g_LuaMethodLists[targetName]) {
-//                PushLuaMethod(L, m.luaMethodFunc, m.internalName.c_str(), stackOffset, m.exposedName.c_str());
-//            }
-//            orig(manager, L, stackOffset);
-//            };
-//    }
-//    else {
-//        return (void*)__fastcall + [](hks::lua_State* L, int stackOffset) {
-//            auto orig = reinterpret_cast<PushMethodFunc>(g_OriginalFunctions[targetName]);
-//            for (auto& m : g_LuaMethodLists[targetName]) {
-//                PushLuaMethod(L, m.luaMethodFunc, m.internalName.c_str(), stackOffset, m.exposedName.c_str());
-//            }
-//            orig(L, stackOffset);
-//            };
-//    }
-//}
-
 
 // ---------------- HookAPI ??? ----------------
 bool InstallHookImpl(void* target, void* detour, void** original) {
@@ -150,6 +134,10 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
         Logger::Log("InstallHook: enable failed %s", MH_StatusToString(status));
         return false;
     }
+
+    // 记录 target → owner（插件 OnLoad 期间 = 插件 stem；否则空串 = Loader 自身）。
+    // 插件卸载时据此撤销，避免 GameCore 重载后同一 target 再次 CreateHook 报 ALREADY_CREATED。
+    g_pluginHookOwners[target] = g_activePluginName[0] ? g_activePluginName : L"";
 
     return true;
 }
@@ -347,19 +335,6 @@ void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
     Logger::Log("RegisterScriptGlobalsForUI: hooked RegisterScriptDataForUI");
 }
 
-//static std::vector<LuaMethodInfo> g_detourMethods_NoManager;
-//static void(__fastcall* g_basePush_NoManager)(hks::lua_State*, int) = nullptr;
-//
-//static void __fastcall DetourPush_NoManager(hks::lua_State* L, int stackOffset) {
-//    for (auto& method : g_detourMethods_NoManager) {
-//        PushLuaMethod(L, method.luaMethodFunc, method.internalName.c_str(), stackOffset, method.exposedName.c_str());
-//    }
-//    if (g_basePush_NoManager) {
-//        std::cout << "DetourPush_NoManager 1" << endl;
-//        g_basePush_NoManager(L, stackOffset);
-//    }
-//        
-//}
 namespace {
 
 constexpr int kMaxPushHooks = 16;
@@ -894,6 +869,17 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
     return 1;
 }
 
+// ---------------- Patch/Unpatch (v2) ----------------
+
+static bool HookPatch(void* target, const void* bytes, size_t len) {
+    return PatchRegistry::Apply(target, bytes, len,
+        g_activePluginName[0] ? g_activePluginName : L"unknown");
+}
+
+static bool HookUnpatch(void* target) {
+    return PatchRegistry::Revert(target);
+}
+
 static HookAPI g_hookApi = {
     CIV6_HOOK_API_VERSION,
     static_cast<uint32_t>(sizeof(HookAPI)),
@@ -977,6 +963,9 @@ static HookAPI g_hookApi = {
     &ResolveSymbolImpl,
     &RegisterGameCoreRvaImpl,
     &RegisterPushMethodsTargetImpl,
+
+    &HookPatch,
+    &HookUnpatch,
 };
 
 typedef void (*OnLoadFunc)(HookAPI*);
@@ -1050,57 +1039,85 @@ static void CallOnUnloadSafe(OnUnloadFunc onUnload, const char* name) {
     }
 }
 
-void LoadPluginDLL(const char* name, const string& path) {
-    const std::wstring wpath = ModScan::NarrowToWide(path);
+// v2 统一插件加载流程：LoadLibraryExW + OnLoad(SEH) + OnMessage 自动注册 + 记录跟踪项。
+// nameNarrow = 显示名（通常为文件名，内部取 stem 作 Patch owner / OnMessage 名）；已加载（同句柄）返回 false。
+static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& nameNarrow,
+    LoaderCore::PluginCategory category) {
     HMODULE hPlugin = LoadLibraryExW(wpath.c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!hPlugin) {
-        Logger::Log("LoadPlugin failed: %s err=%lu", path.c_str(), GetLastError());
-        return;
+        Logger::Log("LoadPlugin failed: %s err=%lu", ModScan::WideToNarrow(wpath).c_str(), GetLastError());
+        return false;
     }
 
-    for (HMODULE existing : g_pluginHandles) {
-        if (existing == hPlugin) {
+    for (const auto& entry : g_plugins) {
+        if (entry.handle == hPlugin) {
             FreeLibrary(hPlugin);
-            return;
+            return false;
         }
     }
 
     auto onLoad = (OnLoadFunc)GetProcAddress(hPlugin, "OnLoad");
     if (!onLoad) {
-        Logger::Log("Plugin has no OnLoad export: %s", path.c_str());
+        Logger::Log("Plugin has no OnLoad export: %s", ModScan::WideToNarrow(wpath).c_str());
         FreeLibrary(hPlugin);
-        return;
+        return false;
     }
 
-    Logger::Log("Loaded plugin %s (%s)", name, path.c_str());
-    g_pluginHandles.push_back(hPlugin);
-    if (!CallOnLoadSafe(onLoad, name)) {
+    const std::string narrow = ModScan::WideToNarrow(wpath);
+
+    // 插件 stem（文件名去掉扩展名）作为 Patch owner；与 OnMessage 自动注册名一致。
+    std::wstring pluginStem;
+    {
+        std::string stemName = nameNarrow.empty() ? narrow : nameNarrow;
+        const size_t dot = stemName.find_last_of('.');
+        if (dot != std::string::npos) stemName = stemName.substr(0, dot);
+        pluginStem = ModScan::NarrowToWide(stemName);
+    }
+    Logger::Log("Loaded plugin %s (%s)", nameNarrow.c_str(), narrow.c_str());
+
+    PluginEntry entry;
+    entry.handle = hPlugin;
+    entry.path = wpath;
+    entry.name = pluginStem;
+    entry.category = category;
+    g_plugins.push_back(std::move(entry));
+
+    // OnLoad 期间暴露"当前插件名"给 Patch 作 owner；SEH 由 CallOnLoadSafe 包裹，
+    // 无论 OnLoad 正常返回还是崩溃，都要在返回后清空，防止污染后续插件。
+    SetActivePluginName(pluginStem.c_str());
+    const bool onLoadOk = CallOnLoadSafe(onLoad, nameNarrow.c_str());
+    SetActivePluginName(nullptr);
+
+    if (!onLoadOk) {
         // Keep the module mapped: a partially initialized plugin may already
         // have registered callbacks or detours into its image. Unmapping it
         // here would turn those pointers into immediate use-after-free.
-        Logger::Log("Plugin quarantined after OnLoad failure: %s", path.c_str());
-        return;
+        Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
+        return false;
     }
 
     auto onMessage = (OnMessageFunc)GetProcAddress(hPlugin, "OnMessage");
     if (onMessage) {
         // Register under filename stem so SendMessageTo("Example1", ...) works.
-        string handlerName = name ? name : path;
+        string handlerName = nameNarrow.empty() ? narrow : nameNarrow;
         const size_t dot = handlerName.find_last_of('.');
         if (dot != string::npos) handlerName = handlerName.substr(0, dot);
         RegisterMessageHandlerImpl(handlerName.c_str(), onMessage);
         Logger::Log("Auto-registered OnMessage for %s", handlerName.c_str());
     }
+    return true;
+}
+
+void LoadPluginDLL(const char* name, const string& path) {
+    const std::wstring wpath = ModScan::NarrowToWide(path);
+    LoadPluginDllInternal(wpath, name ? name : "", CategoryForPath(wpath));
 }
 
 void UnloadPlugins() {
-    for (HMODULE h : g_pluginHandles) {
-        auto onUnload = (OnUnloadFunc)GetProcAddress(h, "OnUnload");
-        if (onUnload) CallOnUnloadSafe(onUnload, nullptr);
-        FreeLibrary(h);
-    }
-    g_pluginHandles.clear();
+    // v1 兼容入口：全量卸载（先 GameCore 后 Global，与加载次序相反）。
+    LoaderCore::UnloadPluginsOf(LoaderCore::PluginCategory::GameCore);
+    LoaderCore::UnloadPluginsOf(LoaderCore::PluginCategory::Global);
 }
 
 string GetCurrentModuleDir() {
@@ -1125,16 +1142,6 @@ bool InitializeLoader(HMODULE hModule) {
     return true;
 }
 
-void LoadPlugins() {
-    if (!g_loaderModule) return;
-    const auto plugins = ModScan::FindPluginCandidates(g_loaderModule);
-    Logger::Log("Plugin candidates: %zu", plugins.size());
-    for (const auto& wpath : plugins) {
-        const string path = ModScan::WideToNarrow(wpath);
-        LoadPluginDLL(fs::path(path).filename().string().c_str(), path);
-    }
-}
-
 void CleanupLoader() {
     // Hooks may detour into plugin code — tear down MinHook before FreeLibrary.
     Runtime::Destroy();
@@ -1150,4 +1157,166 @@ void CleanupLoader() {
 
 void BroadcastLoaderMessage(const char* topic, const void* data, size_t len) {
     BroadcastMessageImpl(topic, data, len);
+}
+
+// ================= LoaderCore 实现（S3c：插件生命周期 v2） =================
+
+// 撤销某插件通过 HookAPI.InstallHook 注册的全部 MinHook 钩子（Disable + Remove）。
+// 在卸载插件的 FreeLibrary 之前调用；owner 为插件 stem（空串代表 Loader 自身，不在此撤销）。
+static void RemovePluginHooks(const wchar_t* owner) {
+    if (!owner || !*owner) return;
+    lock_guard<mutex> lock(g_hookMutex);
+    for (auto it = g_pluginHookOwners.begin(); it != g_pluginHookOwners.end(); ) {
+        if (it->second == owner) {
+            void* target = it->first;
+            MH_DisableHook(target);
+            MH_RemoveHook(target);
+            it = g_pluginHookOwners.erase(it);
+            Logger::Log("RemovePluginHooks: removed hook at %p (owner=%ls)", target, owner);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// 按跟踪项卸载单个插件（调用方保证 index 有效）：
+// OnUnload → PatchRegistry::RevertAllFor(name) → RemovePluginHooks(name) → FreeLibrary，语义与 S2a 接线一致。
+static void UnloadPluginEntryAt(size_t index) {
+    PluginEntry entry = std::move(g_plugins[index]);
+    g_plugins.erase(g_plugins.begin() + index);
+
+    auto onUnload = (OnUnloadFunc)GetProcAddress(entry.handle, "OnUnload");
+    // 暴露当前插件名：OnUnload 期间若有 Patch 调用也归到该 owner。
+    SetActivePluginName(entry.name.c_str());
+    if (onUnload) CallOnUnloadSafe(onUnload, nullptr);
+    // 先 OnUnload 后回滚补丁：插件 OnUnload 可能仍依赖自己的补丁。
+    // 必须在 FreeLibrary 之前回滚——补丁目标可能位于该插件自身映像内。
+    if (g_activePluginName[0]) {
+        PatchRegistry::RevertAllFor(g_activePluginName);
+    }
+    // 撤销该插件的 MinHook 钩子：否则 GameCore 重载后重新 OnLoad 会撞 MH_ERROR_ALREADY_CREATED。
+    RemovePluginHooks(g_activePluginName);
+    SetActivePluginName(nullptr);
+    FreeLibrary(entry.handle);
+    Logger::Log("Unloaded plugin %s", ModScan::WideToNarrow(entry.path).c_str());
+}
+
+static const char* CategoryNameForLog(LoaderCore::PluginCategory cat) {
+    return cat == LoaderCore::PluginCategory::GameCore ? "GameCore" : "Global";
+}
+
+void LoaderCore::LoadPluginsOf(PluginCategory cat) {
+    const auto wpaths = (cat == PluginCategory::GameCore)
+        ? ModScan::FindGameCorePluginCandidates()
+        : ModScan::FindGlobalPluginCandidates();
+    Logger::Log("LoadPluginsOf(%s): %zu candidate(s)", CategoryNameForLog(cat), wpaths.size());
+    for (const auto& wpath : wpaths) {
+        LoadSinglePlugin(wpath);
+    }
+}
+
+void LoaderCore::UnloadPluginsOf(PluginCategory cat) {
+    size_t unloaded = 0;
+    for (size_t i = g_plugins.size(); i-- > 0; ) {
+        if (g_plugins[i].category != cat) continue;
+        UnloadPluginEntryAt(i);
+        ++unloaded;
+    }
+    Logger::Log("UnloadPluginsOf(%s): unloaded=%zu remaining=%zu",
+        CategoryNameForLog(cat), unloaded, g_plugins.size());
+}
+
+bool LoaderCore::LoadSinglePlugin(const std::wstring& path) {
+    if (path.empty()) return false;
+    const std::wstring norm = NormalizePluginPath(path);
+    for (const auto& entry : g_plugins) {
+        if (NormalizePluginPath(entry.path) == norm) {
+            Logger::Log("LoadSinglePlugin: already loaded %s", ModScan::WideToNarrow(path).c_str());
+            return false;
+        }
+    }
+    const std::wstring filename = fs::path(path).filename().wstring();
+    return LoadPluginDllInternal(path, ModScan::WideToNarrow(filename), CategoryForPath(path));
+}
+
+void LoaderCore::UnloadSinglePlugin(const std::wstring& path) {
+    const std::wstring norm = NormalizePluginPath(path);
+    for (size_t i = 0; i < g_plugins.size(); ++i) {
+        if (NormalizePluginPath(g_plugins[i].path) != norm) continue;
+        UnloadPluginEntryAt(i);
+        Logger::Log("UnloadSinglePlugin: %s", ModScan::WideToNarrow(path).c_str());
+        return;
+    }
+    // 未加载：no-op
+}
+
+bool LoaderCore::InitializeGameCorePhase() {
+    HMODULE gm = GetModuleHandleW(L"GameCore_XP2_FinalRelease.dll");
+    if (!gm) {
+        Logger::Log("InitializeGameCorePhase: GameCore_XP2_FinalRelease.dll not loaded");
+        return false;
+    }
+    if (!AttachGameCore(gm)) {
+        Logger::Log("InitializeGameCorePhase: AttachGameCore failed");
+        return false;
+    }
+    // v2 无薄壳：以当前进程 exe 模块作扫描锚。
+    if (!InitializeLoader(GetModuleHandleW(nullptr))) {
+        Logger::Log("InitializeGameCorePhase: InitializeLoader failed");
+        return false;
+    }
+    hks::InitHavokScript();
+    Localization::InitScript();
+    g_gameCorePhaseReady = true;
+    Logger::Log("InitializeGameCorePhase: OK");
+    return true;
+}
+
+void LoaderCore::ReconcileGlobalPlugins() {
+    const auto expected = ModScan::FindGlobalPluginCandidates();
+
+    std::unordered_set<std::wstring> expectedNorm;
+    expectedNorm.reserve(expected.size());
+    for (const auto& wpath : expected) {
+        expectedNorm.insert(NormalizePluginPath(wpath));
+    }
+
+    // 先卸载"当前有而期望无"的 Global 插件。
+    std::vector<std::wstring> toUnload;
+    for (const auto& entry : g_plugins) {
+        if (entry.category != PluginCategory::Global) continue;
+        if (expectedNorm.count(NormalizePluginPath(entry.path))) continue;
+        toUnload.push_back(entry.path);
+    }
+    for (const auto& wpath : toUnload) {
+        UnloadSinglePlugin(wpath);
+    }
+
+    // 再加载"期望有而当前无"的 Global 插件。
+    std::unordered_set<std::wstring> currentNorm;
+    currentNorm.reserve(g_plugins.size());
+    for (const auto& entry : g_plugins) {
+        if (entry.category == PluginCategory::Global) {
+            currentNorm.insert(NormalizePluginPath(entry.path));
+        }
+    }
+    size_t loaded = 0;
+    for (const auto& wpath : expected) {
+        if (currentNorm.count(NormalizePluginPath(wpath))) continue;
+        if (LoadSinglePlugin(wpath)) ++loaded;
+    }
+
+    Logger::Log("ReconcileGlobalPlugins: unloaded=%zu loaded=%zu tracked=%zu",
+        toUnload.size(), loaded, g_plugins.size());
+}
+
+bool LoaderCore::IsInitialized() {
+    return g_gameCorePhaseReady;
+}
+
+void LoaderCore::ResetForReload() {
+    // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。
+    UnloadPluginsOf(PluginCategory::GameCore);
+    g_gameCorePhaseReady = false;
+    Logger::Log("ResetForReload: GameCore plugins unloaded, phase-B flag cleared");
 }

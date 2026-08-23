@@ -22,10 +22,12 @@ std::vector<std::wstring> CollectScanRoots(HMODULE shellModule);
 // All Civ6DllLoader.runtime.dll candidates under scan roots + next to the shell.
 std::vector<std::wstring> FindRuntimeCandidates(HMODULE shellModule);
 
-// All plugin DLL paths: <mod>/Binaries/Win64/Plugins/*.dll across scan roots,
-// plus Plugins next to the shell module.
-std::vector<std::wstring> FindPluginCandidates(HMODULE shellModule);
-
 bool ShouldSkipPluginFile(const fs::path& path);
+
+// v2: 各启用 Mod 的 Binaries\Win64\Plugins\Global\*.dll 候选（顺序/过滤/去重语义同旧扁平 Plugins 扫描）
+// v2 运行时无 shell 模块句柄可传：以当前进程可执行模块（GetModuleHandleW(nullptr)）为锚收集扫描根。
+std::vector<std::wstring> FindGlobalPluginCandidates();
+// v2: 各启用 Mod 的 Binaries\Win64\Plugins\GameCore\*.dll 候选（同上）
+std::vector<std::wstring> FindGameCorePluginCandidates();
 
 }  // namespace ModScan

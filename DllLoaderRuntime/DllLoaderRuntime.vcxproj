@@ -111,11 +111,19 @@
     <ClInclude Include="..\DllLoader\Runtime.h" />
     <ClInclude Include="..\DllLoader\SymbolDb.h" />
     <ClInclude Include="framework.h" />
+    <ClInclude Include="GameAddress.h" />
+    <ClInclude Include="LoaderUpdate.h" />
+    <ClInclude Include="PatchRegistry.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="RuntimeEntry.cpp" />
+    <ClCompile Include="ProxyExports.cpp" />
+    <ClCompile Include="LoaderUpdate.cpp" />
+    <ClCompile Include="GameAddress.cpp" />
+    <ClCompile Include="LoaderHooks.cpp" />
+    <ClCompile Include="PatchRegistry.cpp" />
     <ClCompile Include="..\common\ModScan.cpp" />
     <ClCompile Include="..\common\EnabledMods.cpp" />
     <ClCompile Include="..\third_party\sqlite\sqlite3.c">

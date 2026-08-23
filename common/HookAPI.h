@@ -124,6 +124,10 @@ typedef struct HookAPI {
     int (*ResolveSymbol)(const char* functionName, void** out);
     int (*RegisterGameCoreRva)(const char* name, uint32_t rva);
     int (*RegisterPushMethodsTarget)(const char* name, int sigType, const char* pushMethodsSymbol);
+
+    // v2: 原始字节补丁（单层存档，见 patch registry）。由运行时在初始化时填表。
+    bool (*Patch)(void* target, const void* bytes, size_t len);
+    bool (*Unpatch)(void* target);
 } HookAPI;
 
 // True if this runtime can serve a plugin built against the current header.

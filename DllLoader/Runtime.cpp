@@ -28,15 +28,6 @@ namespace Runtime {
 		LeaveLuaCriticalSection = nullptr;
 	}
 
-	void Create() {
-		GameCore = LoadLibrary(TEXT("../../../DLC/Expansion2/Binaries/Win64/GameCore_XP2_FinalRelease.dll"));
-		if (!GameCore) {
-			Logger::Log("Original GameCore failed to load err=%lu", GetLastError());
-			return;
-		}
-		Attach(GameCore);
-	}
-
 	bool InitMinHook() {
 		if (MH_Initialize() != MH_OK) {
 			Logger::Log("MinHook failed to init");
@@ -55,31 +46,6 @@ namespace Runtime {
 		GameCoreAddress = 0x0;
 		EnterLuaCriticalSection = nullptr;
 		LeaveLuaCriticalSection = nullptr;
-	}
-
-	void InitConsole() {
-		if (!AllocConsole()) {
-			MessageBoxW(NULL, L"Failed to create the console!", L"Error", MB_ICONERROR);
-			return;
-		}
-
-		FILE* fDummy;
-		freopen_s(&fDummy, "CONIN$", "r", stdin);
-		freopen_s(&fDummy, "CONOUT$", "w", stderr);
-		freopen_s(&fDummy, "CONOUT$", "w", stdout);
-		Logger::Log("Console initialized");
-	}
-
-	void CloseConsole() {
-		if (!FreeConsole()) {
-			MessageBoxW(NULL, L"Failed to close the console!", L"Error", MB_ICONERROR);
-		} else {
-			Logger::Log("Console closed");
-		}
-
-		freopen_s((FILE**)stdin, "NUL:", "r", stdin);
-		freopen_s((FILE**)stdout, "NUL:", "w", stdout);
-		freopen_s((FILE**)stderr, "NUL:", "w", stderr);
 	}
 
 	BOOL WriteCodeToProcess(uintptr_t address, byte* bytes, size_t sizeOfBytes) {

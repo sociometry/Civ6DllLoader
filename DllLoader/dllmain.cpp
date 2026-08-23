@@ -1,4 +1,6 @@
-// dllmain.cpp : thin GameCore proxy shell. Elects Civ6DllLoader.runtime.dll by version.
+// dllmain.cpp : thin GameCore proxy shell. v2: when the Loader (exe-dir
+// version.dll) is missing, install it once from the highest-version enabled-mod
+// runtime; always pass through to the real Expansion2 GameCore this session.
 #include "pch.h"
 
 #include <Windows.h>
@@ -67,21 +69,24 @@ extern "C" {
             return nullptr;
         }
 
-        if (!ShellBootstrap::ElectAndStartRuntime(
-                g_hModule, g_realGameCore, reinterpret_cast<void*>(base_DllCreateGameContext))) {
-            Logger::Log("Runtime election/start failed; continuing with stock GameCore only");
+        // v2 shell: never starts the runtime. If the Loader (exe-dir version.dll)
+        // is missing, install it once from the highest-version enabled-mod runtime;
+        // either way this session passes through to the stock GameCore.
+        if (ShellBootstrap::InstallLoaderIfMissing(g_hModule)) {
+            Logger::Log("Loader present after installer (installed or already installed)");
+        } else {
+            Logger::Log("Loader missing; install skipped or failed; continuing with stock GameCore only");
         }
 
         void* context = base_DllCreateGameContext();
         if (!context) {
-            Logger::Log("GameContext creation failed; shutting down runtime");
-            ShellBootstrap::ShutdownRuntime();
+            Logger::Log("GameContext creation failed");
         }
 
         return context;
     }
 
-    // Intercept destroy so MinHook/plugins are torn down before Firaxis FreeLibrary's this shell.
+    // Pass-through teardown: forward destroy to the real GameCore, then release it.
     __declspec(dllexport) void __cdecl DllDestroyGameContext(void* context) {
         Logger::Log("Shell DllDestroyGameContext begin");
 
@@ -93,7 +98,6 @@ extern "C" {
             if (fn) fn(context);
         }
 
-        ShellBootstrap::ShutdownRuntime();
         if (g_realGameCore) {
             FreeLibrary(g_realGameCore);
             g_realGameCore = nullptr;

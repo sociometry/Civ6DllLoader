@@ -3,11 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Shell <-> Runtime ABI. structSize allows future fields to be appended
-// without breaking runtimes that only require the stable prefix.
-#ifndef CIV6_DLL_LOADER_HOST_ABI
-#define CIV6_DLL_LOADER_HOST_ABI 1u
-#endif
+// v2: LoaderHost/ABI 机制已随薄壳 Runtime 选举与启动移除（设计文档 §4.2/§4.3），
+// 仅保留版本宏、文件名常量与导出函数指针类型。
 
 #define CIV6_DLL_LOADER_MAKE_VERSION(major, minor, patch) \
     ((((uint32_t)(major)) << 16) | (((uint32_t)(minor)) << 8) | ((uint32_t)(patch)))
@@ -19,26 +16,12 @@
 extern "C" {
 #endif
 
-typedef void* (__cdecl* DllCreateGameContextFn)(void);
-
-typedef struct LoaderHost {
-    uint32_t hostAbiVersion;          // CIV6_DLL_LOADER_HOST_ABI
-    uint32_t structSize;              // sizeof(LoaderHost) supplied by the shell
-    HMODULE shellModule;              // GameCore_XP2_Shell_FinalRelease.dll in-process
-    HMODULE gameCoreModule;           // real GameCore_XP2_FinalRelease.dll
-    DllCreateGameContextFn baseDllCreateGameContext;
-} LoaderHost;
-
-// Current runtime only requires fields through gameCoreModule. Keep this tied
-// to the last mandatory field when optional fields are appended in the future.
-#define CIV6_DLL_LOADER_HOST_REQUIRED_SIZE \
-    (offsetof(LoaderHost, gameCoreModule) + sizeof(((LoaderHost*)0)->gameCoreModule))
-
 // Exported by Civ6DllLoader.runtime.dll
 typedef uint32_t(__cdecl* GetLoaderVersionFn)(void);
-typedef int(__cdecl* LoaderStartFn)(const LoaderHost* host);
-typedef void(__cdecl* LoaderShutdownFn)(void);
 
 #ifdef __cplusplus
 }
 #endif
+
+// v2 运行时版本号（安装器与自更新比较用）
+constexpr uint32_t kLoaderRuntimeVersion = CIV6_DLL_LOADER_MAKE_VERSION(2, 0, 0);

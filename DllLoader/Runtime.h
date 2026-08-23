@@ -16,7 +16,6 @@ namespace Runtime {
 	using _LeaveLuaCriticalSection = void(*)(void);
 	extern _LeaveLuaCriticalSection LeaveLuaCriticalSection;
 
-	extern void Create();
 	extern void Attach(HMODULE gameCore);
 
 	extern void Destroy();
@@ -43,9 +42,6 @@ namespace Runtime {
 			Logger::Log("EnableHook failed: %s", MH_StatusToString(status));
 		}
 	}
-
-	extern void InitConsole();
-	extern void CloseConsole();
 
 	extern BOOL WriteCodeToGameCore(uintptr_t address, byte* bytes, size_t sizeOfBytes);
 	extern BOOL WriteCodeToProcess(uintptr_t address, byte* bytes, size_t sizeOfBytes);
