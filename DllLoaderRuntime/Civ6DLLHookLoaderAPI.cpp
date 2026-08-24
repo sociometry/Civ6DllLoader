@@ -33,8 +33,6 @@ using namespace std;
 
 static Civ6MessageBus g_bus;
 
-static HMODULE g_loaderModule = NULL;
-
 // v2 插件跟踪项：路径 + 句柄 + 名字(stem，作 Patch owner / OnMessage 注册名) + 类别(Global/GameCore)。
 struct PluginEntry {
     HMODULE handle = nullptr;
@@ -95,16 +93,8 @@ static LoaderCore::PluginCategory CategoryForPath(const std::wstring& path) {
         : LoaderCore::PluginCategory::GameCore;
 }
 
-static HMODULE g_GameCore;
 static uintptr_t g_GameCoreAddress;
 static uint32_t g_GameCoreSizeOfImage;
-
-HMODULE GameCore;
-uintptr_t GameCoreAddress;
-DWORD GameProcessId;
-HANDLE GameProcess;
-uintptr_t BaseAddress;
-
 
 static unordered_map<string, PushMethodSigType> g_MethodSignatureTable = {
     {"GameCore::Cache::Lua::IQuestsManager", PushMethodSigType::WithManager},
@@ -113,22 +103,9 @@ static unordered_map<string, PushMethodSigType> g_MethodSignatureTable = {
 
 // Symbol RVAs live in Civ6DllLoader.symbols.bin (see tools/pack_symbol_db.py).
 
-
-
-
-//static vector<HookAPI::MessageHandler> g_handlers;
-static mutex g_handlerMutex;
 mutex g_hookMutex;
 
 namespace fs = std::filesystem;
-
-
-// ---------------- ???lua??????? ----------------
-static unordered_map<string, void*> g_PushMethodAddresses;
-static unordered_map<string, vector<LuaMethodInfo>> g_LuaMethodLists;
-
-// ????detour????????????????
-static unordered_map<string, void*> g_OriginalFunctions;
 
 
 // ---------------- HookAPI ??? ----------------
@@ -352,17 +329,6 @@ void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State
     }
 }
 
-void ResetScriptHookState() {
-    g_scriptGlobals.clear();
-    g_scriptGlobalsUI.clear();
-    g_scriptHookInstalled = false;
-    g_scriptUIHookInstalled = false;
-    g_origRegisterScriptData = nullptr;
-    g_origRegisterScriptDataForUI = nullptr;
-    g_scriptHookTarget = nullptr;
-    g_scriptUIHookTarget = nullptr;
-}
-
 // 装共享钩（owner 固定 = Loader）。ALREADY_CREATED = 旧 GameCore 映像残留的
 // MinHook 记录（地址复用）：摘除后重装一次，强制按新映像重打补丁。
 // g_*HookTarget 记录目标地址，供 GameCore 重载时摘钩。
@@ -552,13 +518,6 @@ int FindOrAllocWithManagerSlot(void* target) {
         }
     }
     return -1;
-}
-
-void ResetPushHookSlots() {
-    for (int i = 0; i < kMaxPushHooks; ++i) {
-        g_noManagerSlots[i] = NoManagerHookSlot{};
-        g_withManagerSlots[i] = WithManagerHookSlot{};
-    }
 }
 
 }  // namespace
@@ -1168,19 +1127,6 @@ static DWORD GetModuleSizeOfImage(HMODULE module) {
     return nt->OptionalHeader.SizeOfImage;
 }
 
-HMODULE Create() {
-    g_GameCore = LoadLibrary(TEXT("../../../DLC/Expansion2/Binaries/Win64/GameCore_XP2_FinalRelease.dll"));
-    if (!g_GameCore) {
-        Logger::Log("Original GameCore failed to load err=%lu", GetLastError());
-        return g_GameCore;
-    }
-    if (!AttachGameCore(g_GameCore)) {
-        FreeLibrary(g_GameCore);
-        g_GameCore = nullptr;
-    }
-    return g_GameCore;
-}
-
 bool AttachGameCore(HMODULE gameCore) {
     const DWORD sizeOfImage = GetModuleSizeOfImage(gameCore);
     const uint32_t expected = SymbolDb::ExpectedSizeOfImage();
@@ -1194,14 +1140,8 @@ bool AttachGameCore(HMODULE gameCore) {
         return false;
     }
 
-    g_GameCore = gameCore;
-    g_GameCoreAddress = reinterpret_cast<uintptr_t>(g_GameCore);
+    g_GameCoreAddress = reinterpret_cast<uintptr_t>(gameCore);
     g_GameCoreSizeOfImage = sizeOfImage;
-    GameCoreAddress = g_GameCoreAddress;
-    GameProcessId = GetCurrentProcessId();
-    GameProcess = GetCurrentProcess();
-    BaseAddress = (uintptr_t)GetModuleHandle(NULL);
-    Runtime::Attach(gameCore);
 
     Logger::Log("GameCore attached base=0x%llX SizeOfImage=0x%08X",
         static_cast<unsigned long long>(g_GameCoreAddress), sizeOfImage);
@@ -1323,20 +1263,6 @@ void LoadPluginDLL(const char* name, const string& path) {
     LoadPluginDllInternal(wpath, name ? name : "", CategoryForPath(wpath));
 }
 
-void UnloadPlugins() {
-    // v1 兼容入口：全量卸载（先 GameCore 后 Global，与加载次序相反）。
-    LoaderCore::UnloadPluginsOf(LoaderCore::PluginCategory::GameCore);
-    LoaderCore::UnloadPluginsOf(LoaderCore::PluginCategory::Global);
-}
-
-string GetCurrentModuleDir() {
-    char path[MAX_PATH];
-    GetModuleFileNameA(g_loaderModule, path, MAX_PATH);
-    string fullPath = path;
-    size_t pos = fullPath.find_last_of("\\/");
-    return fullPath.substr(0, pos);
-}
-
 void OnLoaderMessage(const char* topic, const void* data, size_t len) {
     Logger::Log("OnLoaderMessage %s", topic ? topic : "");
     if (topic && data && strcmp(topic, "load-plugin") == 0 && len > 0) {
@@ -1346,26 +1272,11 @@ void OnLoaderMessage(const char* topic, const void* data, size_t len) {
 }
 
 bool InitializeLoader(HMODULE hModule) {
-    g_loaderModule = hModule;
+    // v1 时代还记录模块句柄供 GetCurrentModuleDir 使用；该路径已随 v1 死代码清理
+    // 删除，现在只注册 "Loader" 消息处理器（load-plugin 遗留入口，保持兼容）。
+    (void)hModule;
     RegisterMessageHandlerImpl("Loader", OnLoaderMessage);
     return true;
-}
-
-void CleanupLoader() {
-    // Hooks may detour into plugin code — tear down MinHook before FreeLibrary.
-    Runtime::Destroy();
-    ResetScriptHookState();
-    ResetPushHookSlots();
-    g_bus.Clear();
-    UnloadPlugins();
-    g_loaderModule = nullptr;
-    g_GameCore = nullptr;
-    g_GameCoreAddress = 0;
-    g_GameCoreSizeOfImage = 0;
-}
-
-void BroadcastLoaderMessage(const char* topic, const void* data, size_t len) {
-    BroadcastMessageImpl(topic, data, len);
 }
 
 // ================= LoaderCore 实现（S3c：插件生命周期 v2） =================

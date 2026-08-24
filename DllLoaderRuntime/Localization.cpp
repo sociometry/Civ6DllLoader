@@ -26,6 +26,21 @@ String::~String() {
         DestructorPtr(this);
 }
 
+String::String(String&& other) noexcept {
+    std::memcpy(storage_, other.storage_, sizeof(storage_));
+    std::memset(other.storage_, 0, sizeof(other.storage_));
+}
+
+String& String::operator=(String&& other) noexcept {
+    if (this != &other) {
+        if (DestructorPtr)
+            DestructorPtr(this);  // 释放自己当前持有的，再接管对方
+        std::memcpy(storage_, other.storage_, sizeof(storage_));
+        std::memset(other.storage_, 0, sizeof(other.storage_));
+    }
+    return *this;
+}
+
 bool String::PushArgument(const char* arg) {
     if (!PushArgumentPtr || !arg) return false;
     return PushArgumentPtr(this, arg);
