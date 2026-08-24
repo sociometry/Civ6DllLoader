@@ -142,6 +142,8 @@ static bool InstallHookOwnedBy(void* target, void* detour, void** original, cons
 
     if ((status = MH_EnableHook(target)) != MH_OK) {
         Logger::Log("InstallHook: enable failed %s", MH_StatusToString(status));
+        // 回滚残留的 MinHook 记录：否则该 target 永远 ALREADY_CREATED，再无重试机会。
+        MH_RemoveHook(target);
         return false;
     }
 
@@ -155,6 +157,24 @@ static bool InstallHookOwnedBy(void* target, void* detour, void** original, cons
 bool InstallHookImpl(void* target, void* detour, void** original) {
     return InstallHookOwnedBy(target, detour, original,
         g_activePluginName[0] ? g_activePluginName : L"");
+}
+
+// 摘除单个 MinHook 钩子；目标内存不可读（GameCore 映像已卸载，重载兜底路径会出现）
+// 时跳过 RemoveHook——对未映射地址恢复原字节会失败甚至出错。残留的 MinHook 记录
+// 由 InstallSharedHook 的 ALREADY_CREATED 恢复路径在新映像 attach 后清理复用。
+static bool SafeRemoveHook(void* target) {
+    if (!target) return false;
+    if (!Runtime::IsReadableSpan(target, 1)) {
+        Logger::Log("SafeRemoveHook: target %p unreadable (module unmapped); skip MinHook removal", target);
+        return false;
+    }
+    MH_DisableHook(target);
+    const MH_STATUS st = MH_RemoveHook(target);
+    if (st != MH_OK) {
+        Logger::Log("SafeRemoveHook: MH_RemoveHook(%p) -> %s", target, MH_StatusToString(st));
+        return false;
+    }
+    return true;
 }
 
 void BroadcastMessageImpl(const char* topic, const void* data, size_t len) {
@@ -273,6 +293,9 @@ ProxyTypes::RegisterScriptData g_origRegisterScriptData = nullptr;
 ProxyTypes::RegisterScriptDataForUI g_origRegisterScriptDataForUI = nullptr;
 bool g_scriptHookInstalled = false;
 bool g_scriptUIHookInstalled = false;
+// 共享钩子的目标地址（GameCore 域）：GameCore 重载时据此摘钩。
+void* g_scriptHookTarget = nullptr;
+void* g_scriptUIHookTarget = nullptr;
 
 static void CallScriptGlobalsSafe(ScriptGlobalsFn fn, void* L) {
     if (!fn) return;
@@ -330,6 +353,54 @@ void ResetScriptHookState() {
     g_scriptUIHookInstalled = false;
     g_origRegisterScriptData = nullptr;
     g_origRegisterScriptDataForUI = nullptr;
+    g_scriptHookTarget = nullptr;
+    g_scriptUIHookTarget = nullptr;
+}
+
+// 装共享钩（owner 固定 = Loader）。ALREADY_CREATED = 旧 GameCore 映像残留的
+// MinHook 记录（地址复用）：摘除后重装一次，强制按新映像重打补丁。
+// g_*HookTarget 记录目标地址，供 GameCore 重载时摘钩。
+static bool InstallSharedHook(void* target, void* detour, void** orig, void** targetSlot) {
+    if (InstallHookOwnedBy(target, detour, orig, L"")) {
+        *targetSlot = target;
+        return true;
+    }
+    if (SafeRemoveHook(target) && InstallHookOwnedBy(target, detour, orig, L"")) {
+        *targetSlot = target;
+        return true;
+    }
+    return false;
+}
+
+// 确保已注册回调对应的共享钩子已装上。三条调用路径：
+//  1) 插件 RegisterScriptGlobals 首次注册（原有路径）；
+//  2) GameCore 重载后 InitializeGameCorePhase 再调（钩子已随 ResetForReload 摘除，
+//     回调列表跨重载保留——Global 插件仍加载着，其注册项不丢）；
+//  3) 阶段 B 首次进入时列表已非空（Global 插件在阶段 A 注册过）。
+// 检查+安装整体持锁，消除并发首装的重复创建竞态。
+static void EnsureScriptHooksInstalled() {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+
+    if (!g_scriptHookInstalled && !g_scriptGlobals.empty()) {
+        void* target = GetFunctionByNameImpl("GameCore::RegisterScriptData");
+        if (!target) {
+            Logger::Log("EnsureScriptHooksInstalled: RegisterScriptData address missing");
+        } else if (InstallSharedHook(target, reinterpret_cast<void*>(&Hook_RegisterScriptData),
+                       reinterpret_cast<void**>(&g_origRegisterScriptData), &g_scriptHookTarget)) {
+            g_scriptHookInstalled = true;
+            Logger::Log("EnsureScriptHooksInstalled: hooked RegisterScriptData at %p", target);
+        }
+    }
+    if (!g_scriptUIHookInstalled && !g_scriptGlobalsUI.empty()) {
+        void* target = GetFunctionByNameImpl("GameCore::RegisterScriptDataForUI");
+        if (!target) {
+            Logger::Log("EnsureScriptHooksInstalled: RegisterScriptDataForUI address missing");
+        } else if (InstallSharedHook(target, reinterpret_cast<void*>(&Hook_RegisterScriptDataForUI),
+                       reinterpret_cast<void**>(&g_origRegisterScriptDataForUI), &g_scriptUIHookTarget)) {
+            g_scriptUIHookInstalled = true;
+            Logger::Log("EnsureScriptHooksInstalled: hooked RegisterScriptDataForUI at %p", target);
+        }
+    }
 }
 
 }  // namespace
@@ -340,21 +411,7 @@ void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
         g_scriptGlobals.push_back(ScriptGlobalsEntry{ g_activePluginName, fn });
     }
     if (g_scriptHookInstalled) return;
-
-    void* target = GetFunctionByNameImpl("GameCore::RegisterScriptData");
-    if (!target) {
-        Logger::Log("RegisterScriptGlobals: RegisterScriptData address missing");
-        return;
-    }
-    // 共享 hook 归 Loader 所有（owner 传空串）：首个注册者恰好是插件时，
-    // 也不能让该插件卸载时把其他插件共用的 RegisterScriptData hook 摘掉。
-    if (!InstallHookOwnedBy(target, reinterpret_cast<void*>(&Hook_RegisterScriptData),
-            reinterpret_cast<void**>(&g_origRegisterScriptData), L"")) {
-        Logger::Log("RegisterScriptGlobals: failed to hook RegisterScriptData");
-        return;
-    }
-    g_scriptHookInstalled = true;
-    Logger::Log("RegisterScriptGlobals: hooked RegisterScriptData");
+    EnsureScriptHooksInstalled();  // 检查+安装整体在锁内（含并发首装与重载后重装）
 }
 
 void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
@@ -363,20 +420,7 @@ void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
         g_scriptGlobalsUI.push_back(ScriptGlobalsEntry{ g_activePluginName, fn });
     }
     if (g_scriptUIHookInstalled) return;
-
-    void* target = GetFunctionByNameImpl("GameCore::RegisterScriptDataForUI");
-    if (!target) {
-        Logger::Log("RegisterScriptGlobalsForUI: address missing");
-        return;
-    }
-    // 同上：共享 hook，owner = Loader。
-    if (!InstallHookOwnedBy(target, reinterpret_cast<void*>(&Hook_RegisterScriptDataForUI),
-            reinterpret_cast<void**>(&g_origRegisterScriptDataForUI), L"")) {
-        Logger::Log("RegisterScriptGlobalsForUI: failed to hook");
-        return;
-    }
-    g_scriptUIHookInstalled = true;
-    Logger::Log("RegisterScriptGlobalsForUI: hooked RegisterScriptDataForUI");
+    EnsureScriptHooksInstalled();
 }
 
 namespace {
@@ -513,6 +557,16 @@ void ResetPushHookSlots() {
 
 }  // namespace
 
+// 追加方法并登记 owner（OnLoad 期间 = 插件 stem），插件卸载时按此撤销。
+static void AppendOwnedMethods(std::vector<StoredLuaMethod>& dst, const std::vector<StoredLuaMethod>& src) {
+    std::vector<StoredLuaMethod> owned = src;
+    const std::wstring owner = g_activePluginName[0] ? g_activePluginName : L"";
+    for (auto& m : owned) {
+        m.owner = owner;
+    }
+    dst.insert(dst.end(), owned.begin(), owned.end());
+}
+
 void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     const int slot = FindOrAllocNoManagerSlot(target);
@@ -522,28 +576,27 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
     }
 
     auto& state = g_noManagerSlots[slot];
-    // 追加的方法记录注册者（OnLoad 期间 = 插件 stem），插件卸载时按 owner 撤销。
-    {
-        std::vector<StoredLuaMethod> owned = methods;
-        const std::wstring owner = g_activePluginName[0] ? g_activePluginName : L"";
-        for (auto& m : owned) {
-            m.owner = owner;
-        }
-        state.methods.insert(state.methods.end(), owned.begin(), owned.end());
-    }
     if (state.base) {
+        // 已 hook 同一 target：只追加方法，返回既有 trampoline。
+        AppendOwnedMethods(state.methods, methods);
         return reinterpret_cast<void*>(state.base);
     }
 
+    // 新槽：先建钩启用，全部成功后才登记方法；任一步失败完整回滚槽位与
+    // MinHook 记录——否则半初始化槽位会让重试重复追加方法或返回失效 trampoline。
     MH_STATUS status = MH_CreateHook(target, NoManagerDetourTable[slot], reinterpret_cast<void**>(&state.base));
     if (status != MH_OK) {
         Logger::Log("InstallPushMethodsNoManager: create hook failed %s", MH_StatusToString(status));
+        state = NoManagerHookSlot{};
         return nullptr;
     }
     if ((status = MH_EnableHook(target)) != MH_OK) {
         Logger::Log("InstallPushMethodsNoManager: enable hook failed %s", MH_StatusToString(status));
+        MH_RemoveHook(target);
+        state = NoManagerHookSlot{};
         return nullptr;
     }
+    AppendOwnedMethods(state.methods, methods);
     return reinterpret_cast<void*>(state.base);
 }
 
@@ -556,27 +609,24 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
     }
 
     auto& state = g_withManagerSlots[slot];
-    {
-        std::vector<StoredLuaMethod> owned = methods;
-        const std::wstring owner = g_activePluginName[0] ? g_activePluginName : L"";
-        for (auto& m : owned) {
-            m.owner = owner;
-        }
-        state.methods.insert(state.methods.end(), owned.begin(), owned.end());
-    }
     if (state.base) {
+        AppendOwnedMethods(state.methods, methods);
         return reinterpret_cast<void*>(state.base);
     }
 
     MH_STATUS status = MH_CreateHook(target, WithManagerDetourTable[slot], reinterpret_cast<void**>(&state.base));
     if (status != MH_OK) {
         Logger::Log("InstallPushMethodsWithManager: create hook failed %s", MH_StatusToString(status));
+        state = WithManagerHookSlot{};
         return nullptr;
     }
     if ((status = MH_EnableHook(target)) != MH_OK) {
         Logger::Log("InstallPushMethodsWithManager: enable hook failed %s", MH_StatusToString(status));
+        MH_RemoveHook(target);
+        state = WithManagerHookSlot{};
         return nullptr;
     }
+    AppendOwnedMethods(state.methods, methods);
     return reinterpret_cast<void*>(state.base);
 }
 
@@ -1296,8 +1346,9 @@ static void RemovePluginHooks(const wchar_t* owner) {
     for (auto it = g_pluginHookOwners.begin(); it != g_pluginHookOwners.end(); ) {
         if (it->second == owner) {
             void* target = it->first;
-            MH_DisableHook(target);
-            MH_RemoveHook(target);
+            // SafeRemoveHook：目标可能位于已卸载的旧 GameCore 映像（重载兜底路径），
+            // 此时跳过 MinHook 移除，仅清簿记。
+            SafeRemoveHook(target);
             it = g_pluginHookOwners.erase(it);
             Logger::Log("RemovePluginHooks: removed hook at %p (owner=%ls)", target, owner);
         } else {
@@ -1460,6 +1511,9 @@ bool LoaderCore::InitializeGameCorePhase() {
         return false;
     }
     Localization::InitScript();
+    // GameCore 重载后重装共享脚本钩（ResetForReload 已摘除；回调列表跨重载保留）。
+    // 首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。
+    EnsureScriptHooksInstalled();
     g_gameCorePhaseReady = true;
     Logger::Log("InitializeGameCorePhase: OK");
     return true;
@@ -1511,9 +1565,52 @@ bool LoaderCore::IsInitialized() {
     return g_gameCorePhaseReady;
 }
 
+// GameCore 重载时的共享钩子复位（G1）：RegisterScriptData/ForUI 共享钩与全部
+// PushMethods 槽位钩的目标都在旧 GameCore 映像内——映像卸载后补丁字节随映射消失，
+// 而 MinHook 记录、g_scriptHookInstalled 标志、trampoline 指针全部残留：
+//  - 若不复位：重进游戏后 detour 不再被调用（新映像是未打补丁的原始字节），
+//    且 g_scriptHookInstalled=true 让重注册早退 → Lua 注入本会话永久失效；
+//  - PushMethods 槽位还会按重载次数泄漏（上限 16 个）。
+// 在 UnloadDllDetour 路径调用时旧映像仍存活，可干净摘钩；在 LoadDllDetour 重入
+// 兜底路径调用时映像可能已卸载，SafeRemoveHook 自动跳过（残留记录由
+// InstallSharedHook 的 ALREADY_CREATED 恢复路径处理）。
+// 已注册的 ScriptGlobals 回调列表跨重载保留（Global 插件仍加载着），
+// 由 EnsureScriptHooksInstalled 在新 GameCore attach 后重新装钩。
+static void ResetSharedGameCoreHooks() {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+
+    if (g_scriptHookTarget) {
+        SafeRemoveHook(g_scriptHookTarget);
+        g_scriptHookTarget = nullptr;
+        g_scriptHookInstalled = false;
+        g_origRegisterScriptData = nullptr;
+    }
+    if (g_scriptUIHookTarget) {
+        SafeRemoveHook(g_scriptUIHookTarget);
+        g_scriptUIHookTarget = nullptr;
+        g_scriptUIHookInstalled = false;
+        g_origRegisterScriptDataForUI = nullptr;
+    }
+
+    for (int i = 0; i < kMaxPushHooks; ++i) {
+        if (g_noManagerSlots[i].used) {
+            SafeRemoveHook(g_noManagerSlots[i].target);
+            g_noManagerSlots[i] = NoManagerHookSlot{};
+        }
+        if (g_withManagerSlots[i].used) {
+            SafeRemoveHook(g_withManagerSlots[i].target);
+            g_withManagerSlots[i] = WithManagerHookSlot{};
+        }
+    }
+    Logger::Log("ResetSharedGameCoreHooks: script/UI hooks + push slots reset");
+}
+
 void LoaderCore::ResetForReload() {
     // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。
     UnloadPluginsOf(PluginCategory::GameCore);
+    // 共享钩子（ScriptData/ForUI + PushMethods 槽位）目标在旧 GameCore 映像内，
+    // 必须随重载复位，否则 Lua 注入在新映像下永久失效（见函数头注释）。
+    ResetSharedGameCoreHooks();
     g_gameCorePhaseReady = false;
-    Logger::Log("ResetForReload: GameCore plugins unloaded, phase-B flag cleared");
+    Logger::Log("ResetForReload: GameCore plugins unloaded, shared hooks reset, phase-B flag cleared");
 }

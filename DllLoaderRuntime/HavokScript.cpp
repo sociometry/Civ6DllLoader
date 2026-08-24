@@ -174,8 +174,11 @@ namespace hks {
 			return playerId;
 		}
 
-		std::string errorMessage = "Invalid playerId: ";
-		hks::error(L, errorMessage.append(std::to_string(playerId)).c_str());
+		// 非法 ID 也走判空：checkinteger 与 error 是两个独立导入，可能一有一无。
+		if (error) {
+			std::string errorMessage = "Invalid playerId: ";
+			hks::error(L, errorMessage.append(std::to_string(playerId)).c_str());
+		}
 		return -1;
 	}
 
@@ -188,7 +191,8 @@ namespace hks {
 	static bool RawPushTValue(lua_State* L, int typeTag, uintptr_t valueBits) {
 		if (!L) return false;
 		int** topSlotPtr = reinterpret_cast<int**>(reinterpret_cast<uintptr_t>(L) + kLuaStateTopSlotOffset);
-		if (!Runtime::IsReadableSpan(topSlotPtr, sizeof(int*))) return false;
+		// top 槽既要读（取栈顶）也要写（推进栈顶），按可写检查。
+		if (!Runtime::IsWritableSpan(topSlotPtr, sizeof(int*))) return false;
 		int* stackTop = *topSlotPtr;
 		if (!Runtime::IsWritableSpan(stackTop, 16)) return false;
 		stackTop[0] = typeTag;                                    // tt
