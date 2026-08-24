@@ -9,7 +9,13 @@
 #pragma comment(lib, "libMinHook.x64.lib")
 
 namespace Runtime {
+	std::mutex& MinHookMutex() {
+		static std::mutex mutex;
+		return mutex;
+	}
+
 	bool InitMinHook() {
+		std::lock_guard<std::mutex> lock(MinHookMutex());
 		if (MH_Initialize() != MH_OK) {
 			Logger::Log("MinHook failed to init");
 			return false;

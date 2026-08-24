@@ -17,13 +17,11 @@ public:
     String();
     ~String();
 
-    // 隐式拷贝是 storage 字节浅拷贝（内含游戏侧内部指针），两份对象析构会双重
-    // 释放——删除拷贝（M3）。转移语义显式提供：字节搬移 + 源清零（清零态析构
-    // 安全：与 LocCreate 的 calloc 语义一致）。
+    // opaque 游戏对象不能按字节复制或移动；只允许通过 out-param API 原地构造/使用。
     String(const String&) = delete;
     String& operator=(const String&) = delete;
-    String(String&& other) noexcept;
-    String& operator=(String&& other) noexcept;
+    String(String&& other) = delete;
+    String& operator=(String&& other) = delete;
 
     bool PushArgument(const char* arg);
     const char* toUTF8() const;
@@ -32,8 +30,6 @@ public:
 private:
     alignas(8) unsigned char storage_[LOCALIZATION_STRING_BYTES];
 };
-
-String Lookup(const char* key);
 
 using GetArgumentCountFunc = unsigned int(__fastcall*)(const String* pThis);
 using LookupFunc = String*(__cdecl*)(String* pThis, const char* key);

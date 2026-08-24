@@ -24,6 +24,9 @@
 #include <cwchar>
 #include <cwctype>
 #include <atomic>
+#include <condition_variable>
+#include <intrin.h>
+#include <optional>
 #include <unordered_set>
 
 #include "PatchRegistry.h"
@@ -34,41 +37,57 @@ using namespace std;
 static Civ6MessageBus g_bus;
 
 // v2 插件跟踪项：路径 + 句柄 + 名字(stem，作 Patch owner / OnMessage 注册名) + 类别(Global/GameCore)。
+enum class PluginState {
+    Active,
+    Deactivating,
+    Quarantined,
+};
+
 struct PluginEntry {
     HMODULE handle = nullptr;
     std::wstring path;
     std::wstring name;
+    std::wstring ownerId;
     LoaderCore::PluginCategory category = LoaderCore::PluginCategory::Global;
+    PluginState state = PluginState::Active;
 };
 static vector<PluginEntry> g_plugins;
 
 // 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
 // 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
 // 游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）与 Loader 工作线程
-// （ReconcileGlobalPlugins）在此串行化。g_hookMutex（MinHook 调用 + owner 表）与
+// （ReconcileGlobalPlugins）在此串行化。Runtime::MinHookMutex（MinHook 调用 + owner 表）与
 // PatchRegistry 的 CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
 static std::recursive_mutex g_pluginLifecycleMutex;
 
-// 当前正在加载/卸载的插件名（去扩展名的文件名 stem）。OnLoad/OnUnload 期间由
-// SetActivePluginName 设置；HookPatch 与 InstallHookImpl 用它作 owner，使卸载时能对上号。
-// 线程局部（G7）：OnLoad/OnUnload 永远运行在执行加载/卸载的线程上；他线程并发调用
-// HookAPI（如插件在游戏线程 detour 里延迟装钩/打补丁）不会被误归属到正在加载的
-// 插件——此时本线程 active 为空，owner 记为空串（Loader 所有，卸载不撤销）。
-static thread_local wchar_t g_activePluginName[64];
+// OnLoad/OnUnload 的快速 owner 上下文。异步调用不依赖它，而由回调/调用方地址反查
+// 所属插件模块，避免错误归为 Loader 导致插件停用后钩子仍生效。
+static thread_local std::wstring g_activePluginOwner;
+static thread_local HMODULE g_activePluginModule;
 
-static void SetActivePluginName(const wchar_t* name) {
-    if (!name || !*name) {
-        g_activePluginName[0] = L'\0';
-        return;
-    }
-    wcsncpy_s(g_activePluginName, _countof(g_activePluginName), name, _TRUNCATE);
+static void SetActivePluginContext(const std::wstring& owner, HMODULE module) {
+    g_activePluginOwner = owner;
+    g_activePluginModule = module;
 }
 
-// 插件通过 HookAPI.InstallHook 注册的 MinHook 目标 → owner 插件名。
-// owner 为空串 = Loader 自身（非插件）在加载阶段注册的钩子，插件卸载时不撤销。
-// 插件卸载时据此精确 MH_DisableHook + MH_RemoveHook，避免 GameCore 重载后
-// 同一 target 再次 MH_CreateHook 报 MH_ERROR_ALREADY_CREATED。
-static std::unordered_map<void*, std::wstring> g_pluginHookOwners;
+static void ClearActivePluginContext() {
+    g_activePluginOwner.clear();
+    g_activePluginModule = nullptr;
+}
+
+enum class HookKind {
+    Plugin,
+    SharedScript,
+    PushMethods,
+};
+
+struct HookRecord {
+    std::wstring owner;  // 空 = Loader 共享钩
+    HookKind kind = HookKind::Plugin;
+    uint64_t gameCoreGeneration = 0;
+};
+
+static std::unordered_map<void*, HookRecord> g_hookRecords;
 
 // 阶段 B 是否已完成（InitializeGameCorePhase 成功置 true；ResetForReload 复位）。
 static bool g_gameCorePhaseReady = false;
@@ -95,54 +114,151 @@ static LoaderCore::PluginCategory CategoryForPath(const std::wstring& path) {
 
 static uintptr_t g_GameCoreAddress;
 static uint32_t g_GameCoreSizeOfImage;
+static uint64_t g_gameCoreGeneration;
+static uintptr_t g_gameCoreTeardownAddress;
+static uint32_t g_gameCoreTeardownSizeOfImage;
 
 static unordered_map<string, PushMethodSigType> g_MethodSignatureTable = {
     {"GameCore::Cache::Lua::IQuestsManager", PushMethodSigType::WithManager},
     {"GameCore::Lua::IQuestsManager", PushMethodSigType::NoManager},
 };
 
+struct PushRegistration {
+    std::string targetName;
+    PushMethodSigType signature = PushMethodSigType::NoManager;
+    std::vector<StoredLuaMethod> methods;
+    std::wstring owner;
+};
+static std::vector<PushRegistration> g_pushRegistrations;
+
 // Symbol RVAs live in Civ6DllLoader.symbols.bin (see tools/pack_symbol_db.py).
 
-mutex g_hookMutex;
+static mutex g_scriptStateMutex;
+static mutex g_pushStateMutex;
+static atomic<uint32_t> g_activeSharedDetours{ 0 };
+static mutex g_detourDrainMutex;
+static condition_variable g_detourDrainCv;
+
+class SharedDetourActivity {
+public:
+    SharedDetourActivity() {
+        g_activeSharedDetours.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~SharedDetourActivity() {
+        if (g_activeSharedDetours.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            lock_guard<mutex> lock(g_detourDrainMutex);
+            g_detourDrainCv.notify_all();
+        }
+    }
+};
 
 namespace fs = std::filesystem;
 
+static std::optional<std::wstring> ResolvePluginOwnerForAddress(const void* codeAddress) {
+    if (!codeAddress) return std::nullopt;
+
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(codeAddress), &module)) {
+        return std::nullopt;
+    }
+    if (!g_activePluginOwner.empty() && module == g_activePluginModule) {
+        return g_activePluginOwner;
+    }
+
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    for (const auto& entry : g_plugins) {
+        if (entry.state == PluginState::Active && entry.handle == module) {
+            return entry.ownerId;
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<std::wstring> RequirePluginOwner(const void* codeAddress,
+                                                       const char* apiName) {
+    auto owner = ResolvePluginOwnerForAddress(codeAddress);
+    if (!owner || owner->empty()) {
+        Logger::Log("%s rejected: caller/callback is not an active plugin", apiName);
+        return std::nullopt;
+    }
+    return owner;
+}
+
+static bool TargetInCurrentGameCore(void* target) {
+    const uintptr_t p = reinterpret_cast<uintptr_t>(target);
+    return g_GameCoreAddress && p >= g_GameCoreAddress &&
+        p - g_GameCoreAddress < g_GameCoreSizeOfImage;
+}
+
+static bool TargetInTearingDownGameCore(void* target) {
+    const uintptr_t p = reinterpret_cast<uintptr_t>(target);
+    return g_gameCoreTeardownAddress && p >= g_gameCoreTeardownAddress &&
+        p - g_gameCoreTeardownAddress < g_gameCoreTeardownSizeOfImage;
+}
 
 // ---------------- HookAPI ??? ----------------
-// InstallHookImpl 的内核：owner 显式传入。空串 = Loader 自身的共享 hook
-// （如 RegisterScriptData），插件卸载时不撤销；插件名 = 该插件私有，卸载时撤销。
-static bool InstallHookOwnedBy(void* target, void* detour, void** original, const wchar_t* owner) {
-    lock_guard<mutex> lock(g_hookMutex);
-
-    MH_STATUS status;
-    if ((status = MH_CreateHook(target, detour, original)) != MH_OK) {
+static bool SafeRemoveHookLocked(void* target, bool eraseRecord);
+// 调用方必须持有 Runtime::MinHookMutex()。
+static MH_STATUS InstallHookOwnedByLocked(void* target, void* detour, void** original,
+                                          const wchar_t* owner, HookKind kind) {
+    MH_STATUS status = MH_CreateHook(target, detour, original);
+    const auto existing = g_hookRecords.find(target);
+    const bool recoverStalePlugin =
+        status == MH_ERROR_ALREADY_CREATED &&
+        kind == HookKind::Plugin &&
+        existing != g_hookRecords.end() &&
+        existing->second.kind == HookKind::Plugin &&
+        existing->second.owner == (owner ? owner : L"") &&
+        existing->second.gameCoreGeneration != 0 &&
+        existing->second.gameCoreGeneration < g_gameCoreGeneration &&
+        TargetInCurrentGameCore(target);
+    if (recoverStalePlugin && SafeRemoveHookLocked(target, false)) {
+        status = MH_CreateHook(target, detour, original);
+    }
+    if (status != MH_OK) {
         Logger::Log("InstallHook: create failed %s", MH_StatusToString(status));
-        return false;
+        return status;
     }
 
     if ((status = MH_EnableHook(target)) != MH_OK) {
         Logger::Log("InstallHook: enable failed %s", MH_StatusToString(status));
         // 回滚残留的 MinHook 记录：否则该 target 永远 ALREADY_CREATED，再无重试机会。
         MH_RemoveHook(target);
-        return false;
+        return status;
     }
 
-    // 记录 target → owner（插件 OnLoad 期间 = 插件 stem；否则空串 = Loader 自身）。
-    // 插件卸载时据此撤销，避免 GameCore 重载后同一 target 再次 CreateHook 报 ALREADY_CREATED。
-    g_pluginHookOwners[target] = owner ? owner : L"";
+    g_hookRecords[target] = HookRecord{
+        owner ? owner : L"",
+        kind,
+        TargetInCurrentGameCore(target) ? g_gameCoreGeneration : 0,
+    };
+    return MH_OK;
+}
 
-    return true;
+static bool InstallHookOwnedBy(void* target, void* detour, void** original,
+                               const wchar_t* owner, HookKind kind = HookKind::Plugin) {
+    lock_guard<mutex> lock(Runtime::MinHookMutex());
+    return InstallHookOwnedByLocked(target, detour, original, owner, kind) == MH_OK;
 }
 
 bool InstallHookImpl(void* target, void* detour, void** original) {
-    return InstallHookOwnedBy(target, detour, original,
-        g_activePluginName[0] ? g_activePluginName : L"");
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    if (TargetInTearingDownGameCore(target)) {
+        Logger::Log("InstallHook rejected: target %p belongs to tearing-down GameCore", target);
+        return false;
+    }
+    auto owner = RequirePluginOwner(detour, "InstallHook");
+    return owner && InstallHookOwnedBy(target, detour, original, owner->c_str());
 }
 
 // 摘除单个 MinHook 钩子；目标内存不可读（GameCore 映像已卸载，重载兜底路径会出现）
 // 时跳过 RemoveHook——对未映射地址恢复原字节会失败甚至出错。残留的 MinHook 记录
 // 由 InstallSharedHook 的 ALREADY_CREATED 恢复路径在新映像 attach 后清理复用。
-static bool SafeRemoveHook(void* target) {
+// 调用方必须持有 Runtime::MinHookMutex()。
+static bool SafeRemoveHookLocked(void* target, bool eraseRecord = true) {
     if (!target) return false;
     if (!Runtime::IsReadableSpan(target, 1)) {
         Logger::Log("SafeRemoveHook: target %p unreadable (module unmapped); skip MinHook removal", target);
@@ -154,6 +270,7 @@ static bool SafeRemoveHook(void* target) {
         Logger::Log("SafeRemoveHook: MH_RemoveHook(%p) -> %s", target, MH_StatusToString(st));
         return false;
     }
+    if (eraseRecord) g_hookRecords.erase(target);
     return true;
 }
 
@@ -162,7 +279,11 @@ void BroadcastMessageImpl(const char* topic, const void* data, size_t len) {
 }
 
 void RegisterMessageHandlerImpl(const char* pluginName, MessageHandlerFn handler) {
-    g_bus.RegisterHandler(pluginName, handler);
+    if (!pluginName || !*pluginName || !handler) return;
+    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(handler),
+                                    "RegisterMessageHandler");
+    if (!owner) return;
+    g_bus.RegisterHandler(pluginName, handler, *owner);
 }
 
 void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len) {
@@ -170,10 +291,12 @@ void SendMessageToImpl(const char* pluginName, const char* topic, const void* da
 }
 
 uintptr_t GetGameCoreAddressImpl() {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     return g_GameCoreAddress;
 }
 
 void* GetFunctionByNameImpl(const char* name) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     if (!name || !*name || !g_GameCoreAddress) return nullptr;
     const uint32_t rva = SymbolDb::LookupRva(name);
     if (rva == 0 || rva >= g_GameCoreSizeOfImage) {
@@ -187,6 +310,7 @@ void* GetFunctionByNameImpl(const char* name) {
 }
 
 void* GetFunctionByAddressImpl(uintptr_t address) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     if (!g_GameCoreAddress || address == 0 || address >= g_GameCoreSizeOfImage) {
         Logger::Log("GetFunctionByAddress: rejected RVA=0x%llX image=0x%X",
             static_cast<unsigned long long>(address), g_GameCoreSizeOfImage);
@@ -213,32 +337,58 @@ static vector<StoredLuaMethod> CopyLuaMethods(const LuaMethodInfo* methods, uint
 }
 
 void* PushLuaMethodsImpl(const char* name, const LuaMethodInfo* methods, uint32_t count) {
-    if (!name) return nullptr;
+    if (!name || !*name || !methods || count == 0) return nullptr;
+    auto owner = RequirePluginOwner(
+        reinterpret_cast<const void*>(methods[0].luaMethodFunc), "PushLuaMethods");
+    if (!owner) return nullptr;
+    for (uint32_t i = 0; i < count; ++i) {
+        auto methodOwner = RequirePluginOwner(
+            reinterpret_cast<const void*>(methods[i].luaMethodFunc), "PushLuaMethods");
+        if (!methodOwner || *methodOwner != *owner) {
+            Logger::Log("PushLuaMethods rejected: mixed or unowned callback modules");
+            return nullptr;
+        }
+    }
+
     // M2: g_MethodSignatureTable 与 RegisterPushMethodsTargetImpl 的写入跨线程共享，
     // 读写都在生命周期锁内（后面 InstallPushMethods* 递归重入）。
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    auto name2 = string(name);
-    auto sigIt = g_MethodSignatureTable.find(name2);
+    const std::string targetName(name);
+    auto sigIt = g_MethodSignatureTable.find(targetName);
     if (sigIt == g_MethodSignatureTable.end()) {
         Logger::Log("PushLuaMethods: unknown target %s", name);
         return nullptr;
     }
     auto stored = CopyLuaMethods(methods, count);
-    name2 += "::PushMethods";
-    if (sigIt->second == PushMethodSigType::NoManager) {
-        auto target = reinterpret_cast<PushMethodsNoFunc>(GetFunctionByNameImpl(name2.c_str()));
-        if (!target) {
-            Logger::Log("PushLuaMethods: missing %s", name2.c_str());
-            return nullptr;
-        }
-        return InstallPushMethodsNoManager(target, stored);
-    }
-    auto target = reinterpret_cast<PushMethodsWithFunc>(GetFunctionByNameImpl(name2.c_str()));
-    if (!target) {
-        Logger::Log("PushLuaMethods: missing %s", name2.c_str());
+    for (auto& method : stored) method.owner = *owner;
+    g_pushRegistrations.push_back(
+        PushRegistration{ targetName, sigIt->second, stored, *owner });
+
+    if (!g_gameCorePhaseReady) {
+        Logger::Log("PushLuaMethods: deferred until GameCore phase is ready: %s",
+                    targetName.c_str());
         return nullptr;
     }
-    return InstallPushMethodsWithManager(target, stored);
+
+    std::string symbolName = targetName + "::PushMethods";
+    if (sigIt->second == PushMethodSigType::NoManager) {
+        auto target = reinterpret_cast<PushMethodsNoFunc>(
+            GetFunctionByNameImpl(symbolName.c_str()));
+        if (!target) {
+            Logger::Log("PushLuaMethods: deferred until GameCore is ready: %s",
+                        symbolName.c_str());
+            return nullptr;
+        }
+        return InstallPushMethodsNoManager(target, stored, *owner);
+    }
+    auto target = reinterpret_cast<PushMethodsWithFunc>(
+        GetFunctionByNameImpl(symbolName.c_str()));
+    if (!target) {
+        Logger::Log("PushLuaMethods: deferred until GameCore is ready: %s",
+                    symbolName.c_str());
+        return nullptr;
+    }
+    return InstallPushMethodsWithManager(target, stored, *owner);
 }
 
 // 版本锁定偏移：当前回合 dword 位于 CurrentTurnStorage 解引用对象 +0xC0。
@@ -246,6 +396,7 @@ void* PushLuaMethodsImpl(const char* name, const LuaMethodInfo* methods, uint32_
 constexpr size_t kCurTurnDwordOffset = 0xC0;
 
 unsigned int GetCurTurnImpl() {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     auto* slot = reinterpret_cast<uint64_t**>(
         GetFunctionByNameImpl("GameCore::Globals::CurrentTurnStorage"));
     if (!slot || !Runtime::IsReadableSpan(slot, sizeof(uint64_t*)) || !*slot) {
@@ -291,11 +442,12 @@ static void CallScriptGlobalsSafe(ScriptGlobalsFn fn, void* L) {
 
 // 拷贝快照后在锁外回调：注册表可能被 Loader 工作线程（插件卸载清理）并发修改。
 static std::vector<ScriptGlobalsEntry> SnapshotScriptGlobals(std::vector<ScriptGlobalsEntry>& reg) {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    lock_guard<mutex> lock(g_scriptStateMutex);
     return reg;
 }
 
 void __cdecl Hook_RegisterScriptData(hks::lua_State* L) {
+    SharedDetourActivity activity;
     const auto snapshot = SnapshotScriptGlobals(g_scriptGlobals);
     Logger::Log("RegisterScriptData: running %zu plugin global registrar(s)", snapshot.size());
     size_t i = 0;
@@ -313,6 +465,7 @@ void __cdecl Hook_RegisterScriptData(hks::lua_State* L) {
 }
 
 void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State* L) {
+    SharedDetourActivity activity;
     const auto snapshot = SnapshotScriptGlobals(g_scriptGlobalsUI);
     Logger::Log("RegisterScriptDataForUI: running %zu plugin global registrar(s)", snapshot.size());
     size_t i = 0;
@@ -333,11 +486,24 @@ void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State
 // MinHook 记录（地址复用）：摘除后重装一次，强制按新映像重打补丁。
 // g_*HookTarget 记录目标地址，供 GameCore 重载时摘钩。
 static bool InstallSharedHook(void* target, void* detour, void** orig, void** targetSlot) {
-    if (InstallHookOwnedBy(target, detour, orig, L"")) {
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    MH_STATUS status = InstallHookOwnedByLocked(
+        target, detour, orig, L"", HookKind::SharedScript);
+    if (status == MH_OK) {
         *targetSlot = target;
         return true;
     }
-    if (SafeRemoveHook(target) && InstallHookOwnedBy(target, detour, orig, L"")) {
+
+    const auto it = g_hookRecords.find(target);
+    const bool isOurStaleHook =
+        status == MH_ERROR_ALREADY_CREATED &&
+        it != g_hookRecords.end() &&
+        it->second.owner.empty() &&
+        it->second.gameCoreGeneration < g_gameCoreGeneration &&
+        g_activeSharedDetours.load(std::memory_order_acquire) == 0;
+    if (isOurStaleHook && SafeRemoveHookLocked(target) &&
+        InstallHookOwnedByLocked(target, detour, orig, L"",
+                                 HookKind::SharedScript) == MH_OK) {
         *targetSlot = target;
         return true;
     }
@@ -352,6 +518,7 @@ static bool InstallSharedHook(void* target, void* detour, void** orig, void** ta
 // 检查+安装整体持锁，消除并发首装的重复创建竞态。
 static void EnsureScriptHooksInstalled() {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (!g_gameCorePhaseReady) return;
 
     if (!g_scriptHookInstalled && !g_scriptGlobals.empty()) {
         void* target = GetFunctionByNameImpl("GameCore::RegisterScriptData");
@@ -378,20 +545,28 @@ static void EnsureScriptHooksInstalled() {
 }  // namespace
 
 void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
-    if (fn) {
+    if (!fn) return;
+    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
+                                    "RegisterScriptGlobals");
+    if (!owner) return;
+    {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-        g_scriptGlobals.push_back(ScriptGlobalsEntry{ g_activePluginName, fn });
+        lock_guard<mutex> stateLock(g_scriptStateMutex);
+        g_scriptGlobals.push_back(ScriptGlobalsEntry{ *owner, fn });
     }
-    if (g_scriptHookInstalled) return;
     EnsureScriptHooksInstalled();  // 检查+安装整体在锁内（含并发首装与重载后重装）
 }
 
 void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
-    if (fn) {
+    if (!fn) return;
+    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
+                                    "RegisterScriptGlobalsForUI");
+    if (!owner) return;
+    {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-        g_scriptGlobalsUI.push_back(ScriptGlobalsEntry{ g_activePluginName, fn });
+        lock_guard<mutex> stateLock(g_scriptStateMutex);
+        g_scriptGlobalsUI.push_back(ScriptGlobalsEntry{ *owner, fn });
     }
-    if (g_scriptUIHookInstalled) return;
     EnsureScriptHooksInstalled();
 }
 
@@ -418,12 +593,13 @@ WithManagerHookSlot g_withManagerSlots[kMaxPushHooks];
 
 template<int I>
 void __fastcall DetourPushNoManager(hks::lua_State* L, int stackOffset) {
+    SharedDetourActivity activity;
     // 拷贝快照后在锁外回调：methods 可能被 Loader 工作线程（插件卸载清理）并发修改，
     // 快照同时把函数指针与 internalName/exposedName 字符串一并拷贝，锁外安全使用。
     std::vector<StoredLuaMethod> methods;
     PushMethodsNoFunc base = nullptr;
     {
-        lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        lock_guard<mutex> lock(g_pushStateMutex);
         methods = g_noManagerSlots[I].methods;
         base = g_noManagerSlots[I].base;
     }
@@ -438,10 +614,11 @@ void __fastcall DetourPushNoManager(hks::lua_State* L, int stackOffset) {
 
 template<int I>
 void __fastcall DetourPushWithManager(void* manager, hks::lua_State* L, int stackOffset) {
+    SharedDetourActivity activity;
     std::vector<StoredLuaMethod> methods;
     PushMethodsWithFunc base = nullptr;
     {
-        lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        lock_guard<mutex> lock(g_pushStateMutex);
         methods = g_withManagerSlots[I].methods;
         base = g_withManagerSlots[I].base;
     }
@@ -522,21 +699,30 @@ int FindOrAllocWithManagerSlot(void* target) {
 
 }  // namespace
 
-// 追加方法并登记 owner（OnLoad 期间 = 插件 stem），插件卸载时按此撤销。
-static void AppendOwnedMethods(std::vector<StoredLuaMethod>& dst, const std::vector<StoredLuaMethod>& src) {
-    std::vector<StoredLuaMethod> owned = src;
-    const std::wstring owner = g_activePluginName[0] ? g_activePluginName : L"";
-    for (auto& m : owned) {
-        m.owner = owner;
+static bool RecoverStalePushHookLocked(void* target, MH_STATUS status) {
+    if (status != MH_ERROR_ALREADY_CREATED) return false;
+    const auto it = g_hookRecords.find(target);
+    if (it == g_hookRecords.end() ||
+        it->second.kind != HookKind::PushMethods ||
+        !it->second.owner.empty() ||
+        it->second.gameCoreGeneration >= g_gameCoreGeneration ||
+        g_activeSharedDetours.load(std::memory_order_acquire) != 0) {
+        return false;
     }
-    dst.insert(dst.end(), owned.begin(), owned.end());
+    return SafeRemoveHookLocked(target);
 }
 
-void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods) {
+void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods,
+                                  const std::wstring& owner) {
+    if (owner.empty() || std::any_of(methods.begin(), methods.end(),
+            [&owner](const StoredLuaMethod& method) {
+                return method.owner != owner;
+            })) {
+        return nullptr;
+    }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    // G3: MinHook 调用统一串行在 g_hookMutex 上（与 InstallHookOwnedBy 一致），
-    // 不依赖 MinHook 内部线程安全；锁序恒为 lifecycle → hook，单向无死锁。
-    lock_guard<mutex> hookLock(g_hookMutex);
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    lock_guard<mutex> stateLock(g_pushStateMutex);
     const int slot = FindOrAllocNoManagerSlot(target);
     if (slot < 0) {
         Logger::Log("InstallPushMethodsNoManager: no free hook slot");
@@ -546,13 +732,17 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
     auto& state = g_noManagerSlots[slot];
     if (state.base) {
         // 已 hook 同一 target：只追加方法，返回既有 trampoline。
-        AppendOwnedMethods(state.methods, methods);
+        state.methods.insert(state.methods.end(), methods.begin(), methods.end());
         return reinterpret_cast<void*>(state.base);
     }
 
     // 新槽：先建钩启用，全部成功后才登记方法；任一步失败完整回滚槽位与
     // MinHook 记录——否则半初始化槽位会让重试重复追加方法或返回失效 trampoline。
     MH_STATUS status = MH_CreateHook(target, NoManagerDetourTable[slot], reinterpret_cast<void**>(&state.base));
+    if (RecoverStalePushHookLocked(target, status)) {
+        status = MH_CreateHook(target, NoManagerDetourTable[slot],
+                               reinterpret_cast<void**>(&state.base));
+    }
     if (status != MH_OK) {
         Logger::Log("InstallPushMethodsNoManager: create hook failed %s", MH_StatusToString(status));
         state = NoManagerHookSlot{};
@@ -564,13 +754,24 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
         state = NoManagerHookSlot{};
         return nullptr;
     }
-    AppendOwnedMethods(state.methods, methods);
+    g_hookRecords[target] = HookRecord{
+        L"", HookKind::PushMethods, g_gameCoreGeneration
+    };
+    state.methods.insert(state.methods.end(), methods.begin(), methods.end());
     return reinterpret_cast<void*>(state.base);
 }
 
-void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMethod>& methods) {
+void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMethod>& methods,
+                                    const std::wstring& owner) {
+    if (owner.empty() || std::any_of(methods.begin(), methods.end(),
+            [&owner](const StoredLuaMethod& method) {
+                return method.owner != owner;
+            })) {
+        return nullptr;
+    }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    lock_guard<mutex> hookLock(g_hookMutex);  // G3: 同上，MinHook 调用统一串行
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    lock_guard<mutex> stateLock(g_pushStateMutex);
     const int slot = FindOrAllocWithManagerSlot(target);
     if (slot < 0) {
         Logger::Log("InstallPushMethodsWithManager: no free hook slot");
@@ -579,11 +780,15 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
 
     auto& state = g_withManagerSlots[slot];
     if (state.base) {
-        AppendOwnedMethods(state.methods, methods);
+        state.methods.insert(state.methods.end(), methods.begin(), methods.end());
         return reinterpret_cast<void*>(state.base);
     }
 
     MH_STATUS status = MH_CreateHook(target, WithManagerDetourTable[slot], reinterpret_cast<void**>(&state.base));
+    if (RecoverStalePushHookLocked(target, status)) {
+        status = MH_CreateHook(target, WithManagerDetourTable[slot],
+                               reinterpret_cast<void**>(&state.base));
+    }
     if (status != MH_OK) {
         Logger::Log("InstallPushMethodsWithManager: create hook failed %s", MH_StatusToString(status));
         state = WithManagerHookSlot{};
@@ -595,8 +800,33 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
         state = WithManagerHookSlot{};
         return nullptr;
     }
-    AppendOwnedMethods(state.methods, methods);
+    g_hookRecords[target] = HookRecord{
+        L"", HookKind::PushMethods, g_gameCoreGeneration
+    };
+    state.methods.insert(state.methods.end(), methods.begin(), methods.end());
     return reinterpret_cast<void*>(state.base);
+}
+
+static void ReinstallPushRegistrations() {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    size_t installed = 0;
+    for (const auto& registration : g_pushRegistrations) {
+        const std::string symbolName = registration.targetName + "::PushMethods";
+        void* target = GetFunctionByNameImpl(symbolName.c_str());
+        if (!target) {
+            Logger::Log("ReinstallPushRegistrations: missing %s",
+                        symbolName.c_str());
+            continue;
+        }
+        void* base = registration.signature == PushMethodSigType::NoManager
+            ? InstallPushMethodsNoManager(target, registration.methods,
+                                          registration.owner)
+            : InstallPushMethodsWithManager(target, registration.methods,
+                                            registration.owner);
+        if (base) ++installed;
+    }
+    Logger::Log("ReinstallPushRegistrations: installed=%zu registered=%zu",
+                installed, g_pushRegistrations.size());
 }
 
 
@@ -974,6 +1204,7 @@ int ResolveSymbolImpl(const char* functionName, void** out) {
 }
 
 int RegisterGameCoreRvaImpl(const char* name, uint32_t rva) {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     if (rva == 0 || rva >= g_GameCoreSizeOfImage) {
         Logger::Log("RegisterGameCoreRva: out-of-range name=%s rva=0x%X image=0x%X",
             name ? name : "(null)", rva, g_GameCoreSizeOfImage);
@@ -1017,13 +1248,19 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
 
 // ---------------- Patch/Unpatch (v2) ----------------
 
-static bool HookPatch(void* target, const void* bytes, size_t len) {
-    return PatchRegistry::Apply(target, bytes, len,
-        g_activePluginName[0] ? g_activePluginName : L"unknown");
+#pragma intrinsic(_ReturnAddress)
+
+__declspec(noinline) static bool HookPatch(void* target, const void* bytes, size_t len) {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    if (TargetInTearingDownGameCore(target)) return false;
+    auto owner = RequirePluginOwner(_ReturnAddress(), "Patch");
+    return owner && PatchRegistry::Apply(target, bytes, len, owner->c_str());
 }
 
-static bool HookUnpatch(void* target) {
-    return PatchRegistry::Revert(target);
+__declspec(noinline) static bool HookUnpatch(void* target) {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    auto owner = RequirePluginOwner(_ReturnAddress(), "Unpatch");
+    return owner && PatchRegistry::RevertOwned(target, owner->c_str());
 }
 
 static HookAPI g_hookApi = {
@@ -1128,6 +1365,7 @@ static DWORD GetModuleSizeOfImage(HMODULE module) {
 }
 
 bool AttachGameCore(HMODULE gameCore) {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     const DWORD sizeOfImage = GetModuleSizeOfImage(gameCore);
     const uint32_t expected = SymbolDb::ExpectedSizeOfImage();
     if (sizeOfImage == 0) {
@@ -1142,9 +1380,11 @@ bool AttachGameCore(HMODULE gameCore) {
 
     g_GameCoreAddress = reinterpret_cast<uintptr_t>(gameCore);
     g_GameCoreSizeOfImage = sizeOfImage;
+    ++g_gameCoreGeneration;
 
-    Logger::Log("GameCore attached base=0x%llX SizeOfImage=0x%08X",
-        static_cast<unsigned long long>(g_GameCoreAddress), sizeOfImage);
+    Logger::Log("GameCore attached base=0x%llX SizeOfImage=0x%08X generation=%llu",
+        static_cast<unsigned long long>(g_GameCoreAddress), sizeOfImage,
+        static_cast<unsigned long long>(g_gameCoreGeneration));
     return true;
 }
 
@@ -1209,29 +1449,37 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     }
 
     const std::string narrow = ModScan::WideToNarrow(wpath);
+    std::string pluginFileName = nameNarrow;
+    if (pluginFileName.empty()) {
+        const size_t slash = narrow.find_last_of("\\/");
+        pluginFileName = slash == std::string::npos ? narrow : narrow.substr(slash + 1);
+    }
 
-    // 插件 stem（文件名去掉扩展名）作为 Patch owner；与 OnMessage 自动注册名一致。
+    // stem 只用于消息寻址；ownerId 使用规范化完整路径，避免不同 Mod 的同名 DLL
+    // 在卸载/隔离时互相清理。
     std::wstring pluginStem;
     {
-        std::string stemName = nameNarrow.empty() ? narrow : nameNarrow;
+        std::string stemName = pluginFileName;
         const size_t dot = stemName.find_last_of('.');
         if (dot != std::string::npos) stemName = stemName.substr(0, dot);
         pluginStem = ModScan::NarrowToWide(stemName);
     }
-    Logger::Log("Loaded plugin %s (%s)", nameNarrow.c_str(), narrow.c_str());
+    Logger::Log("Loaded plugin %s (%s)", pluginFileName.c_str(), narrow.c_str());
 
     PluginEntry entry;
     entry.handle = hPlugin;
     entry.path = wpath;
     entry.name = pluginStem;
+    entry.ownerId = NormalizePluginPath(wpath);
     entry.category = category;
+    const std::wstring ownerId = entry.ownerId;
     g_plugins.push_back(std::move(entry));
 
     // OnLoad 期间暴露"当前插件名"给 Patch 作 owner；SEH 由 CallOnLoadSafe 包裹，
     // 无论 OnLoad 正常返回还是崩溃，都要在返回后清空，防止污染后续插件。
-    SetActivePluginName(pluginStem.c_str());
-    const bool onLoadOk = CallOnLoadSafe(onLoad, nameNarrow.c_str());
-    SetActivePluginName(nullptr);
+    SetActivePluginContext(ownerId, hPlugin);
+    const bool onLoadOk = CallOnLoadSafe(onLoad, pluginFileName.c_str());
+    ClearActivePluginContext();
 
     if (!onLoadOk) {
         // 崩溃隔离（G2）：仅驻留模块不够——半初始化插件已注册的补丁/钩子/Lua 方法/
@@ -1239,20 +1487,26 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         // 驻留策略保证回滚后残留指针依然安全）。跟踪项保留在 g_plugins：
         // 一方面标记"已隔离"，另一方面防止阶段 B 全量扫描反复重试崩溃的 OnLoad。
         Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
-        PatchRegistry::RevertAllFor(pluginStem.c_str());
-        RemovePluginHooks(pluginStem.c_str());
-        RemovePluginOwnedLuaEntries(pluginStem);
-        g_bus.UnregisterHandler(ModScan::WideToNarrow(pluginStem));
+        for (auto& tracked : g_plugins) {
+            if (tracked.handle == hPlugin && tracked.name == pluginStem) {
+                tracked.state = PluginState::Quarantined;
+                break;
+            }
+        }
+        PatchRegistry::RevertAllFor(ownerId.c_str());
+        RemovePluginHooks(ownerId.c_str());
+        RemovePluginOwnedLuaEntries(ownerId);
+        g_bus.UnregisterOwner(ownerId);
         return false;
     }
 
     auto onMessage = (OnMessageFunc)GetProcAddress(hPlugin, "OnMessage");
     if (onMessage) {
         // Register under filename stem so SendMessageTo("Example1", ...) works.
-        string handlerName = nameNarrow.empty() ? narrow : nameNarrow;
+        string handlerName = pluginFileName;
         const size_t dot = handlerName.find_last_of('.');
         if (dot != string::npos) handlerName = handlerName.substr(0, dot);
-        RegisterMessageHandlerImpl(handlerName.c_str(), onMessage);
+        g_bus.RegisterHandler(handlerName, onMessage, ownerId);
         Logger::Log("Auto-registered OnMessage for %s", handlerName.c_str());
     }
     return true;
@@ -1267,7 +1521,7 @@ void OnLoaderMessage(const char* topic, const void* data, size_t len) {
     Logger::Log("OnLoaderMessage %s", topic ? topic : "");
     if (topic && data && strcmp(topic, "load-plugin") == 0 && len > 0) {
         string path((const char*)data, len);
-        LoadPluginDLL("loader", path);
+        LoadPluginDLL(nullptr, path);
     }
 }
 
@@ -1275,7 +1529,10 @@ bool InitializeLoader(HMODULE hModule) {
     // v1 时代还记录模块句柄供 GetCurrentModuleDir 使用；该路径已随 v1 死代码清理
     // 删除，现在只注册 "Loader" 消息处理器（load-plugin 遗留入口，保持兼容）。
     (void)hModule;
-    RegisterMessageHandlerImpl("Loader", OnLoaderMessage);
+    static std::once_flag registerLoaderHandler;
+    std::call_once(registerLoaderHandler, [] {
+        g_bus.RegisterHandler("Loader", OnLoaderMessage);
+    });
     return true;
 }
 
@@ -1285,15 +1542,19 @@ bool InitializeLoader(HMODULE hModule) {
 // 在卸载插件的 FreeLibrary 之前调用；owner 为插件 stem（空串代表 Loader 自身，不在此撤销）。
 static void RemovePluginHooks(const wchar_t* owner) {
     if (!owner || !*owner) return;
-    lock_guard<mutex> lock(g_hookMutex);
-    for (auto it = g_pluginHookOwners.begin(); it != g_pluginHookOwners.end(); ) {
-        if (it->second == owner) {
+    lock_guard<mutex> lock(Runtime::MinHookMutex());
+    for (auto it = g_hookRecords.begin(); it != g_hookRecords.end(); ) {
+        if (it->second.owner == owner) {
             void* target = it->first;
-            // SafeRemoveHook：目标可能位于已卸载的旧 GameCore 映像（重载兜底路径），
-            // 此时跳过 MinHook 移除，仅清簿记。
-            SafeRemoveHook(target);
-            it = g_pluginHookOwners.erase(it);
-            Logger::Log("RemovePluginHooks: removed hook at %p (owner=%ls)", target, owner);
+            if (SafeRemoveHookLocked(target, false)) {
+                it = g_hookRecords.erase(it);
+                Logger::Log("RemovePluginHooks: removed hook at %p (owner=%ls)",
+                            target, owner);
+            } else {
+                Logger::Log("RemovePluginHooks: retained failed hook record at %p (owner=%ls)",
+                            target, owner);
+                ++it;
+            }
         } else {
             ++it;
         }
@@ -1322,49 +1583,79 @@ static void RemovePluginOwnedLuaEntries(const std::wstring& owner) {
         return removed;
     };
 
-    const size_t globals = removeOwnedBy(g_scriptGlobals);
-    const size_t globalsUi = removeOwnedBy(g_scriptGlobalsUI);
+    size_t globals = 0;
+    size_t globalsUi = 0;
+    {
+        lock_guard<mutex> stateLock(g_scriptStateMutex);
+        globals = removeOwnedBy(g_scriptGlobals);
+        globalsUi = removeOwnedBy(g_scriptGlobalsUI);
+    }
 
     size_t methods = 0;
-    for (auto& slot : g_noManagerSlots) {
-        if (slot.used) methods += removeOwnedBy(slot.methods);
+    {
+        lock_guard<mutex> stateLock(g_pushStateMutex);
+        for (auto& slot : g_noManagerSlots) {
+            if (slot.used) methods += removeOwnedBy(slot.methods);
+        }
+        for (auto& slot : g_withManagerSlots) {
+            if (slot.used) methods += removeOwnedBy(slot.methods);
+        }
     }
-    for (auto& slot : g_withManagerSlots) {
-        if (slot.used) methods += removeOwnedBy(slot.methods);
-    }
+    const size_t registrationsBefore = g_pushRegistrations.size();
+    g_pushRegistrations.erase(
+        std::remove_if(g_pushRegistrations.begin(), g_pushRegistrations.end(),
+            [&owner](const PushRegistration& registration) {
+                return registration.owner == owner;
+            }),
+        g_pushRegistrations.end());
+    const size_t registrationsRemoved =
+        registrationsBefore - g_pushRegistrations.size();
 
-    Logger::Log("RemovePluginOwnedLuaEntries: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu",
-        owner.c_str(), globals, globalsUi, methods);
+    Logger::Log("RemovePluginOwnedLuaEntries: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu registrations=%zu",
+        owner.c_str(), globals, globalsUi, methods, registrationsRemoved);
 }
 
 // 按跟踪项卸载单个插件（调用方保证 index 有效）：
 // OnUnload → PatchRegistry::RevertAllFor(name) → RemovePluginHooks(name) → FreeLibrary，语义与 S2a 接线一致。
-static void UnloadPluginEntryAt(size_t index) {
-    // 全程持锁（含 OnUnload）；上层 LoadPluginsOf/Reconcile 等入口也会先取锁，递归重入。
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
+    unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    const auto initial = std::find_if(g_plugins.begin(), g_plugins.end(),
+        [&ownerId](const PluginEntry& entry) {
+            return entry.ownerId == ownerId;
+        });
+    if (initial == g_plugins.end()) return;
+    const size_t index = static_cast<size_t>(initial - g_plugins.begin());
+    if (g_plugins[index].state != PluginState::Active) {
+        Logger::Log("UnloadPluginEntryAt: quarantined plugin remains parked: %s",
+                    ModScan::WideToNarrow(g_plugins[index].path).c_str());
+        return;
+    }
 
-    PluginEntry entry = std::move(g_plugins[index]);
-    g_plugins.erase(g_plugins.begin() + index);
+    g_plugins[index].state = PluginState::Deactivating;
+    PluginEntry entry = g_plugins[index];
 
+    // 先阻止并排空消息回调，避免 OnUnload 释放插件状态时旧快照仍在执行。
+    // 等待时必须释放 lifecycle 锁，否则 handler 若正在调用 HookAPI 会锁反转。
+    lifecycleLock.unlock();
+    g_bus.UnregisterOwner(entry.ownerId);
+    lifecycleLock.lock();
+    const auto tracked = std::find_if(g_plugins.begin(), g_plugins.end(),
+        [&entry](const PluginEntry& candidate) {
+            return candidate.handle == entry.handle &&
+                   candidate.ownerId == entry.ownerId;
+        });
+    if (tracked != g_plugins.end()) g_plugins.erase(tracked);
     auto onUnload = (OnUnloadFunc)GetProcAddress(entry.handle, "OnUnload");
-    // 暴露当前插件名：OnUnload 期间若有 Patch 调用也归到该 owner。
-    SetActivePluginName(entry.name.c_str());
+    SetActivePluginContext(entry.ownerId, entry.handle);
     if (onUnload) CallOnUnloadSafe(onUnload, nullptr);
     // 先 OnUnload 后回滚补丁：插件 OnUnload 可能仍依赖自己的补丁。
     // 必须在 FreeLibrary 之前回滚——补丁目标可能位于该插件自身映像内。
-    if (g_activePluginName[0]) {
-        PatchRegistry::RevertAllFor(g_activePluginName);
-    }
+    PatchRegistry::RevertAllFor(entry.ownerId.c_str());
     // 撤销该插件的 MinHook 钩子：否则 GameCore 重载后重新 OnLoad 会撞 MH_ERROR_ALREADY_CREATED。
-    RemovePluginHooks(g_activePluginName);
+    RemovePluginHooks(entry.ownerId.c_str());
     // 撤销该插件注册的 Lua 方法与脚本全局回调（见 RemovePluginOwnedLuaEntries）。
-    RemovePluginOwnedLuaEntries(entry.name);
-    // 注销 OnMessage：否则 bus 里残留指向本映像的 handler，FreeLibrary 后广播/定向发送会跳进已释放内存。
-    const std::string handlerName = ModScan::WideToNarrow(entry.name);
-    if (!handlerName.empty()) {
-        g_bus.UnregisterHandler(handlerName);
-    }
-    SetActivePluginName(nullptr);
+    RemovePluginOwnedLuaEntries(entry.ownerId);
+    ClearActivePluginContext();
     // 不 FreeLibrary：游戏线程可能仍在该插件的 detour/回调内执行（MH_DisableHook
     // 不等待在飞调用，RegisterScriptData 等回调也没有引用计数），此刻卸下映像会把
     // 正在执行的代码变成 UAF。改为驻留模块（hook 框架的标准做法）：映像保持映射
@@ -1393,15 +1684,25 @@ void LoaderCore::LoadPluginsOf(PluginCategory cat) {
 }
 
 void LoaderCore::UnloadPluginsOf(PluginCategory cat) {
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    size_t unloaded = 0;
-    for (size_t i = g_plugins.size(); i-- > 0; ) {
-        if (g_plugins[i].category != cat) continue;
-        UnloadPluginEntryAt(i);
-        ++unloaded;
+    std::vector<std::wstring> owners;
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        for (const auto& entry : g_plugins) {
+            if (entry.category == cat && entry.state == PluginState::Active) {
+                owners.push_back(entry.ownerId);
+            }
+        }
+    }
+    for (const auto& owner : owners) {
+        UnloadPluginByOwnerId(owner);
+    }
+    size_t remaining = 0;
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        remaining = g_plugins.size();
     }
     Logger::Log("UnloadPluginsOf(%s): unloaded=%zu remaining=%zu",
-        CategoryNameForLog(cat), unloaded, g_plugins.size());
+        CategoryNameForLog(cat), owners.size(), remaining);
 }
 
 bool LoaderCore::LoadSinglePlugin(const std::wstring& path) {
@@ -1422,17 +1723,29 @@ bool LoaderCore::LoadSinglePlugin(const std::wstring& path) {
 
 void LoaderCore::UnloadSinglePlugin(const std::wstring& path) {
     const std::wstring norm = NormalizePluginPath(path);
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    for (size_t i = 0; i < g_plugins.size(); ++i) {
-        if (NormalizePluginPath(g_plugins[i].path) != norm) continue;
-        UnloadPluginEntryAt(i);
+    std::wstring ownerId;
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        for (const auto& entry : g_plugins) {
+            if (NormalizePluginPath(entry.path) != norm) continue;
+            if (entry.state != PluginState::Active) {
+                Logger::Log("UnloadSinglePlugin: inactive plugin remains parked: %s",
+                            ModScan::WideToNarrow(path).c_str());
+                return;
+            }
+            ownerId = entry.ownerId;
+            break;
+        }
+    }
+    if (!ownerId.empty()) {
+        UnloadPluginByOwnerId(ownerId);
         Logger::Log("UnloadSinglePlugin: %s", ModScan::WideToNarrow(path).c_str());
-        return;
     }
     // 未加载：no-op
 }
 
 bool LoaderCore::InitializeGameCorePhase() {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     HMODULE gm = GetModuleHandleW(L"GameCore_XP2_FinalRelease.dll");
     if (!gm) {
         Logger::Log("InitializeGameCorePhase: GameCore_XP2_FinalRelease.dll not loaded");
@@ -1445,19 +1758,24 @@ bool LoaderCore::InitializeGameCorePhase() {
     // v2 无薄壳：以当前进程 exe 模块作扫描锚。
     if (!InitializeLoader(GetModuleHandleW(nullptr))) {
         Logger::Log("InitializeGameCorePhase: InitializeLoader failed");
+        g_GameCoreAddress = 0;
+        g_GameCoreSizeOfImage = 0;
         return false;
     }
     // HavokScript 导入缺失 = Lua API 半可用，对插件是崩溃源：停用 GameCore 插件
     // 加载（本会话游戏本体照常运行）。
     if (!hks::InitHavokScript()) {
         Logger::Log("InitializeGameCorePhase: InitHavokScript incomplete; GameCore plugins disabled");
+        g_GameCoreAddress = 0;
+        g_GameCoreSizeOfImage = 0;
         return false;
     }
     Localization::InitScript();
+    g_gameCorePhaseReady = true;
     // GameCore 重载后重装共享脚本钩（ResetForReload 已摘除；回调列表跨重载保留）。
     // 首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。
     EnsureScriptHooksInstalled();
-    g_gameCorePhaseReady = true;
+    ReinstallPushRegistrations();
     Logger::Log("InitializeGameCorePhase: OK");
     return true;
 }
@@ -1467,8 +1785,6 @@ void LoaderCore::ReconcileGlobalPlugins() {
     // 与游戏线程的 LoadPluginsOf（LoadDLL detour 内）串行化。
     const auto expected = ModScan::FindGlobalPluginCandidates(LoaderCore::RuntimeModuleHandle());
 
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-
     std::unordered_set<std::wstring> expectedNorm;
     expectedNorm.reserve(expected.size());
     for (const auto& wpath : expected) {
@@ -1477,10 +1793,13 @@ void LoaderCore::ReconcileGlobalPlugins() {
 
     // 先卸载"当前有而期望无"的 Global 插件。
     std::vector<std::wstring> toUnload;
-    for (const auto& entry : g_plugins) {
-        if (entry.category != PluginCategory::Global) continue;
-        if (expectedNorm.count(NormalizePluginPath(entry.path))) continue;
-        toUnload.push_back(entry.path);
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        for (const auto& entry : g_plugins) {
+            if (entry.category != PluginCategory::Global) continue;
+            if (expectedNorm.count(NormalizePluginPath(entry.path))) continue;
+            toUnload.push_back(entry.path);
+        }
     }
     for (const auto& wpath : toUnload) {
         UnloadSinglePlugin(wpath);
@@ -1488,10 +1807,13 @@ void LoaderCore::ReconcileGlobalPlugins() {
 
     // 再加载"期望有而当前无"的 Global 插件。
     std::unordered_set<std::wstring> currentNorm;
-    currentNorm.reserve(g_plugins.size());
-    for (const auto& entry : g_plugins) {
-        if (entry.category == PluginCategory::Global) {
-            currentNorm.insert(NormalizePluginPath(entry.path));
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        currentNorm.reserve(g_plugins.size());
+        for (const auto& entry : g_plugins) {
+            if (entry.category == PluginCategory::Global) {
+                currentNorm.insert(NormalizePluginPath(entry.path));
+            }
         }
     }
     size_t loaded = 0;
@@ -1500,11 +1822,17 @@ void LoaderCore::ReconcileGlobalPlugins() {
         if (LoadSinglePlugin(wpath)) ++loaded;
     }
 
+    size_t tracked = 0;
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        tracked = g_plugins.size();
+    }
     Logger::Log("ReconcileGlobalPlugins: unloaded=%zu loaded=%zu tracked=%zu",
-        toUnload.size(), loaded, g_plugins.size());
+        toUnload.size(), loaded, tracked);
 }
 
 bool LoaderCore::IsInitialized() {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     return g_gameCorePhaseReady;
 }
 
@@ -1519,41 +1847,81 @@ bool LoaderCore::IsInitialized() {
 // InstallSharedHook 的 ALREADY_CREATED 恢复路径处理）。
 // 已注册的 ScriptGlobals 回调列表跨重载保留（Global 插件仍加载着），
 // 由 EnsureScriptHooksInstalled 在新 GameCore attach 后重新装钩。
-static void ResetSharedGameCoreHooks() {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-
-    if (g_scriptHookTarget) {
-        SafeRemoveHook(g_scriptHookTarget);
-        g_scriptHookTarget = nullptr;
-        g_scriptHookInstalled = false;
-        g_origRegisterScriptData = nullptr;
-    }
-    if (g_scriptUIHookTarget) {
-        SafeRemoveHook(g_scriptUIHookTarget);
-        g_scriptUIHookTarget = nullptr;
-        g_scriptUIHookInstalled = false;
-        g_origRegisterScriptDataForUI = nullptr;
-    }
-
-    for (int i = 0; i < kMaxPushHooks; ++i) {
-        if (g_noManagerSlots[i].used) {
-            SafeRemoveHook(g_noManagerSlots[i].target);
-            g_noManagerSlots[i] = NoManagerHookSlot{};
+static void ResetSharedGameCoreHooks(
+        unique_lock<std::recursive_mutex>& lifecycleLock) {
+    std::vector<void*> pushTargets;
+    {
+        lock_guard<mutex> stateLock(g_pushStateMutex);
+        for (int i = 0; i < kMaxPushHooks; ++i) {
+            if (g_noManagerSlots[i].used) {
+                pushTargets.push_back(g_noManagerSlots[i].target);
+            }
+            if (g_withManagerSlots[i].used) {
+                pushTargets.push_back(g_withManagerSlots[i].target);
+            }
         }
-        if (g_withManagerSlots[i].used) {
-            SafeRemoveHook(g_withManagerSlots[i].target);
+    }
+
+    {
+        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+        if (g_scriptHookTarget) MH_DisableHook(g_scriptHookTarget);
+        if (g_scriptUIHookTarget) MH_DisableHook(g_scriptUIHookTarget);
+        for (void* target : pushTargets) {
+            if (target) MH_DisableHook(target);
+        }
+    }
+
+    // 禁止新的 GameCore API 解析后释放生命周期锁，让已经进入 detour 的插件回调
+    // 能正常调用 HookAPI 并退出；不能在持 lifecycle/hook 锁时等待。
+    g_gameCoreTeardownAddress = g_GameCoreAddress;
+    g_gameCoreTeardownSizeOfImage = g_GameCoreSizeOfImage;
+    g_GameCoreAddress = 0;
+    g_GameCoreSizeOfImage = 0;
+    lifecycleLock.unlock();
+    {
+        unique_lock<mutex> drainLock(g_detourDrainMutex);
+        g_detourDrainCv.wait(drainLock, [] {
+            return g_activeSharedDetours.load(std::memory_order_acquire) == 0;
+        });
+    }
+    lifecycleLock.lock();
+
+    {
+        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+        if (g_scriptHookTarget) SafeRemoveHookLocked(g_scriptHookTarget);
+        if (g_scriptUIHookTarget) SafeRemoveHookLocked(g_scriptUIHookTarget);
+        for (void* target : pushTargets) {
+            if (target) SafeRemoveHookLocked(target);
+        }
+    }
+
+    g_scriptHookTarget = nullptr;
+    g_scriptUIHookTarget = nullptr;
+    g_scriptHookInstalled = false;
+    g_scriptUIHookInstalled = false;
+    g_origRegisterScriptData = nullptr;
+    g_origRegisterScriptDataForUI = nullptr;
+    {
+        lock_guard<mutex> stateLock(g_pushStateMutex);
+        for (int i = 0; i < kMaxPushHooks; ++i) {
+            g_noManagerSlots[i] = NoManagerHookSlot{};
             g_withManagerSlots[i] = WithManagerHookSlot{};
         }
     }
+    g_gameCoreTeardownAddress = 0;
+    g_gameCoreTeardownSizeOfImage = 0;
     Logger::Log("ResetSharedGameCoreHooks: script/UI hooks + push slots reset");
 }
 
 void LoaderCore::ResetForReload() {
+    unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    g_gameCorePhaseReady = false;
+    lifecycleLock.unlock();
     // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。
     UnloadPluginsOf(PluginCategory::GameCore);
+    lifecycleLock.lock();
     // 共享钩子（ScriptData/ForUI + PushMethods 槽位）目标在旧 GameCore 映像内，
     // 必须随重载复位，否则 Lua 注入在新映像下永久失效（见函数头注释）。
-    ResetSharedGameCoreHooks();
-    g_gameCorePhaseReady = false;
+    ResetSharedGameCoreHooks(lifecycleLock);
     Logger::Log("ResetForReload: GameCore plugins unloaded, shared hooks reset, phase-B flag cleared");
 }

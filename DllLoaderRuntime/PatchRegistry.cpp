@@ -82,10 +82,18 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     }
 
     EnterCriticalSection(&Cs());
-    const bool isFirst = Registry().find(target) == Registry().end();
+    const auto existing = Registry().find(target);
+    const bool isFirst = existing == Registry().end();
     if (isFirst) {
         Logger::Log("PatchRegistry::Apply: first patch target=%p len=%zu owner=%ls", target, len, owner);
     } else {
+        if (existing->second.owner != owner) {
+            const std::wstring currentOwner = existing->second.owner;
+            LeaveCriticalSection(&Cs());
+            Logger::Log("PatchRegistry::Apply: owner conflict target=%p current=%ls requested=%ls",
+                        target, currentOwner.c_str(), owner);
+            return false;
+        }
         // 重复 Apply 同一地址：更新当前字节但保留最初存档（日志告警）。
         Logger::Log("PatchRegistry::Apply: repeat patch target=%p len=%zu owner=%ls (original archive kept)",
             target, len, owner);
@@ -142,6 +150,33 @@ bool Revert(void* target) {
     Registry().erase(it);
     LeaveCriticalSection(&Cs());
     Logger::Log("PatchRegistry::Revert: restored target=%p (%zu bytes) owner=%ls", target, origSize, owner.c_str());
+    return true;
+}
+
+bool RevertOwned(void* target, const wchar_t* owner) {
+    if (!target || !owner || !*owner) return false;
+    EnterCriticalSection(&Cs());
+    const auto it = Registry().find(target);
+    if (it == Registry().end() || it->second.owner != owner) {
+        LeaveCriticalSection(&Cs());
+        Logger::Log("PatchRegistry::RevertOwned: owner mismatch target=%p owner=%ls",
+                    target, owner);
+        return false;
+    }
+
+    const size_t origSize = it->second.original.size();
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(target, origSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        LeaveCriticalSection(&Cs());
+        Logger::Log("PatchRegistry::RevertOwned: VirtualProtect failed target=%p err=%lu",
+                    target, GetLastError());
+        return false;
+    }
+    memcpy(target, it->second.original.data(), origSize);
+    VirtualProtect(target, origSize, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), target, origSize);
+    Registry().erase(it);
+    LeaveCriticalSection(&Cs());
     return true;
 }
 

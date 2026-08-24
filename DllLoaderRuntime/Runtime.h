@@ -2,8 +2,11 @@
 #include "MinHook.h"
 #include "ProxyTypes.h"
 #include "../common/Logger.h"
+#include <mutex>
 
 namespace Runtime {
+	std::mutex& MinHookMutex();
+
 	// MinHook 初始化（进程内一次；LoaderHooks::InstallAll 的防御性重初始化兼容）。
 	bool InitMinHook();
 

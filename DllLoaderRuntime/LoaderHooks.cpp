@@ -17,6 +17,7 @@
 #include "LoaderHooks.h"
 #include "LoaderCore.h"
 #include "GameAddress.h"
+#include "Runtime.h"
 #include "../common/Logger.h"
 #include "MinHook.h"
 
@@ -278,6 +279,7 @@ static __int64 __fastcall DisableModDetour(void* L) {
 }  // namespace
 
 bool LoaderHooks::InstallAll() {
+    std::lock_guard<std::mutex> hookLock(Runtime::MinHookMutex());
     // MinHook 初始化：Runtime::InitMinHook 已在阶段 A 调用；此处防御性再初始化一次，
     // MH_ERROR_ALREADY_INITIALIZED 视为成功。
     MH_STATUS st = MH_Initialize();
@@ -301,6 +303,7 @@ bool LoaderHooks::InstallAll() {
         ok = false;
     } else if ((st = MH_EnableHook((LPVOID)loadDllAddr)) != MH_OK) {
         Logger::Log("LoadDLL MH_EnableHook failed: %s", MH_StatusToString(st));
+        MH_RemoveHook((LPVOID)loadDllAddr);
         ok = false;
     } else {
         Logger::Log("LoadDLL hook installed at 0x%llX",
@@ -319,6 +322,7 @@ bool LoaderHooks::InstallAll() {
         ok = false;
     } else if ((st = MH_EnableHook((LPVOID)disableAddr)) != MH_OK) {
         Logger::Log("lDisableMod MH_EnableHook failed: %s", MH_StatusToString(st));
+        MH_RemoveHook((LPVOID)disableAddr);
         ok = false;
     } else {
         Logger::Log("lDisableMod hook installed at 0x%llX",
@@ -337,6 +341,7 @@ bool LoaderHooks::InstallAll() {
         ok = false;
     } else if ((st = MH_EnableHook((LPVOID)enableAddr)) != MH_OK) {
         Logger::Log("lEnableMod MH_EnableHook failed: %s", MH_StatusToString(st));
+        MH_RemoveHook((LPVOID)enableAddr);
         ok = false;
     } else {
         Logger::Log("lEnableMod hook installed at 0x%llX",
@@ -355,6 +360,7 @@ bool LoaderHooks::InstallAll() {
         ok = false;
     } else if ((st = MH_EnableHook((LPVOID)unloadDllAddr)) != MH_OK) {
         Logger::Log("UnloadDLL MH_EnableHook failed: %s", MH_StatusToString(st));
+        MH_RemoveHook((LPVOID)unloadDllAddr);
         ok = false;
     } else {
         Logger::Log("UnloadDLL hook installed at 0x%llX",

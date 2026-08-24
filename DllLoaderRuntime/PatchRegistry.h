@@ -20,6 +20,7 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner);
 
 // Revert：恢复原始字节并移除记录；无记录返回 false。
 bool Revert(void* target);
+bool RevertOwned(void* target, const wchar_t* owner);
 
 // RevertAllFor：回滚某 owner 的全部未回滚补丁（插件卸载时调用）。返回回滚条数。
 size_t RevertAllFor(const wchar_t* owner);

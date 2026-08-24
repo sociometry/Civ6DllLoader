@@ -17,8 +17,10 @@ struct StoredLuaMethod {
     std::wstring owner;  // 注册时活跃插件名（空 = Loader 自身；插件卸载时按此撤销）
 };
 
-void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods);
-void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMethod>& methods);
+void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods,
+                                  const std::wstring& owner);
+void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMethod>& methods,
+                                    const std::wstring& owner);
 
 bool InitializeLoader(HMODULE hModule);
 bool AttachGameCore(HMODULE gameCore);
