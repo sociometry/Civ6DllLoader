@@ -53,7 +53,10 @@ static std::recursive_mutex g_pluginLifecycleMutex;
 
 // 当前正在加载/卸载的插件名（去扩展名的文件名 stem）。OnLoad/OnUnload 期间由
 // SetActivePluginName 设置；HookPatch 与 InstallHookImpl 用它作 owner，使卸载时能对上号。
-static wchar_t g_activePluginName[64];
+// 线程局部（G7）：OnLoad/OnUnload 永远运行在执行加载/卸载的线程上；他线程并发调用
+// HookAPI（如插件在游戏线程 detour 里延迟装钩/打补丁）不会被误归属到正在加载的
+// 插件——此时本线程 active 为空，owner 记为空串（Loader 所有，卸载不撤销）。
+static thread_local wchar_t g_activePluginName[64];
 
 static void SetActivePluginName(const wchar_t* name) {
     if (!name || !*name) {
@@ -234,6 +237,9 @@ static vector<StoredLuaMethod> CopyLuaMethods(const LuaMethodInfo* methods, uint
 
 void* PushLuaMethodsImpl(const char* name, const LuaMethodInfo* methods, uint32_t count) {
     if (!name) return nullptr;
+    // M2: g_MethodSignatureTable 与 RegisterPushMethodsTargetImpl 的写入跨线程共享，
+    // 读写都在生命周期锁内（后面 InstallPushMethods* 递归重入）。
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     auto name2 = string(name);
     auto sigIt = g_MethodSignatureTable.find(name2);
     if (sigIt == g_MethodSignatureTable.end()) {
@@ -569,6 +575,9 @@ static void AppendOwnedMethods(std::vector<StoredLuaMethod>& dst, const std::vec
 
 void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    // G3: MinHook 调用统一串行在 g_hookMutex 上（与 InstallHookOwnedBy 一致），
+    // 不依赖 MinHook 内部线程安全；锁序恒为 lifecycle → hook，单向无死锁。
+    lock_guard<mutex> hookLock(g_hookMutex);
     const int slot = FindOrAllocNoManagerSlot(target);
     if (slot < 0) {
         Logger::Log("InstallPushMethodsNoManager: no free hook slot");
@@ -602,6 +611,7 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
 
 void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMethod>& methods) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    lock_guard<mutex> hookLock(g_hookMutex);  // G3: 同上，MinHook 调用统一串行
     const int slot = FindOrAllocWithManagerSlot(target);
     if (slot < 0) {
         Logger::Log("InstallPushMethodsWithManager: no free hook slot");
@@ -689,7 +699,9 @@ void LuaPushNumberImpl(void* L, double num) {
 }
 
 void LuaPushIntegerImpl(void* L, int num) {
-    HKS_GUARD_VOID(hks::pushnumber, reinterpret_cast<hks::lua_State*>(L), num);
+    // G12: 语义对齐——API 承诺压整数，用 hksi_lua_pushinteger 压整数标记值
+    // （此前走 pushnumber 是历史遗留，hks 开启 IntLiterals 时两者字节码可区分）。
+    HKS_GUARD_VOID(hks::pushinteger, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 void LuaErrorImpl(void* L, char const* str, ...) {
@@ -1023,6 +1035,8 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
         Logger::Log("RegisterPushMethodsTarget: bad sigType %d for %s", sigType, name);
         return 0;
     }
+    // M2: 表写入与 PushLuaMethodsImpl 的读取跨线程共享，持锁修改。
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     g_MethodSignatureTable[name] = (sigType == kHookApiPushWithManager)
         ? PushMethodSigType::WithManager
         : PushMethodSigType::NoManager;
@@ -1212,6 +1226,10 @@ static void CallOnUnloadSafe(OnUnloadFunc onUnload, const char* name) {
     }
 }
 
+// 前置声明：G2 崩溃隔离要用与卸载同一套 owner 清理（定义在本文件后部）。
+static void RemovePluginHooks(const wchar_t* owner);
+static void RemovePluginOwnedLuaEntries(const std::wstring& owner);
+
 // v2 统一插件加载流程：LoadLibraryExW + OnLoad(SEH) + OnMessage 自动注册 + 记录跟踪项。
 // nameNarrow = 显示名（通常为文件名，内部取 stem 作 Patch owner / OnMessage 名）；已加载（同句柄）返回 false。
 static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& nameNarrow,
@@ -1220,8 +1238,17 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     // push_back 原子化；OnLoad 内再调用 HookAPI 注册入口由递归锁重入。
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
 
-    HMODULE hPlugin = LoadLibraryExW(wpath.c_str(), nullptr,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    // G5: 已驻留模块（禁用后未卸载）用 UNCHANGED_REFCOUNT 取回，"禁用→启用"循环
+    // 不再累计引用计数；未映射才真正加载。ownsRef 标记引用是否归本调用所有，
+    // 失败路径只释放自己拿到的引用（GetModuleHandleEx 取回的引用不属于我们）。
+    bool ownsRef = false;
+    HMODULE hPlugin = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            wpath.c_str(), &hPlugin)) {
+        hPlugin = LoadLibraryExW(wpath.c_str(), nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        ownsRef = (hPlugin != nullptr);
+    }
     if (!hPlugin) {
         Logger::Log("LoadPlugin failed: %s err=%lu", ModScan::WideToNarrow(wpath).c_str(), GetLastError());
         return false;
@@ -1229,7 +1256,7 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
 
     for (const auto& entry : g_plugins) {
         if (entry.handle == hPlugin) {
-            FreeLibrary(hPlugin);
+            if (ownsRef) FreeLibrary(hPlugin);
             return false;
         }
     }
@@ -1237,7 +1264,7 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     auto onLoad = (OnLoadFunc)GetProcAddress(hPlugin, "OnLoad");
     if (!onLoad) {
         Logger::Log("Plugin has no OnLoad export: %s", ModScan::WideToNarrow(wpath).c_str());
-        FreeLibrary(hPlugin);
+        if (ownsRef) FreeLibrary(hPlugin);
         return false;
     }
 
@@ -1267,10 +1294,15 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     SetActivePluginName(nullptr);
 
     if (!onLoadOk) {
-        // Keep the module mapped: a partially initialized plugin may already
-        // have registered callbacks or detours into its image. Unmapping it
-        // here would turn those pointers into immediate use-after-free.
+        // 崩溃隔离（G2）：仅驻留模块不够——半初始化插件已注册的补丁/钩子/Lua 方法/
+        // OnMessage 可能仍生效。按 owner 执行与正常卸载同一套回滚（模块保持映射，
+        // 驻留策略保证回滚后残留指针依然安全）。跟踪项保留在 g_plugins：
+        // 一方面标记"已隔离"，另一方面防止阶段 B 全量扫描反复重试崩溃的 OnLoad。
         Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
+        PatchRegistry::RevertAllFor(pluginStem.c_str());
+        RemovePluginHooks(pluginStem.c_str());
+        RemovePluginOwnedLuaEntries(pluginStem);
+        g_bus.UnregisterHandler(ModScan::WideToNarrow(pluginStem));
         return false;
     }
 
