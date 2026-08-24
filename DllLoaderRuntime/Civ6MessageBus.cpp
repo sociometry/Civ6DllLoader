@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "Civ6MessageBus.h"
-#include "Logger.h"
+#include "../common/Logger.h"
 #include <unordered_map>
 #include <mutex>
 #include <string>

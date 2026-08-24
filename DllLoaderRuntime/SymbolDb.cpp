@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "SymbolDb.h"
-#include "Logger.h"
+#include "../common/Logger.h"
 
 #include <algorithm>
 #include <cstring>

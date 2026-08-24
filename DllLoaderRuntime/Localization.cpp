@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "Localization.h"
-#include "Logger.h"
+#include "../common/Logger.h"
 #include <Windows.h>
 #include <cstring>
 

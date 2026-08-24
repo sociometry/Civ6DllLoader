@@ -4,8 +4,8 @@
 #include "pch.h"
 
 #include <Windows.h>
-#include "Logger.h"
-#include "ProxyTypes.h"
+#include "../common/Logger.h"
+#include "../DllLoaderRuntime/ProxyTypes.h"
 #include "ShellBootstrap.h"
 
 HMODULE g_hModule = nullptr;

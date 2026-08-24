@@ -101,15 +101,15 @@
     <ClInclude Include="..\common\ModScan.h" />
     <ClInclude Include="..\common\EnabledMods.h" />
     <ClInclude Include="..\third_party\sqlite\sqlite3.h" />
-    <ClInclude Include="..\DllLoader\Civ6DLLHookLoaderAPI.h" />
-    <ClInclude Include="..\DllLoader\Civ6MessageBus.h" />
-    <ClInclude Include="..\DllLoader\HavokScript.h" />
-    <ClInclude Include="..\DllLoader\Localization.h" />
-    <ClInclude Include="..\DllLoader\Logger.h" />
-    <ClInclude Include="..\DllLoader\MinHook.h" />
-    <ClInclude Include="..\DllLoader\ProxyTypes.h" />
-    <ClInclude Include="..\DllLoader\Runtime.h" />
-    <ClInclude Include="..\DllLoader\SymbolDb.h" />
+    <ClInclude Include="Civ6DLLHookLoaderAPI.h" />
+    <ClInclude Include="Civ6MessageBus.h" />
+    <ClInclude Include="HavokScript.h" />
+    <ClInclude Include="Localization.h" />
+    <ClInclude Include="..\common\Logger.h" />
+    <ClInclude Include="MinHook.h" />
+    <ClInclude Include="ProxyTypes.h" />
+    <ClInclude Include="Runtime.h" />
+    <ClInclude Include="SymbolDb.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="GameAddress.h" />
     <ClInclude Include="LoaderUpdate.h" />
@@ -131,13 +131,13 @@
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
-    <ClCompile Include="..\DllLoader\Civ6DLLHookLoaderAPI.cpp" />
-    <ClCompile Include="..\DllLoader\Civ6MessageBus.cpp" />
-    <ClCompile Include="..\DllLoader\HavokScript.cpp" />
-    <ClCompile Include="..\DllLoader\Localization.cpp" />
-    <ClCompile Include="..\DllLoader\Logger.cpp" />
-    <ClCompile Include="..\DllLoader\Runtime.cpp" />
-    <ClCompile Include="..\DllLoader\SymbolDb.cpp" />
+    <ClCompile Include="Civ6DLLHookLoaderAPI.cpp" />
+    <ClCompile Include="Civ6MessageBus.cpp" />
+    <ClCompile Include="HavokScript.cpp" />
+    <ClCompile Include="Localization.cpp" />
+    <ClCompile Include="..\common\Logger.cpp" />
+    <ClCompile Include="Runtime.cpp" />
+    <ClCompile Include="SymbolDb.cpp" />
     <ClCompile Include="pch.cpp"><PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader></ClCompile>
   </ItemGroup>
   <ItemGroup>

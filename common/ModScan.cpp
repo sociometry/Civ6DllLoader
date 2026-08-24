@@ -2,7 +2,7 @@
 #include "ModScan.h"
 #include "EnabledMods.h"
 #include "LoaderProtocol.h"
-#include "../DllLoader/Logger.h"
+#include "Logger.h"
 
 #include <algorithm>
 #include <set>
@@ -181,9 +181,8 @@ void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::pa
 
 // v2 shared pipeline: scan roots -> EnabledMods filter -> case-insensitive lexicographic sort ->
 // basename dedup (order/filter/dedup mirrors the legacy flat Plugins scan).
-std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir) {
-    // v2 运行时无 shell 模块句柄可传：以当前进程可执行模块为锚（游戏进程内 Loader/version.dll 场景）。
-    HMODULE anchor = GetModuleHandleW(nullptr);
+std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir, HMODULE anchor) {
+    // 锚 = Loader 自身模块（version.dll）；由其目录收集扫描根，避免 exe 目录(Win64Steam)导致的根上溯偏差。
     std::vector<std::wstring> out;
     for (const auto& root : CollectScanRoots(anchor)) {
         CollectPluginsUnderContentRootDir(root, pluginSubdir, out);
@@ -237,7 +236,11 @@ std::string WideToNarrow(const std::wstring& s) {
 
 std::wstring FindContentRoot(const std::wstring& binariesWin64Dir) {
     fs::path win64(binariesWin64Dir);
-    if (!EqualsIgnoreCase(win64.filename().wstring(), L"Win64")) return {};
+    // 兼容 Win64 / Win64Steam 两种目录名（Steam 版 exe 与 Loader 在 Binaries\Win64Steam）。
+    const std::wstring win64Name = win64.filename().wstring();
+    if (win64Name.size() < 5 || !EqualsIgnoreCase(win64Name.substr(0, 5), L"Win64")) {
+        return {};
+    }
     fs::path binaries = win64.parent_path();
     if (!EqualsIgnoreCase(binaries.filename().wstring(), L"Binaries")) return {};
     fs::path modRoot = binaries.parent_path();
@@ -276,12 +279,12 @@ std::vector<std::wstring> FindRuntimeCandidates(HMODULE shellModule) {
     return out;
 }
 
-std::vector<std::wstring> FindGlobalPluginCandidates() {
-    return FindSubdirPluginCandidates(L"Global");
+std::vector<std::wstring> FindGlobalPluginCandidates(HMODULE anchor) {
+    return FindSubdirPluginCandidates(L"Global", anchor);
 }
 
-std::vector<std::wstring> FindGameCorePluginCandidates() {
-    return FindSubdirPluginCandidates(L"GameCore");
+std::vector<std::wstring> FindGameCorePluginCandidates(HMODULE anchor) {
+    return FindSubdirPluginCandidates(L"GameCore", anchor);
 }
 
 bool ShouldSkipPluginFile(const fs::path& path) {

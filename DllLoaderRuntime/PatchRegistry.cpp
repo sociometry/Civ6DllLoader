@@ -5,7 +5,7 @@
 
 #include <Windows.h>
 
-#include "../DllLoader/Logger.h"
+#include "../common/Logger.h"
 
 #include <algorithm>
 #include <map>
@@ -55,7 +55,7 @@ bool IsWritableCommitted(void* p, size_t len) {
             return false;
         }
         const size_t regionBytes = static_cast<size_t>(mbi.RegionSize)
-            - (static_cast<uint8_t*>(mbi.BaseAddress) - cur);
+            - static_cast<size_t>(cur - static_cast<uint8_t*>(mbi.BaseAddress));
         if (regionBytes == 0) {
             return false;  // 防御：RegionSize 解析异常，避免死循环
         }

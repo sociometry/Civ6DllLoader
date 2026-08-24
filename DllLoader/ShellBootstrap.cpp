@@ -3,7 +3,7 @@
 #include "../common/LoaderProtocol.h"
 #include "../common/ModScan.h"
 #include "../common/RestartGame.h"
-#include "Logger.h"
+#include "../common/Logger.h"
 
 #include <algorithm>
 #include <string>

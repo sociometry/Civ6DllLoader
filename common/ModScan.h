@@ -25,9 +25,9 @@ std::vector<std::wstring> FindRuntimeCandidates(HMODULE shellModule);
 bool ShouldSkipPluginFile(const fs::path& path);
 
 // v2: 各启用 Mod 的 Binaries\Win64\Plugins\Global\*.dll 候选（顺序/过滤/去重语义同旧扁平 Plugins 扫描）
-// v2 运行时无 shell 模块句柄可传：以当前进程可执行模块（GetModuleHandleW(nullptr)）为锚收集扫描根。
-std::vector<std::wstring> FindGlobalPluginCandidates();
+// anchor = 锚模块（Loader 自身 version.dll）；以其目录收集扫描根。
+std::vector<std::wstring> FindGlobalPluginCandidates(HMODULE anchor);
 // v2: 各启用 Mod 的 Binaries\Win64\Plugins\GameCore\*.dll 候选（同上）
-std::vector<std::wstring> FindGameCorePluginCandidates();
+std::vector<std::wstring> FindGameCorePluginCandidates(HMODULE anchor);
 
 }  // namespace ModScan

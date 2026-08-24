@@ -2,7 +2,7 @@
 #include <Windows.h>
 #include <string>
 #include "HavokScript.h"
-#include "Logger.h"
+#include "../common/Logger.h"
 
 namespace hks {
 	hks_pushnamedcclosureType pushnamedcclosure;

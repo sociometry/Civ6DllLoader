@@ -17,8 +17,8 @@
 #include "LoaderHooks.h"
 #include "LoaderCore.h"
 #include "GameAddress.h"
-#include "../DllLoader/Logger.h"
-#include "../DllLoader/MinHook.h"
+#include "../common/Logger.h"
+#include "MinHook.h"
 
 #include <cwchar>
 #include <wchar.h>
@@ -145,14 +145,6 @@ bool CheckLoadDllSignature(uintptr_t addr) {
         }
     }
     return true;
-}
-
-// lEnableMod/lDisableMod 入口：48 89 5C 24 10 48 89 6C 24 18（mov [rsp+10h],rbx; mov [rsp+18h],rbp）
-bool CheckModToggleSignature(uintptr_t addr) {
-    static const unsigned char kSig[10] = {
-        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18
-    };
-    return memcmp(reinterpret_cast<const void*>(addr), kSig, sizeof(kSig)) == 0;
 }
 
 // UnloadDLL 入口：48 83 EC 28 | 48 83 3D ?? ?? ?? ?? 00 | 74 6E | 48 89
@@ -287,9 +279,8 @@ bool LoaderHooks::InstallAll() {
 
     // ---- lDisableMod @ RVA 0x4CCD50 ----
     const uintptr_t disableAddr = GameAddress::Function(kRva_lDisableMod);
-    if (!disableAddr || !CheckModToggleSignature(disableAddr)) {
-        Logger::Log("lDisableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
-            static_cast<unsigned long long>(disableAddr), GetLastError());
+    if (!disableAddr) {
+        Logger::Log("lDisableMod resolve failed (base unavailable)");
         ok = false;
     } else if ((st = MH_CreateHook((LPVOID)disableAddr, &DisableModDetour, (LPVOID*)&g_origDisableMod))
                != MH_OK) {
@@ -305,9 +296,8 @@ bool LoaderHooks::InstallAll() {
 
     // ---- lEnableMod @ RVA 0x4CCFE0 ----
     const uintptr_t enableAddr = GameAddress::Function(kRva_lEnableMod);
-    if (!enableAddr || !CheckModToggleSignature(enableAddr)) {
-        Logger::Log("lEnableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
-            static_cast<unsigned long long>(enableAddr), GetLastError());
+    if (!enableAddr) {
+        Logger::Log("lEnableMod resolve failed (base unavailable)");
         ok = false;
     } else if ((st = MH_CreateHook((LPVOID)enableAddr, &EnableModDetour, (LPVOID*)&g_origEnableMod))
                != MH_OK) {

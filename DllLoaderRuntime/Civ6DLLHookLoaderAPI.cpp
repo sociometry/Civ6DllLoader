@@ -12,7 +12,7 @@
 #include "Civ6MessageBus.h"
 #include "MinHook.h"
 #include "Runtime.h"
-#include "Logger.h"
+#include "../common/Logger.h"
 #include "../common/ModScan.h"
 #include "ProxyTypes.h"
 #include "Localization.h"
@@ -25,8 +25,8 @@
 #include <cwctype>
 #include <unordered_set>
 
-#include "../DllLoaderRuntime/PatchRegistry.h"
-#include "../DllLoaderRuntime/LoaderCore.h"
+#include "PatchRegistry.h"
+#include "LoaderCore.h"
 
 using namespace std;
 
@@ -1196,6 +1196,11 @@ static void UnloadPluginEntryAt(size_t index) {
     }
     // 撤销该插件的 MinHook 钩子：否则 GameCore 重载后重新 OnLoad 会撞 MH_ERROR_ALREADY_CREATED。
     RemovePluginHooks(g_activePluginName);
+    // 注销 OnMessage：否则 bus 里残留指向本映像的 handler，FreeLibrary 后广播/定向发送会跳进已释放内存。
+    const std::string handlerName = ModScan::WideToNarrow(entry.name);
+    if (!handlerName.empty()) {
+        g_bus.UnregisterHandler(handlerName);
+    }
     SetActivePluginName(nullptr);
     FreeLibrary(entry.handle);
     Logger::Log("Unloaded plugin %s", ModScan::WideToNarrow(entry.path).c_str());
@@ -1206,9 +1211,10 @@ static const char* CategoryNameForLog(LoaderCore::PluginCategory cat) {
 }
 
 void LoaderCore::LoadPluginsOf(PluginCategory cat) {
+    const HMODULE anchor = LoaderCore::RuntimeModuleHandle();
     const auto wpaths = (cat == PluginCategory::GameCore)
-        ? ModScan::FindGameCorePluginCandidates()
-        : ModScan::FindGlobalPluginCandidates();
+        ? ModScan::FindGameCorePluginCandidates(anchor)
+        : ModScan::FindGlobalPluginCandidates(anchor);
     Logger::Log("LoadPluginsOf(%s): %zu candidate(s)", CategoryNameForLog(cat), wpaths.size());
     for (const auto& wpath : wpaths) {
         LoadSinglePlugin(wpath);
@@ -1273,7 +1279,7 @@ bool LoaderCore::InitializeGameCorePhase() {
 }
 
 void LoaderCore::ReconcileGlobalPlugins() {
-    const auto expected = ModScan::FindGlobalPluginCandidates();
+    const auto expected = ModScan::FindGlobalPluginCandidates(LoaderCore::RuntimeModuleHandle());
 
     std::unordered_set<std::wstring> expectedNorm;
     expectedNorm.reserve(expected.size());

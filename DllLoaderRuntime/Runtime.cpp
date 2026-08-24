@@ -1,7 +1,7 @@
 #include "pch.h"
 #include "Runtime.h"
 #include "MinHook.h"
-#include "Logger.h"
+#include "../common/Logger.h"
 #include "HavokScript.h"
 
 #pragma comment(lib, "libMinHook.x64.lib")

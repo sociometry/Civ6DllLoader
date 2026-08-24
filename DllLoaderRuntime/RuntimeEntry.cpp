@@ -21,9 +21,9 @@
 #include "LoaderCore.h"
 #include "LoaderHooks.h"
 #include "LoaderUpdate.h"
-#include "../DllLoader/Logger.h"
-#include "../DllLoader/Runtime.h"
-#include "../DllLoader/SymbolDb.h"
+#include "../common/Logger.h"
+#include "Runtime.h"
+#include "SymbolDb.h"
 
 namespace {
 
@@ -100,6 +100,10 @@ DWORD WINAPI WorkerMain(LPVOID) {
 }  // namespace
 
 // ---- LoaderCore 阶段 A 基础初始化（S3a，本文件实现）----
+HMODULE LoaderCore::RuntimeModuleHandle() {
+    return g_runtimeModule;
+}
+
 void LoaderCore::InitEarly() {
     Logger::Init(L"Civ6DllLoader_Loader.log");
     Logger::Log("InitEarly: runtimeVersion=0x%08X", kLoaderRuntimeVersion);

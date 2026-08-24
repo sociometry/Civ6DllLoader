@@ -14,6 +14,10 @@ enum class PluginCategory {
 // + SymbolDb::Init + Runtime::InitMinHook。实现于 RuntimeEntry.cpp（S3a）。
 void InitEarly();
 
+// Loader 自身模块句柄（version.dll）。实现于 RuntimeEntry.cpp（S3a）；供插件扫描作锚。
+// 返回 0 表示尚未初始化（DllMain 休眠检测未通过，理论不会走到扫描）。
+HMODULE RuntimeModuleHandle();
+
 // 工作线程事件：EnableMod/DisableMod detour（S4）调用本函数置标志并唤醒工作线程，
 // 工作线程随后执行 ReconcileGlobalPlugins。实现于 RuntimeEntry.cpp（S3a）。
 void RequestReconcile();
