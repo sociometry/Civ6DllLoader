@@ -11,10 +11,18 @@ namespace GameAddress {
 // exe 模块基址（GetModuleHandleW(nullptr)，进程内恒定，缓存只取一次）。失败返回 0。
 uintptr_t Base();
 
-// 函数绝对地址 = Base() + rva。rva 为 0 或基址不可用返回 0。
+// exe 模块 PE 头的 SizeOfImage（进程内恒定，缓存只取一次）。失败返回 0。
+// 游戏更新后镜像大小变化 = RVA 集已失效，调用方应据此整体降级。
+uintptr_t ImageSize();
+
+// [Base()+rva, Base()+rva+span) 是否完整落在 exe 镜像内（含 span 字节余量，
+// 供特征码读取前判定可读）。rva=0 或镜像信息不可用返回 false。
+bool RvaSpanValid(uintptr_t rva, size_t span);
+
+// 函数绝对地址 = Base() + rva。rva 为 0、基址不可用或 rva 越出镜像返回 0。
 uintptr_t Function(uintptr_t rva);
 
-// 全局变量（数据）绝对地址 = Base() + rva。rva 为 0 或基址不可用返回 0。
+// 全局变量（数据）绝对地址 = Base() + rva。rva 为 0、基址不可用或 rva 越出镜像返回 0。
 uintptr_t GlobalVariable(uintptr_t rva);
 
 }  // namespace GameAddress

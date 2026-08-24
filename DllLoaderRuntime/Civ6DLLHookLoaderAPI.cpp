@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <cwctype>
+#include <atomic>
 #include <unordered_set>
 
 #include "PatchRegistry.h"
@@ -42,6 +43,13 @@ struct PluginEntry {
     LoaderCore::PluginCategory category = LoaderCore::PluginCategory::Global;
 };
 static vector<PluginEntry> g_plugins;
+
+// 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
+// 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
+// 游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）与 Loader 工作线程
+// （ReconcileGlobalPlugins）在此串行化。g_hookMutex（MinHook 调用 + owner 表）与
+// PatchRegistry 的 CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
+static std::recursive_mutex g_pluginLifecycleMutex;
 
 // 当前正在加载/卸载的插件名（去扩展名的文件名 stem）。OnLoad/OnUnload 期间由
 // SetActivePluginName 设置；HookPatch 与 InstallHookImpl 用它作 owner，使卸载时能对上号。
@@ -121,7 +129,9 @@ static unordered_map<string, void*> g_OriginalFunctions;
 
 
 // ---------------- HookAPI ??? ----------------
-bool InstallHookImpl(void* target, void* detour, void** original) {
+// InstallHookImpl 的内核：owner 显式传入。空串 = Loader 自身的共享 hook
+// （如 RegisterScriptData），插件卸载时不撤销；插件名 = 该插件私有，卸载时撤销。
+static bool InstallHookOwnedBy(void* target, void* detour, void** original, const wchar_t* owner) {
     lock_guard<mutex> lock(g_hookMutex);
 
     MH_STATUS status;
@@ -137,9 +147,14 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
 
     // 记录 target → owner（插件 OnLoad 期间 = 插件 stem；否则空串 = Loader 自身）。
     // 插件卸载时据此撤销，避免 GameCore 重载后同一 target 再次 CreateHook 报 ALREADY_CREATED。
-    g_pluginHookOwners[target] = g_activePluginName[0] ? g_activePluginName : L"";
+    g_pluginHookOwners[target] = owner ? owner : L"";
 
     return true;
+}
+
+bool InstallHookImpl(void* target, void* detour, void** original) {
+    return InstallHookOwnedBy(target, detour, original,
+        g_activePluginName[0] ? g_activePluginName : L"");
 }
 
 void BroadcastMessageImpl(const char* topic, const void* data, size_t len) {
@@ -223,21 +238,37 @@ void* PushLuaMethodsImpl(const char* name, const LuaMethodInfo* methods, uint32_
     return InstallPushMethodsWithManager(target, stored);
 }
 
+// 版本锁定偏移：当前回合 dword 位于 CurrentTurnStorage 解引用对象 +0xC0。
+// 符号库/游戏版本错位时由下方可读探测兜住，返回 0 而不是读崩。
+constexpr size_t kCurTurnDwordOffset = 0xC0;
+
 unsigned int GetCurTurnImpl() {
-    auto slot = reinterpret_cast<uint64_t*>(
+    auto* slot = reinterpret_cast<uint64_t**>(
         GetFunctionByNameImpl("GameCore::Globals::CurrentTurnStorage"));
-    if (!slot || !*slot) {
+    if (!slot || !Runtime::IsReadableSpan(slot, sizeof(uint64_t*)) || !*slot) {
         Logger::Log("GetCurTurn: current-turn storage unavailable");
         return 0;
     }
-    uint32_t* base = reinterpret_cast<uint32_t*>(*slot);
-    return base[48];
+    auto* storage = reinterpret_cast<const uint8_t*>(*slot);
+    if (!Runtime::IsReadableSpan(storage, kCurTurnDwordOffset + sizeof(uint32_t))) {
+        Logger::Log("GetCurTurn: storage readable-span check failed (version-locked offset?)");
+        return 0;
+    }
+    return *reinterpret_cast<const uint32_t*>(storage + kCurTurnDwordOffset);
 }
 
 namespace {
 
-std::vector<ScriptGlobalsFn> g_scriptGlobals;
-std::vector<ScriptGlobalsFn> g_scriptGlobalsUI;
+// 脚本全局注册项：owner = 注册时活跃插件名（空 = Loader 自身，插件卸载不撤销）。
+// fn 指向插件映像内代码，插件卸载时必须移除，否则 RegisterScriptData detour
+// 会调进已 FreeLibrary 的内存（与 OnMessage 悬空 handler 同类问题）。
+struct ScriptGlobalsEntry {
+    std::wstring owner;
+    ScriptGlobalsFn fn;
+};
+
+std::vector<ScriptGlobalsEntry> g_scriptGlobals;
+std::vector<ScriptGlobalsEntry> g_scriptGlobalsUI;
 ProxyTypes::RegisterScriptData g_origRegisterScriptData = nullptr;
 ProxyTypes::RegisterScriptDataForUI g_origRegisterScriptDataForUI = nullptr;
 bool g_scriptHookInstalled = false;
@@ -252,12 +283,19 @@ static void CallScriptGlobalsSafe(ScriptGlobalsFn fn, void* L) {
     }
 }
 
+// 拷贝快照后在锁外回调：注册表可能被 Loader 工作线程（插件卸载清理）并发修改。
+static std::vector<ScriptGlobalsEntry> SnapshotScriptGlobals(std::vector<ScriptGlobalsEntry>& reg) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    return reg;
+}
+
 void __cdecl Hook_RegisterScriptData(hks::lua_State* L) {
-    Logger::Log("RegisterScriptData: running %zu plugin global registrar(s)", g_scriptGlobals.size());
+    const auto snapshot = SnapshotScriptGlobals(g_scriptGlobals);
+    Logger::Log("RegisterScriptData: running %zu plugin global registrar(s)", snapshot.size());
     size_t i = 0;
-    for (auto fn : g_scriptGlobals) {
+    for (const auto& entry : snapshot) {
         Logger::Log("RegisterScriptData: registrar[%zu] begin", i);
-        CallScriptGlobalsSafe(fn, reinterpret_cast<void*>(L));
+        CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
         Logger::Log("RegisterScriptData: registrar[%zu] end", i);
         ++i;
     }
@@ -269,11 +307,12 @@ void __cdecl Hook_RegisterScriptData(hks::lua_State* L) {
 }
 
 void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State* L) {
-    Logger::Log("RegisterScriptDataForUI: running %zu plugin global registrar(s)", g_scriptGlobalsUI.size());
+    const auto snapshot = SnapshotScriptGlobals(g_scriptGlobalsUI);
+    Logger::Log("RegisterScriptDataForUI: running %zu plugin global registrar(s)", snapshot.size());
     size_t i = 0;
-    for (auto fn : g_scriptGlobalsUI) {
+    for (const auto& entry : snapshot) {
         Logger::Log("RegisterScriptDataForUI: registrar[%zu] begin", i);
-        CallScriptGlobalsSafe(fn, reinterpret_cast<void*>(L));
+        CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
         Logger::Log("RegisterScriptDataForUI: registrar[%zu] end", i);
         ++i;
     }
@@ -297,7 +336,8 @@ void ResetScriptHookState() {
 
 void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
     if (fn) {
-        g_scriptGlobals.push_back(fn);
+        lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        g_scriptGlobals.push_back(ScriptGlobalsEntry{ g_activePluginName, fn });
     }
     if (g_scriptHookInstalled) return;
 
@@ -306,8 +346,10 @@ void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
         Logger::Log("RegisterScriptGlobals: RegisterScriptData address missing");
         return;
     }
-    if (!InstallHookImpl(target, reinterpret_cast<void*>(&Hook_RegisterScriptData),
-            reinterpret_cast<void**>(&g_origRegisterScriptData))) {
+    // 共享 hook 归 Loader 所有（owner 传空串）：首个注册者恰好是插件时，
+    // 也不能让该插件卸载时把其他插件共用的 RegisterScriptData hook 摘掉。
+    if (!InstallHookOwnedBy(target, reinterpret_cast<void*>(&Hook_RegisterScriptData),
+            reinterpret_cast<void**>(&g_origRegisterScriptData), L"")) {
         Logger::Log("RegisterScriptGlobals: failed to hook RegisterScriptData");
         return;
     }
@@ -317,7 +359,8 @@ void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
 
 void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
     if (fn) {
-        g_scriptGlobalsUI.push_back(fn);
+        lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        g_scriptGlobalsUI.push_back(ScriptGlobalsEntry{ g_activePluginName, fn });
     }
     if (g_scriptUIHookInstalled) return;
 
@@ -326,8 +369,9 @@ void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
         Logger::Log("RegisterScriptGlobalsForUI: address missing");
         return;
     }
-    if (!InstallHookImpl(target, reinterpret_cast<void*>(&Hook_RegisterScriptDataForUI),
-            reinterpret_cast<void**>(&g_origRegisterScriptDataForUI))) {
+    // 同上：共享 hook，owner = Loader。
+    if (!InstallHookOwnedBy(target, reinterpret_cast<void*>(&Hook_RegisterScriptDataForUI),
+            reinterpret_cast<void**>(&g_origRegisterScriptDataForUI), L"")) {
         Logger::Log("RegisterScriptGlobalsForUI: failed to hook");
         return;
     }
@@ -358,23 +402,39 @@ WithManagerHookSlot g_withManagerSlots[kMaxPushHooks];
 
 template<int I>
 void __fastcall DetourPushNoManager(hks::lua_State* L, int stackOffset) {
-    for (auto& method : g_noManagerSlots[I].methods) {
+    // 拷贝快照后在锁外回调：methods 可能被 Loader 工作线程（插件卸载清理）并发修改，
+    // 快照同时把函数指针与 internalName/exposedName 字符串一并拷贝，锁外安全使用。
+    std::vector<StoredLuaMethod> methods;
+    PushMethodsNoFunc base = nullptr;
+    {
+        lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        methods = g_noManagerSlots[I].methods;
+        base = g_noManagerSlots[I].base;
+    }
+    for (auto& method : methods) {
         PushLuaMethod(L, reinterpret_cast<hks::luaFunc>(method.luaMethodFunc),
             method.internalName.c_str(), stackOffset, method.exposedName.c_str());
     }
-    if (g_noManagerSlots[I].base) {
-        g_noManagerSlots[I].base(L, stackOffset);
+    if (base) {
+        base(L, stackOffset);
     }
 }
 
 template<int I>
 void __fastcall DetourPushWithManager(void* manager, hks::lua_State* L, int stackOffset) {
-    for (auto& method : g_withManagerSlots[I].methods) {
+    std::vector<StoredLuaMethod> methods;
+    PushMethodsWithFunc base = nullptr;
+    {
+        lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        methods = g_withManagerSlots[I].methods;
+        base = g_withManagerSlots[I].base;
+    }
+    for (auto& method : methods) {
         PushLuaMethod(L, reinterpret_cast<hks::luaFunc>(method.luaMethodFunc),
             method.internalName.c_str(), stackOffset, method.exposedName.c_str());
     }
-    if (g_withManagerSlots[I].base) {
-        g_withManagerSlots[I].base(manager, L, stackOffset);
+    if (base) {
+        base(manager, L, stackOffset);
     }
 }
 
@@ -454,6 +514,7 @@ void ResetPushHookSlots() {
 }  // namespace
 
 void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     const int slot = FindOrAllocNoManagerSlot(target);
     if (slot < 0) {
         Logger::Log("InstallPushMethodsNoManager: no free hook slot");
@@ -461,7 +522,15 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
     }
 
     auto& state = g_noManagerSlots[slot];
-    state.methods.insert(state.methods.end(), methods.begin(), methods.end());
+    // 追加的方法记录注册者（OnLoad 期间 = 插件 stem），插件卸载时按 owner 撤销。
+    {
+        std::vector<StoredLuaMethod> owned = methods;
+        const std::wstring owner = g_activePluginName[0] ? g_activePluginName : L"";
+        for (auto& m : owned) {
+            m.owner = owner;
+        }
+        state.methods.insert(state.methods.end(), owned.begin(), owned.end());
+    }
     if (state.base) {
         return reinterpret_cast<void*>(state.base);
     }
@@ -479,6 +548,7 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
 }
 
 void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMethod>& methods) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     const int slot = FindOrAllocWithManagerSlot(target);
     if (slot < 0) {
         Logger::Log("InstallPushMethodsWithManager: no free hook slot");
@@ -486,7 +556,14 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
     }
 
     auto& state = g_withManagerSlots[slot];
-    state.methods.insert(state.methods.end(), methods.begin(), methods.end());
+    {
+        std::vector<StoredLuaMethod> owned = methods;
+        const std::wstring owner = g_activePluginName[0] ? g_activePluginName : L"";
+        for (auto& m : owned) {
+            m.owner = owner;
+        }
+        state.methods.insert(state.methods.end(), owned.begin(), owned.end());
+    }
     if (state.base) {
         return reinterpret_cast<void*>(state.base);
     }
@@ -504,43 +581,72 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
 }
 
 
+// hks 导入缺失时的统一降级：安全默认值 + 限次日志（脚本可能高频调用，不能每次刷日志）。
+// 导入缺失在 InitHavokScript 已整体告警并停用 GameCore 插件加载；此处是纵深防御
+// （阶段 A 已加载的 Global 插件仍可能在调用这些包装）。
+static void WarnHksImportMissing(const char* name) {
+    static std::atomic<int> s_warned{ 0 };
+    if (s_warned.fetch_add(1, std::memory_order_relaxed) < 10) {
+        Logger::Log("HookAPI lua wrapper unavailable (HavokScript import missing): %s", name);
+    }
+}
+
+// 有返回值包装：导入缺失 → 限次日志 + fallback。
+#define HKS_GUARD_RET(fnPtr, fallback, ...) \
+    do { \
+        if (!(fnPtr)) { WarnHksImportMissing(#fnPtr); return (fallback); } \
+        return (fnPtr)(__VA_ARGS__); \
+    } while (0)
+
+// void 包装：导入缺失 → 限次日志 + 直接返回。
+#define HKS_GUARD_VOID(fnPtr, ...) \
+    do { \
+        if (!(fnPtr)) { WarnHksImportMissing(#fnPtr); return; } \
+        return (fnPtr)(__VA_ARGS__); \
+    } while (0)
+
 void LuaPushNamedCClosureImpl(void* L, void* func, int a, const char* name, int b) {
-    hks::pushnamedcclosure(reinterpret_cast<hks::lua_State*>(L), reinterpret_cast<hks::luaFunc>(func), a, name, b);
+    HKS_GUARD_VOID(hks::pushnamedcclosure, reinterpret_cast<hks::lua_State*>(L),
+        reinterpret_cast<hks::luaFunc>(func), a, name, b);
 }
 
 int LuaCheckIntegerImpl(void* L, int index) {
-    return hks::checkinteger(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::checkinteger, 0, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 double LuaCheckNumberImpl(void* L, int index) {
-    return hks::checknumber(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::checknumber, 0.0, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 void LuaSetFieldImpl(void* L, int stackOffset, const char* name) {
-    hks::setfield(reinterpret_cast<hks::lua_State*>(L), stackOffset, name);
+    HKS_GUARD_VOID(hks::setfield, reinterpret_cast<hks::lua_State*>(L), stackOffset, name);
 }
 
 int LuaGetTopImpl(void* L) {
-    return hks::gettop(reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET(hks::gettop, 0, reinterpret_cast<hks::lua_State*>(L));
 }
 
 int LuaDoStringImpl(void* L, const char* str) {
-    return hks::dostring(reinterpret_cast<hks::lua_State*>(L), str);
+    HKS_GUARD_RET(hks::dostring, 0, reinterpret_cast<hks::lua_State*>(L), str);
 }
 
 int LuaToBooleanImpl(void* L, int index) {
-    return hks::toboolean(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::toboolean, 0, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 void LuaPushNumberImpl(void* L, double num) {
-    hks::pushnumber(reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_VOID(hks::pushnumber, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 void LuaPushIntegerImpl(void* L, int num) {
-    hks::pushnumber(reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_VOID(hks::pushnumber, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 void LuaErrorImpl(void* L, char const* str, ...) {
+    if (!hks::error) {
+        WarnHksImportMissing("hks::error");
+        return;
+    }
     char buffer[1024];
     va_list args;
     va_start(args, str);
@@ -550,6 +656,10 @@ void LuaErrorImpl(void* L, char const* str, ...) {
 }
 
 char const* LuaPushFStringImpl(void* L, char const* str, ...) {
+    if (!hks::pushfstring) {
+        WarnHksImportMissing("hks::pushfstring");
+        return nullptr;
+    }
     char buffer[1024];
     va_list args;
     va_start(args, str);
@@ -559,111 +669,116 @@ char const* LuaPushFStringImpl(void* L, char const* str, ...) {
 }
 
 char const* LuaCheckLStringImpl(void* L, int index, unsigned __int64* a) {
-    return hks::checklstring(reinterpret_cast<hks::lua_State*>(L), index, a);
+    HKS_GUARD_RET(hks::checklstring, nullptr, reinterpret_cast<hks::lua_State*>(L), index, a);
 }
 
 void* LuaToUserDataImpl(void* L, int index) {
-    return hks::touserdata(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::touserdata, nullptr, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 void LuaGetFieldImpl(void* L, int a, char const* b) {
-    hks::getfield(reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_VOID(hks::getfield, reinterpret_cast<hks::lua_State*>(L), a, b);
 }
 
 void LuaPopImpl(void* L, int a) {
-    hks::pop(reinterpret_cast<hks::lua_State*>(L), a);
+    HKS_GUARD_VOID(hks::pop, reinterpret_cast<hks::lua_State*>(L), a);
 }
 
 void LuaCreateTableImpl(void* L, int a, int b) {
-    hks::createtable(reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_VOID(hks::createtable, reinterpret_cast<hks::lua_State*>(L), a, b);
 }
 
 void* LuaToCFunctionImpl(void* L, int index) {
+    if (!hks::tocfunction) {
+        WarnHksImportMissing("hks::tocfunction");
+        return nullptr;
+    }
     return reinterpret_cast<void*>(hks::tocfunction(reinterpret_cast<hks::lua_State*>(L), index));
 }
 
 void LuaCheckTableImpl(void* L, int index) {
-    hks::checktable(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_VOID(hks::checktable, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 unsigned long long LuaObjLenImpl(void* L, int index) {
-    return hks::objlen(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::objlen, 0, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 void LuaGetTableImpl(void* L, int index) {
-    hks::gettable(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_VOID(hks::gettable, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 void LuaCPcallImpl(void* L, int a, void* func, int b) {
-    hks::cpcall(reinterpret_cast<hks::lua_State*>(L), a, reinterpret_cast<hks::luaFunc>(func), b);
+    HKS_GUARD_VOID(hks::cpcall, reinterpret_cast<hks::lua_State*>(L), a,
+        reinterpret_cast<hks::luaFunc>(func), b);
 }
 
 int LuaRefImpl(void* L, int index) {
-    return hks::ref(reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::ref, 0, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 int LuaPcallImpl(void* L, int a, int b, int c) {
-    return hks::pcall(reinterpret_cast<hks::lua_State*>(L), a, b, c);
+    HKS_GUARD_RET(hks::pcall, 0, reinterpret_cast<hks::lua_State*>(L), a, b, c);
 }
 
 void LuaPushValueImpl(void* L, int value) {
-    hks::pushvalue(reinterpret_cast<hks::lua_State*>(L), value);
+    HKS_GUARD_VOID(hks::pushvalue, reinterpret_cast<hks::lua_State*>(L), value);
 }
 
 void LuaRawGetIImpl(void* L, int a, int b) {
-    hks::rawgeti(reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_VOID(hks::rawgeti, reinterpret_cast<hks::lua_State*>(L), a, b);
 }
 
 void LuaUnrefImpl(void* L, int a, int b) {
-    hks::unref(reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_VOID(hks::unref, reinterpret_cast<hks::lua_State*>(L), a, b);
 }
 
 void LuaSetTableImpl(void* L, int t) {
-    hks::settable(reinterpret_cast<hks::lua_State*>(L), t);
+    HKS_GUARD_VOID(hks::settable, reinterpret_cast<hks::lua_State*>(L), t);
 }
 
 int LuaIsNumberImpl(void* L, int num) {
-    return hks::isnumber(reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::isnumber, 0, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 double LuaToNumberImpl(void* L, int num) {
-    return hks::tonumber(reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::tonumber, 0.0, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 int LuaIsUserDataImpl(void* L, int num) {
-    return hks::isuserdata(reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::isuserdata, 0, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 int LuaOpenDebugImpl(void* L) {
-    return hks::luaopen_debug(reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET(hks::luaopen_debug, 0, reinterpret_cast<hks::lua_State*>(L));
 }
 
 int LuaToIntegerImpl(void* L, int num) {
-    return hks::tointeger(reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::tointeger, 0, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 int LuaTypeImpl(void* L, int num) {
-    return hks::type(reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::type, 0, reinterpret_cast<hks::lua_State*>(L), num);
 }
 
 int LuaOptIntegerImpl(void* L, int a, int b) {
-    return hks::optinteger(reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_RET(hks::optinteger, b, reinterpret_cast<hks::lua_State*>(L), a, b);
 }
 
 int LuaSetHookImpl(void* L, void* a, int b, int c) {
-    return hks::sethook(reinterpret_cast<hks::lua_State*>(L), a, b, c);
+    HKS_GUARD_RET(hks::sethook, 0, reinterpret_cast<hks::lua_State*>(L), a, b, c);
 }
 
 void* LuaGetHookImpl(void* L) {
-    return hks::gethook(reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET(hks::gethook, nullptr, reinterpret_cast<hks::lua_State*>(L));
 }
 
 int LuaGetHookMaskImpl(void* L) {
-    return hks::gethookmask(reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET(hks::gethookmask, 0, reinterpret_cast<hks::lua_State*>(L));
 }
 
 int LuaGetHookCountImpl(void* L) {
-    return hks::gethookcount(reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET(hks::gethookcount, 0, reinterpret_cast<hks::lua_State*>(L));
 }
 
 int LuaCheckPlayerIdImpl(void* L, int index) {
@@ -705,6 +820,10 @@ void LogImpl(const char* format, ...) {
 
 void LuaPushCFunctionFieldImpl(void* L, int tableIndex, const char* fieldName, void* fn, const char* internalName) {
     if (!L || !fieldName || !fn) return;
+    if (!hks::pushnamedcclosure || !hks::setfield) {
+        WarnHksImportMissing("hks::pushnamedcclosure/setfield");
+        return;
+    }
     const char* iname = internalName && *internalName ? internalName : fieldName;
     auto* state = reinterpret_cast<hks::lua_State*>(L);
     // pushnamedcclosure grows the stack by 1; relative negative indices must be
@@ -717,6 +836,10 @@ void LuaPushCFunctionFieldImpl(void* L, int tableIndex, const char* fieldName, v
 
 void LuaNewGlobalTableImpl(void* L, const char* globalName, int narr, int nrec) {
     if (!L || !globalName) return;
+    if (!hks::createtable || !hks::setfield || !hks::getfield) {
+        WarnHksImportMissing("hks::createtable/setfield/getfield");
+        return;
+    }
     auto* state = reinterpret_cast<hks::lua_State*>(L);
     hks::createtable(state, narr, nrec);
     hks::setfield(state, hks::LUA_GLOBAL, globalName);
@@ -1043,6 +1166,10 @@ static void CallOnUnloadSafe(OnUnloadFunc onUnload, const char* name) {
 // nameNarrow = 显示名（通常为文件名，内部取 stem 作 Patch owner / OnMessage 名）；已加载（同句柄）返回 false。
 static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& nameNarrow,
     LoaderCore::PluginCategory category) {
+    // 全程持锁（含 OnLoad）：与卸载/reconcile 路径互斥，g_plugins 的查重与
+    // push_back 原子化；OnLoad 内再调用 HookAPI 注册入口由递归锁重入。
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+
     HMODULE hPlugin = LoadLibraryExW(wpath.c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!hPlugin) {
@@ -1179,9 +1306,49 @@ static void RemovePluginHooks(const wchar_t* owner) {
     }
 }
 
+// 撤销某插件注册的全部 Lua 方法与脚本全局回调（FreeLibrary 之前调用）：
+// 这些条目持有指向插件映像的函数指针，不清就会在 PushMethods detour /
+// RegisterScriptData detour 里调进已释放内存（与 OnMessage 悬空 handler 同类问题）。
+// 槽位的 methods 清空后保留已装 hook（detour 只透传 base）：避免在游戏可能
+// 正在执行 detour 时摘共享钩；后续同 target 再注册会复用该槽。
+static void RemovePluginOwnedLuaEntries(const std::wstring& owner) {
+    if (owner.empty()) return;
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+
+    auto removeOwnedBy = [&owner](auto& vec) {
+        size_t removed = 0;
+        for (auto it = vec.begin(); it != vec.end(); ) {
+            if (it->owner == owner) {
+                it = vec.erase(it);
+                ++removed;
+            } else {
+                ++it;
+            }
+        }
+        return removed;
+    };
+
+    const size_t globals = removeOwnedBy(g_scriptGlobals);
+    const size_t globalsUi = removeOwnedBy(g_scriptGlobalsUI);
+
+    size_t methods = 0;
+    for (auto& slot : g_noManagerSlots) {
+        if (slot.used) methods += removeOwnedBy(slot.methods);
+    }
+    for (auto& slot : g_withManagerSlots) {
+        if (slot.used) methods += removeOwnedBy(slot.methods);
+    }
+
+    Logger::Log("RemovePluginOwnedLuaEntries: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu",
+        owner.c_str(), globals, globalsUi, methods);
+}
+
 // 按跟踪项卸载单个插件（调用方保证 index 有效）：
 // OnUnload → PatchRegistry::RevertAllFor(name) → RemovePluginHooks(name) → FreeLibrary，语义与 S2a 接线一致。
 static void UnloadPluginEntryAt(size_t index) {
+    // 全程持锁（含 OnUnload）；上层 LoadPluginsOf/Reconcile 等入口也会先取锁，递归重入。
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+
     PluginEntry entry = std::move(g_plugins[index]);
     g_plugins.erase(g_plugins.begin() + index);
 
@@ -1196,14 +1363,22 @@ static void UnloadPluginEntryAt(size_t index) {
     }
     // 撤销该插件的 MinHook 钩子：否则 GameCore 重载后重新 OnLoad 会撞 MH_ERROR_ALREADY_CREATED。
     RemovePluginHooks(g_activePluginName);
+    // 撤销该插件注册的 Lua 方法与脚本全局回调（见 RemovePluginOwnedLuaEntries）。
+    RemovePluginOwnedLuaEntries(entry.name);
     // 注销 OnMessage：否则 bus 里残留指向本映像的 handler，FreeLibrary 后广播/定向发送会跳进已释放内存。
     const std::string handlerName = ModScan::WideToNarrow(entry.name);
     if (!handlerName.empty()) {
         g_bus.UnregisterHandler(handlerName);
     }
     SetActivePluginName(nullptr);
-    FreeLibrary(entry.handle);
-    Logger::Log("Unloaded plugin %s", ModScan::WideToNarrow(entry.path).c_str());
+    // 不 FreeLibrary：游戏线程可能仍在该插件的 detour/回调内执行（MH_DisableHook
+    // 不等待在飞调用，RegisterScriptData 等回调也没有引用计数），此刻卸下映像会把
+    // 正在执行的代码变成 UAF。改为驻留模块（hook 框架的标准做法）：映像保持映射
+    // 但休眠——钩已摘、补丁已回滚、Lua 方法/回调/OnMessage 已注销，不会再被调用。
+    // 代价是该插件重启用时静态状态跨周期保留，OnLoad 必须可重入（重新注册其
+    // 钩子/回调）；这与全新加载路径对插件的要求一致。
+    Logger::Log("Plugin deactivated, module parked (kept mapped): %s",
+        ModScan::WideToNarrow(entry.path).c_str());
 }
 
 static const char* CategoryNameForLog(LoaderCore::PluginCategory cat) {
@@ -1212,6 +1387,8 @@ static const char* CategoryNameForLog(LoaderCore::PluginCategory cat) {
 
 void LoaderCore::LoadPluginsOf(PluginCategory cat) {
     const HMODULE anchor = LoaderCore::RuntimeModuleHandle();
+    // 扫描（文件系统/sqlite）在锁外做，避免长时间阻塞卸载/reconcile 路径；
+    // 单个插件的加载由 LoadSinglePlugin 在锁内原子完成。
     const auto wpaths = (cat == PluginCategory::GameCore)
         ? ModScan::FindGameCorePluginCandidates(anchor)
         : ModScan::FindGlobalPluginCandidates(anchor);
@@ -1222,6 +1399,7 @@ void LoaderCore::LoadPluginsOf(PluginCategory cat) {
 }
 
 void LoaderCore::UnloadPluginsOf(PluginCategory cat) {
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     size_t unloaded = 0;
     for (size_t i = g_plugins.size(); i-- > 0; ) {
         if (g_plugins[i].category != cat) continue;
@@ -1235,10 +1413,13 @@ void LoaderCore::UnloadPluginsOf(PluginCategory cat) {
 bool LoaderCore::LoadSinglePlugin(const std::wstring& path) {
     if (path.empty()) return false;
     const std::wstring norm = NormalizePluginPath(path);
-    for (const auto& entry : g_plugins) {
-        if (NormalizePluginPath(entry.path) == norm) {
-            Logger::Log("LoadSinglePlugin: already loaded %s", ModScan::WideToNarrow(path).c_str());
-            return false;
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        for (const auto& entry : g_plugins) {
+            if (NormalizePluginPath(entry.path) == norm) {
+                Logger::Log("LoadSinglePlugin: already loaded %s", ModScan::WideToNarrow(path).c_str());
+                return false;
+            }
         }
     }
     const std::wstring filename = fs::path(path).filename().wstring();
@@ -1247,6 +1428,7 @@ bool LoaderCore::LoadSinglePlugin(const std::wstring& path) {
 
 void LoaderCore::UnloadSinglePlugin(const std::wstring& path) {
     const std::wstring norm = NormalizePluginPath(path);
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     for (size_t i = 0; i < g_plugins.size(); ++i) {
         if (NormalizePluginPath(g_plugins[i].path) != norm) continue;
         UnloadPluginEntryAt(i);
@@ -1271,7 +1453,12 @@ bool LoaderCore::InitializeGameCorePhase() {
         Logger::Log("InitializeGameCorePhase: InitializeLoader failed");
         return false;
     }
-    hks::InitHavokScript();
+    // HavokScript 导入缺失 = Lua API 半可用，对插件是崩溃源：停用 GameCore 插件
+    // 加载（本会话游戏本体照常运行）。
+    if (!hks::InitHavokScript()) {
+        Logger::Log("InitializeGameCorePhase: InitHavokScript incomplete; GameCore plugins disabled");
+        return false;
+    }
     Localization::InitScript();
     g_gameCorePhaseReady = true;
     Logger::Log("InitializeGameCorePhase: OK");
@@ -1279,7 +1466,11 @@ bool LoaderCore::InitializeGameCorePhase() {
 }
 
 void LoaderCore::ReconcileGlobalPlugins() {
+    // 扫描（文件系统/sqlite）在锁外；下方对 g_plugins 的 diff 与加载/卸载整体持锁，
+    // 与游戏线程的 LoadPluginsOf（LoadDLL detour 内）串行化。
     const auto expected = ModScan::FindGlobalPluginCandidates(LoaderCore::RuntimeModuleHandle());
+
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
 
     std::unordered_set<std::wstring> expectedNorm;
     expectedNorm.reserve(expected.size());

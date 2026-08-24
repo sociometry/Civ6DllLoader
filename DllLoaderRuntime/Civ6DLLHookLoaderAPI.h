@@ -14,6 +14,7 @@ struct StoredLuaMethod {
     LuaMethodFunc luaMethodFunc = nullptr;
     std::string internalName;
     std::string exposedName;
+    std::wstring owner;  // 注册时活跃插件名（空 = Loader 自身；插件卸载时按此撤销）
 };
 
 void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods);

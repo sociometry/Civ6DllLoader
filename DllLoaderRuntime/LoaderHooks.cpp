@@ -128,9 +128,23 @@ const wchar_t* OfficialGameCoreRelPath(const char* ruleset) {
 }
 
 // ---- 特征码校验 ----
+// 特征码读取前的统一前置检查：[addr, addr+span) 必须完整落在 exe 镜像内，
+// 否则游戏更新导致 RVA 错位时，裸读入口字节本身就是访问违例。
+bool SignatureSpanReadable(uintptr_t addr, size_t span) {
+    const uintptr_t base = GameAddress::Base();
+    const uintptr_t imageSize = GameAddress::ImageSize();
+    if (!addr || !base || !imageSize) {
+        return false;
+    }
+    return addr >= base && addr - base + span <= imageSize;
+}
+
 // LoadDLL 入口：48 81 EC 48 02 00 00 | 48 83 3D | ?? ?? ?? ?? | 00 74 0A 32 C0
 // （sub rsp,248h / cmp cs:hModule,0（4 字节 RIP 相对位移通配）/ imm 0 / jz +0Ah / xor al,al）
 bool CheckLoadDllSignature(uintptr_t addr) {
+    if (!SignatureSpanReadable(addr, 19)) {
+        return false;
+    }
     const unsigned char* p = reinterpret_cast<const unsigned char*>(addr);
     // 与通配位置一一对应的固定字节（顺序即为地址偏移 0..6、7..9、14..18）
     static const unsigned char kFixed[15] = {
@@ -147,9 +161,25 @@ bool CheckLoadDllSignature(uintptr_t addr) {
     return true;
 }
 
+// lEnableMod/lDisableMod 入口：48 89 5C 24 10 48 89 6C 24 18
+// （mov [rsp+10h],rbx; mov [rsp+18h],rbp —— 两个函数同款入口序言）。
+// 两者共用：入口相同即通过；不匹配 = 游戏 exe 已更新，RVA 集失效，整体跳过 hook。
+bool CheckModToggleSignature(uintptr_t addr) {
+    if (!SignatureSpanReadable(addr, 10)) {
+        return false;
+    }
+    static const unsigned char kSig[10] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18
+    };
+    return memcmp(reinterpret_cast<const void*>(addr), kSig, sizeof(kSig)) == 0;
+}
+
 // UnloadDLL 入口：48 83 EC 28 | 48 83 3D ?? ?? ?? ?? 00 | 74 6E | 48 89
-// （sub rsp,28h / cmp cs:hModule,0（4 字节 RIP 相对位移通配）/ imm 0 / jz +6Eh / mov [rsp+20h],rbx）
+// （sub rsp,28h / cmp cs:hModule,0（4 字节 RIP 相对位移通配）/ imm 0 / jz +6Eh / mov [rsp+..],rbx）
 bool CheckUnloadDllSignature(uintptr_t addr) {
+    if (!SignatureSpanReadable(addr, 16)) {
+        return false;
+    }
     const unsigned char* p = reinterpret_cast<const unsigned char*>(addr);
     static const unsigned char kFixed[] = {
         0x48, 0x83, 0xEC, 0x28,                          // [0..3]  sub rsp, 28h
@@ -279,8 +309,9 @@ bool LoaderHooks::InstallAll() {
 
     // ---- lDisableMod @ RVA 0x4CCD50 ----
     const uintptr_t disableAddr = GameAddress::Function(kRva_lDisableMod);
-    if (!disableAddr) {
-        Logger::Log("lDisableMod resolve failed (base unavailable)");
+    if (!disableAddr || !CheckModToggleSignature(disableAddr)) {
+        Logger::Log("lDisableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
+            static_cast<unsigned long long>(disableAddr), GetLastError());
         ok = false;
     } else if ((st = MH_CreateHook((LPVOID)disableAddr, &DisableModDetour, (LPVOID*)&g_origDisableMod))
                != MH_OK) {
@@ -296,8 +327,9 @@ bool LoaderHooks::InstallAll() {
 
     // ---- lEnableMod @ RVA 0x4CCFE0 ----
     const uintptr_t enableAddr = GameAddress::Function(kRva_lEnableMod);
-    if (!enableAddr) {
-        Logger::Log("lEnableMod resolve failed (base unavailable)");
+    if (!enableAddr || !CheckModToggleSignature(enableAddr)) {
+        Logger::Log("lEnableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
+            static_cast<unsigned long long>(enableAddr), GetLastError());
         ok = false;
     } else if ((st = MH_CreateHook((LPVOID)enableAddr, &EnableModDetour, (LPVOID*)&g_origEnableMod))
                != MH_OK) {

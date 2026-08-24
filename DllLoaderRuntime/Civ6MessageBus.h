@@ -29,18 +29,5 @@ private:
     std::unordered_map<std::string, MessageHandler> handlers_;
 };
 
-extern Civ6MessageBus g_messageBus;
-
-// C 接口：供跨 DLL 边界调用
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-    void RegisterMessageHandler(const char* name, void (*handler)(const char*, const void*, size_t));
-    void UnregisterMessageHandler(const char* name);
-    void BroadcastMessage(const char* topic, const void* data, size_t len);
-    void SendMessageTo(const char* targetName, const char* topic, const void* data, size_t len);
-
-#ifdef __cplusplus
-}
-#endif
+// 插件侧消息收发统一走 common/HookAPI.h（BroadcastMessage/SendMessageTo 函数指针），
+// 由运行时的 g_bus 实现；不再提供平行的 C 导出接口。

@@ -1,7 +1,9 @@
 #include "pch.h"
 #include <Windows.h>
 #include <string>
+#include <vector>
 #include "HavokScript.h"
+#include "Runtime.h"
 #include "../common/Logger.h"
 
 namespace hks {
@@ -44,48 +46,98 @@ namespace hks {
 	hksi_lua_gethookmaskType gethookmask;
 	hksi_lua_gethookcountType gethookcount;
 
+	// 官方导出优先（存在时无 lua_State 布局依赖）；仅当全部候选都缺失才走原始栈写入兜底。
+	hksi_lua_pushbooleanType pushbooleanReal = nullptr;
+	hksi_lua_pushlightuserdataType pushlightuserdataReal = nullptr;
+
+	// 本次 Init 缺失的导入名清单（含重复解析失败）；InitHavokScript 据此判定整体失败。
+	std::vector<std::string> g_missingImports;
+
+	// 解析并登记：缺失的导入名记录在案，InitHavokScript 汇总告警并返回 false
+	// （GameCore 插件随之停用——半可用的 Lua API 对插件是崩溃源，宁可不加载）。
+#define RESOLVE_IMPORT(var, mangled) \
+    do { \
+        (var) = reinterpret_cast<decltype(var)>(GetProcAddress(hksDll, (mangled))); \
+        if (!(var)) g_missingImports.push_back((mangled)); \
+    } while (0)
+
+	// 候选型解析：按顺序尝试多个 mangling，第一个命中的生效；全缺失不算失败（有兜底路径）。
+	template <typename FnT>
+	FnT ResolveFirst(HMODULE hksDll, const char* const* candidates, size_t count) {
+		for (size_t i = 0; i < count; ++i) {
+			if (auto fn = reinterpret_cast<FnT>(GetProcAddress(hksDll, candidates[i]))) {
+				return fn;
+			}
+		}
+		return nullptr;
+	}
+
 	static void InitHavokScriptImports(HMODULE hksDll) {
-		pushnamedcclosure = (hks_pushnamedcclosureType)GetProcAddress(hksDll, "?hks_pushnamedcclosure@@YAXPEAUlua_State@@P6AH0@ZHPEBDH@Z");
-		setfield = (hksi_lua_setfieldType)GetProcAddress(hksDll, "?hksi_lua_setfield@@YAXPEAUlua_State@@HPEBD@Z");
-		checkinteger = (luaL_checkintegerType)GetProcAddress(hksDll, "?luaL_checkinteger@@YAHPEAUlua_State@@H@Z");
-		gettop = (GetTopType)GetProcAddress(hksDll, "?GetTop@LuaState@LuaPlus@@QEBAHXZ");
-		dostring = (DoStringType)GetProcAddress(hksDll, "?DoString@LuaState@LuaPlus@@QEAAHPEBD@Z");
-		toboolean = (hksi_lua_tobooleanType)GetProcAddress(hksDll, "?hksi_lua_toboolean@@YAHPEAUlua_State@@H@Z");
-		pushinteger = (hksi_lua_pushintegerType)GetProcAddress(hksDll, "?hksi_lua_pushinteger@@YAXPEAUlua_State@@H@Z");
-		pushnumber = (hksi_lua_pushnumberType)GetProcAddress(hksDll, "?hksi_lua_pushnumber@@YAXPEAUlua_State@@N@Z");
-		error = (hksi_luaL_errorType)GetProcAddress(hksDll, "?hksi_luaL_error@@YAHPEAUlua_State@@PEBDZZ");
-		checknumber = (luaL_checknumberType)GetProcAddress(hksDll, "?luaL_checknumber@@YANPEAUlua_State@@H@Z");
-		pushfstring = (hksi_lua_pushfstringType)GetProcAddress(hksDll, "?hksi_lua_pushfstring@@YAPEBDPEAUlua_State@@PEBDZZ");
-		checklstring = (CheckLStringType)GetProcAddress(hksDll, "?hksi_luaL_checklstring@@YAPEBDPEAUlua_State@@HPEA_K@Z");
-		pop = (PopType)GetProcAddress(hksDll, "?Pop@LuaState@LuaPlus@@QEAAXH@Z");
-		touserdata = (hksi_lua_touserdataType)GetProcAddress(hksDll, "?hksi_lua_touserdata@@YAPEAXPEAUlua_State@@H@Z");
-		getfield = (hksi_lua_getfieldType)GetProcAddress(hksDll, "?hksi_lua_getfield@@YAXPEAUlua_State@@HPEBD@Z");
-		createtable = (hksi_lua_createtableType)GetProcAddress(hksDll, "?lua_createtable@@YAXPEAUlua_State@@HH@Z");
-		tocfunction = (lua_tocfunctionType)GetProcAddress(hksDll, "?lua_tocfunction@@YAP6AHPEAUlua_State@@@Z0H@Z");
-		checktable = (hksL_checktableType)GetProcAddress(hksDll, "?hksL_checktable@@YAXPEAUlua_State@@H@Z");
-		objlen = (hks_lua_objlenType)GetProcAddress(hksDll, "?hksi_lua_objlen@@YA_KPEAUlua_State@@H@Z");
-		gettable = (hks_lua_gettableType)GetProcAddress(hksDll, "?hksi_lua_gettable@@YAXPEAUlua_State@@H@Z");
-		cpcall = (hksi_lua_cpcallType)GetProcAddress(hksDll, "?hksi_lua_cpcall@@YAHPEAUlua_State@@P6AH0@ZPEAX@Z");
-		ref = (RefType)GetProcAddress(hksDll, "?luaL_ref@@YAHPEAUlua_State@@H@Z");
-		pcall = (hksi_lua_pcallType)GetProcAddress(hksDll, "?hksi_lua_pcall@@YAHPEAUlua_State@@HHH@Z");
-		pushvalue = (hski_lua_pushvalueType)GetProcAddress(hksDll, "?hksi_lua_pushvalue@@YAXPEAUlua_State@@H@Z");
-		rawgeti = (hksi_lua_rawgetiType)GetProcAddress(hksDll, "?hksi_lua_rawgeti@@YAXPEAUlua_State@@HH@Z");
-		unref = (hksi_lua_unrefType)GetProcAddress(hksDll, "?hksi_luaL_unref@@YAXPEAUlua_State@@HH@Z");
-		settable = (hksi_lua_settableType)GetProcAddress(hksDll, "?SetTable@LuaState@LuaPlus@@QEAAXH@Z");
-		isnumber = (hksi_lua_isnumberType)GetProcAddress(hksDll, "?hksi_lua_isnumber@@YAHPEAUlua_State@@H@Z");
-		tonumber = (hksi_lua_tonumberType)GetProcAddress(hksDll, "?hksi_lua_tonumber@@YANPEAUlua_State@@H@Z");
-		isuserdata = (hksi_lua_isuserdataType)GetProcAddress(hksDll, "?hksi_lua_isuserdata@@YAHPEAUlua_State@@H@Z");
-		luaopen_debug = (luaopen_debugType)GetProcAddress(hksDll, "?luaopen_debug@@YAHPEAUlua_State@@@Z");
-		tointeger = (hksi_lua_tointegerType)GetProcAddress(hksDll, "?hksi_lua_tointeger@@YAHPEAUlua_State@@H@Z");
-		type = (hksi_lua_typeType)GetProcAddress(hksDll, "?hksi_lua_type@@YAHPEAUlua_State@@H@Z");
-		optinteger = (luaL_optintegerType)GetProcAddress(hksDll, "?luaL_optinteger@@YAHPEAUlua_State@@HH@Z");
-		sethook = (hksi_lua_sethookType)GetProcAddress(hksDll, "?hksi_lua_sethook@@YAHPEAUlua_State@@P6AX0PEAUlua_Debug@@@ZHH@Z");
-		gethook = (hksi_lua_gethookType)GetProcAddress(hksDll, "?hksi_lua_gethook@@YAP6AXPEAUlua_State@@PEAUlua_Debug@@@Z0@Z");
-		gethookmask = (hksi_lua_gethookmaskType)GetProcAddress(hksDll, "?hksi_lua_gethookmask@@YAHPEAUlua_State@@@Z");
-		gethookcount = (hksi_lua_gethookcountType)GetProcAddress(hksDll, "?hksi_lua_gethookcount@@YAHPEAUlua_State@@@Z");
+		g_missingImports.clear();
+
+		RESOLVE_IMPORT(pushnamedcclosure, "?hks_pushnamedcclosure@@YAXPEAUlua_State@@P6AH0@ZHPEBDH@Z");
+		RESOLVE_IMPORT(setfield, "?hksi_lua_setfield@@YAXPEAUlua_State@@HPEBD@Z");
+		RESOLVE_IMPORT(checkinteger, "?luaL_checkinteger@@YAHPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(gettop, "?GetTop@LuaState@LuaPlus@@QEBAHXZ");
+		RESOLVE_IMPORT(dostring, "?DoString@LuaState@LuaPlus@@QEAAHPEBD@Z");
+		RESOLVE_IMPORT(toboolean, "?hksi_lua_toboolean@@YAHPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(pushinteger, "?hksi_lua_pushinteger@@YAXPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(pushnumber, "?hksi_lua_pushnumber@@YAXPEAUlua_State@@N@Z");
+		RESOLVE_IMPORT(error, "?hksi_luaL_error@@YAHPEAUlua_State@@PEBDZZ");
+		RESOLVE_IMPORT(checknumber, "?luaL_checknumber@@YANPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(pushfstring, "?hksi_lua_pushfstring@@YAPEBDPEAUlua_State@@PEBDZZ");
+		RESOLVE_IMPORT(checklstring, "?hksi_luaL_checklstring@@YAPEBDPEAUlua_State@@HPEA_K@Z");
+		RESOLVE_IMPORT(pop, "?Pop@LuaState@LuaPlus@@QEAAXH@Z");
+		RESOLVE_IMPORT(touserdata, "?hksi_lua_touserdata@@YAPEAXPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(getfield, "?hksi_lua_getfield@@YAXPEAUlua_State@@HPEBD@Z");
+		RESOLVE_IMPORT(createtable, "?lua_createtable@@YAXPEAUlua_State@@HH@Z");
+		RESOLVE_IMPORT(tocfunction, "?lua_tocfunction@@YAP6AHPEAUlua_State@@@Z0H@Z");
+		RESOLVE_IMPORT(checktable, "?hksL_checktable@@YAXPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(objlen, "?hksi_lua_objlen@@YA_KPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(gettable, "?hksi_lua_gettable@@YAXPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(cpcall, "?hksi_lua_cpcall@@YAHPEAUlua_State@@P6AH0@ZPEAX@Z");
+		RESOLVE_IMPORT(ref, "?luaL_ref@@YAHPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(pcall, "?hksi_lua_pcall@@YAHPEAUlua_State@@HHH@Z");
+		RESOLVE_IMPORT(pushvalue, "?hksi_lua_pushvalue@@YAXPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(rawgeti, "?hksi_lua_rawgeti@@YAXPEAUlua_State@@HH@Z");
+		RESOLVE_IMPORT(unref, "?hksi_luaL_unref@@YAXPEAUlua_State@@HH@Z");
+		RESOLVE_IMPORT(settable, "?SetTable@LuaState@LuaPlus@@QEAAXH@Z");
+		RESOLVE_IMPORT(isnumber, "?hksi_lua_isnumber@@YAHPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(tonumber, "?hksi_lua_tonumber@@YANPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(isuserdata, "?hksi_lua_isuserdata@@YAHPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(luaopen_debug, "?luaopen_debug@@YAHPEAUlua_State@@@Z");
+		RESOLVE_IMPORT(tointeger, "?hksi_lua_tointeger@@YAHPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(type, "?hksi_lua_type@@YAHPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(optinteger, "?luaL_optinteger@@YAHPEAUlua_State@@HH@Z");
+		RESOLVE_IMPORT(sethook, "?hksi_lua_sethook@@YAHPEAUlua_State@@P6AX0PEAUlua_Debug@@@ZHH@Z");
+		RESOLVE_IMPORT(gethook, "?hksi_lua_gethook@@YAP6AXPEAUlua_State@@PEAUlua_Debug@@@Z0@Z");
+		RESOLVE_IMPORT(gethookmask, "?hksi_lua_gethookmask@@YAHPEAUlua_State@@@Z");
+		RESOLVE_IMPORT(gethookcount, "?hksi_lua_gethookcount@@YAHPEAUlua_State@@@Z");
+
+		// pushboolean / pushlightuserdata：尝试官方导出（精确 mangling 匹配，不存在即返回空）。
+		static const char* kPushBooleanCandidates[] = {
+			"?hksi_lua_pushboolean@@YAXPEAUlua_State@@_N@Z",
+			"?hksi_lua_pushboolean@@YAXPEAUlua_State@@H@Z",
+			"?lua_pushboolean@@YAXPEAUlua_State@@H@Z",
+		};
+		static const char* kPushLightUserDataCandidates[] = {
+			"?hksi_lua_pushlightuserdata@@YAXPEAUlua_State@@PEAX@Z",
+			"?lua_pushlightuserdata@@YAXPEAUlua_State@@PEAX@Z",
+		};
+		pushbooleanReal = ResolveFirst<hksi_lua_pushbooleanType>(
+			hksDll, kPushBooleanCandidates, _countof(kPushBooleanCandidates));
+		pushlightuserdataReal = ResolveFirst<hksi_lua_pushlightuserdataType>(
+			hksDll, kPushLightUserDataCandidates, _countof(kPushLightUserDataCandidates));
+		if (!pushbooleanReal) {
+			Logger::Log("InitHavokScript: no pushboolean export; raw-stack fallback (offset-locked)");
+		}
+		if (!pushlightuserdataReal) {
+			Logger::Log("InitHavokScript: no pushlightuserdata export; raw-stack fallback (offset-locked)");
+		}
 	}
 
 	int l_sethook(lua_State* L) {
+		if (!tocfunction || !checkinteger || !optinteger || !sethook) return 0;
 		void* hook = tocfunction(L, 1);
 		int mask = checkinteger(L, 2);
 		int count = optinteger(L, 3, 0);
@@ -96,11 +148,15 @@ namespace hks {
 
 	static int hook_id = 0;
 	int l_gethook(lua_State* L) {
+		if (!gethook || !pushnamedcclosure || !pushinteger || !gethookmask || !gethookcount) {
+			return 0;
+		}
 		void* hook = gethook(L);
 		if (hook == NULL) return 0;
 
 		char hook_name[20] = "hook_";
-		snprintf(hook_name + strlen(hook_name), sizeof(hook_name), "%d", hook_id++);
+		snprintf(hook_name + strlen(hook_name), sizeof(hook_name) - strlen(hook_name),
+			"%d", hook_id++);
 
 		pushnamedcclosure(L, (luaFunc)hook, 0, hook_name, 0);
 		pushinteger(L, gethookmask(L));
@@ -109,6 +165,10 @@ namespace hks {
 	}
 
 	int checkplayerid(lua_State* L, int position) {
+		if (!checkinteger) {
+			if (error) error(L, "checkplayerid unavailable (HavokScript import missing)");
+			return -1;
+		}
 		int playerId = hks::checkinteger(L, position);
 		if (0 <= playerId && playerId < 64) {
 			return playerId;
@@ -119,35 +179,57 @@ namespace hks {
 		return -1;
 	}
 
+	// ---- 原始栈写入兜底（仅当 HavokScript 未导出对应 push 函数时使用）----
+	// lua_State::top 指针槽偏移：版本锁定值（当前 GameCore 布局）。官方导出可用时
+	// 本路径不会执行；布局变化时由下面的可写探测兜住，写不进去只丢这一个值。
+	constexpr uintptr_t kLuaStateTopSlotOffset = 0x48;
+
+	// 写入一个 16 字节 TValue（tt(4)+pad(4)+value(8)）并把 top 指针推进一个槽位。
+	static bool RawPushTValue(lua_State* L, int typeTag, uintptr_t valueBits) {
+		if (!L) return false;
+		int** topSlotPtr = reinterpret_cast<int**>(reinterpret_cast<uintptr_t>(L) + kLuaStateTopSlotOffset);
+		if (!Runtime::IsReadableSpan(topSlotPtr, sizeof(int*))) return false;
+		int* stackTop = *topSlotPtr;
+		if (!Runtime::IsWritableSpan(stackTop, 16)) return false;
+		stackTop[0] = typeTag;                                    // tt
+		*reinterpret_cast<uintptr_t*>(stackTop + 2) = valueBits;  // value（+8）
+		*topSlotPtr = stackTop + 4;                               // top += sizeof(TValue)
+		return true;
+	}
+
 	void pushboolean(lua_State* L, bool value) {
-		// Access the Lua stack top pointer
-		int* stackTop = *(int**)((uintptr_t)L + 0x48);
-
-		// Push a Lua boolean value onto the stack
-		*stackTop = 1;
-		stackTop[2] = static_cast<unsigned int>(value);
-
-		// Increment the stack top pointer by 4 bytes
-		*(int**)((uintptr_t)L + 0x48) = stackTop + 0x4;
+		if (pushbooleanReal) {
+			pushbooleanReal(L, value ? 1 : 0);
+			return;
+		}
+		RawPushTValue(L, 1, value ? 1u : 0u);  // LUA_TBOOLEAN
 	}
 
-	// GameCore: 0x16a10
 	void pushlightuserdata(lua_State* L, void* ptr) {
-		int* luaStack = *(int**)((uintptr_t)L + 0x48);
-
-		*(void**)(luaStack + 2) = ptr;
-		*luaStack = 2;
-
-		*(int**)((uintptr_t)L + 0x48) = luaStack + 0x4;
+		if (pushlightuserdataReal) {
+			pushlightuserdataReal(L, ptr);
+			return;
+		}
+		RawPushTValue(L, 2, reinterpret_cast<uintptr_t>(ptr));  // LUA_TLIGHTUSERDATA
 	}
 
-	// Should only ever be called once.
-	void InitHavokScript() {
+	// Should only ever be called once. 返回 false = 有导入缺失，
+	// 调用方（InitializeGameCorePhase）据此停用 GameCore 插件加载（宁缺毋崩）。
+	bool InitHavokScript() {
 		HMODULE hksDll = GetModuleHandle(TEXT("HavokScript_FinalRelease.dll"));
 		if (hksDll == NULL) {
 			Logger::Log("Failed to load HavokScript err=%lu", GetLastError());
-			return;
+			return false;
 		}
 		InitHavokScriptImports(hksDll);
+		if (!g_missingImports.empty()) {
+			for (const auto& name : g_missingImports) {
+				Logger::Log("HavokScript missing import: %s", name.c_str());
+			}
+			Logger::Log("InitHavokScript: %zu import(s) missing; lua API degraded",
+				g_missingImports.size());
+			return false;
+		}
+		return true;
 	}
 }

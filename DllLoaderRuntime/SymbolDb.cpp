@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,11 @@ struct Entry {
 #pragma pack(pop)
 
 static_assert(sizeof(Header) == 28, "SymbolDb header size");
+
+// 保护 g_map / g_expectedSizeOfImage / g_loaded 的跨线程访问：
+// LookupRva 在游戏线程（GetFunctionByName 路径）被调，RegisterRva 可在 Loader
+// 工作线程（Global 插件 OnLoad）被调，unordered_map 并发读写是 UB。
+std::mutex g_stateMutex;
 
 std::unordered_map<std::string, uint32_t> g_map;
 uint32_t g_expectedSizeOfImage = 0;
@@ -73,6 +79,8 @@ bool ParseBlob(const uint8_t* data, size_t size, const char* sourceTag) {
         return false;
     }
     const uint8_t* heap = data + hdr.heapOffset;
+    // 以下开始触碰共享状态（校验段只读局部变量，锁外完成）。
+    std::lock_guard<std::mutex> lock(g_stateMutex);
     g_map.clear();
     g_map.reserve(hdr.entryCount);
     for (uint32_t i = 0; i < hdr.entryCount; ++i) {
@@ -155,6 +163,7 @@ bool Init(HMODULE runtimeModule) {
 }
 
 void Shutdown() {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
     g_map.clear();
     g_blob.clear();
     g_expectedSizeOfImage = 0;
@@ -162,7 +171,9 @@ void Shutdown() {
 }
 
 uint32_t LookupRva(const char* name) {
-    if (!name || !*name || g_map.empty()) return 0;
+    if (!name || !*name) return 0;
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    if (g_map.empty()) return 0;
     const auto it = g_map.find(name);
     if (it == g_map.end()) return 0;
     return it->second;
@@ -170,20 +181,24 @@ uint32_t LookupRva(const char* name) {
 
 bool RegisterRva(const char* name, uint32_t rva) {
     if (!name || !*name || rva == 0) return false;
+    std::lock_guard<std::mutex> lock(g_stateMutex);
     g_map[name] = rva;
     g_loaded = true;
     return true;
 }
 
 size_t EntryCount() {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
     return g_map.size();
 }
 
 uint32_t ExpectedSizeOfImage() {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
     return g_expectedSizeOfImage;
 }
 
 bool IsLoaded() {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
     return g_loaded;
 }
 

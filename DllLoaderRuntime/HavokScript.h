@@ -2,9 +2,15 @@
 #include <iostream>
 #include <Windows.h>
 
+// 推送前检查导入指针：HavokScript 导出缺失时静默跳过（InitHavokScript 已整体告警），
+// 不再把空指针调用放进游戏线程。
 #define PushLuaMethod(L, func, cclosurename, stackOffset, name) \
-    hks::pushnamedcclosure(L, func, 0, cclosurename, 0); \
-    hks::setfield(L, stackOffset, name);
+    do { \
+        if (hks::pushnamedcclosure && hks::setfield) { \
+            hks::pushnamedcclosure(L, func, 0, cclosurename, 0); \
+            hks::setfield(L, stackOffset, name); \
+        } \
+    } while (0)
 
 namespace hks {
 	constexpr int LUA_GLOBAL = -10002;
@@ -91,6 +97,11 @@ namespace hks {
 	typedef int(__cdecl* hksi_lua_gethookcountType)(lua_State*);
 	extern hksi_lua_gethookcountType gethookcount;
 
+	// 官方导出优先的 pushboolean/pushlightuserdata（缺失时 HavokScript.cpp 内部走
+	// 带防护的原始栈写入兜底，不对外暴露）。
+	typedef void(__cdecl* hksi_lua_pushbooleanType)(lua_State*, int);
+	typedef void(__cdecl* hksi_lua_pushlightuserdataType)(lua_State*, void*);
+
 	extern int checkplayerid(lua_State*, int);
 	extern void pushboolean(lua_State* L, bool value);
 	extern void pushlightuserdata(lua_State* L, void* ptr);
@@ -98,6 +109,7 @@ namespace hks {
 	extern int l_sethook(lua_State* L);
 	extern int l_gethook(lua_State* L);
 
-	// Should only ever be called once
-	extern void InitHavokScript();
+	// Should only ever be called once. false = HavokScript 模块缺失或有导入未解析，
+	// 调用方应停用依赖 Lua API 的插件加载。
+	extern bool InitHavokScript();
 }
