@@ -31,6 +31,11 @@ typedef struct LuaMethodInfo {
 typedef void (*MessageHandlerFn)(const char* topic, const void* data, size_t len);
 typedef void (*ScriptGlobalsFn)(void* L);
 
+// GameCore 生命周期回调（Global 插件延迟挂钩的标准姿势）。
+// context 原样回传，插件可放自己的状态指针。
+typedef void (*GameCoreReadyFn)(void* context);
+typedef void (*GameCoreTeardownFn)(void* context);
+
 // Matches hks::LUA_GLOBAL - plugins can use this with LuaSetField.
 enum { kHookApiLuaGlobal = -10002 };
 
@@ -128,6 +133,23 @@ typedef struct HookAPI {
     // v2: 原始字节补丁（单层存档，见 patch registry）。由运行时在初始化时填表。
     bool (*Patch)(void* target, const void* bytes, size_t len);
     bool (*Unpatch)(void* target);
+
+    // v2.1: GameCore 生命周期回调 —— Global 插件延迟挂钩的标准姿势：
+    //   OnLoad → 先 RegisterGameCoreTeardown(teardown) → 再 RegisterGameCoreReady(ready)
+    //   → ready 内 GetFunctionByName + InstallHook。
+    // 语义要点：
+    //  - Ready 回调在游戏线程、新 GameCore attach 后触发（早于 GameCore 插件加载）；
+    //    注册时若 GameCore 已就绪（如对局中加载的插件），回调立即补调一次。
+    //  - Teardown 回调在旧 GameCore 映像卸载前触发；该代插件钩已被禁用，仍可
+    //    解析符号读数据收尾，但禁止再对旧映像装钩/打补丁（会被拒绝）。
+    //    Global 插件若要 InstallHook 到 GameCore，必须先注册 Teardown，否则拒绝。
+    //  - 每次重载为一"代"：teardown 后该代 GameCore 域的钩与补丁会被运行时统一
+    //    撤销——插件须在 Teardown 返回前排空自身在途 detour 并置空 original
+    //    trampoline；下一次 Ready 回调重新安装并取得新 trampoline。
+    //  - 回调应保持短小（持运行时生命周期锁执行，重活自行开线程）；崩溃的回调
+    //    会被 SEH 捕获，插件随之被隔离（其全部注册被回滚）。
+    void (*RegisterGameCoreReady)(GameCoreReadyFn fn, void* context);
+    void (*RegisterGameCoreTeardown)(GameCoreTeardownFn fn, void* context);
 } HookAPI;
 
 // True if this runtime can serve a plugin built against the current header.

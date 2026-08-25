@@ -220,4 +220,48 @@ size_t RevertAllFor(const wchar_t* owner) {
     return reverted;
 }
 
+size_t RevertAllInRange(uintptr_t base, uintptr_t size) {
+    if (!base || !size) {
+        return 0;
+    }
+    EnterCriticalSection(&Cs());
+
+    std::vector<void*> targets;
+    targets.reserve(Registry().size());
+    for (const auto& kv : Registry()) {
+        const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
+        if (p >= base && p - base < size) {
+            targets.push_back(kv.first);
+        }
+    }
+
+    size_t reverted = 0;
+    for (void* t : targets) {
+        const auto it = Registry().find(t);
+        if (it == Registry().end()) {
+            continue;
+        }
+        const size_t origSize = it->second.original.size();
+        DWORD oldProtect = 0;
+        if (VirtualProtect(t, origSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(t, it->second.original.data(), origSize);
+            VirtualProtect(t, origSize, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), t, origSize);
+            ++reverted;
+        } else {
+            // 回滚失败（如重载兜底路径映像已卸载）：字节随映射消失，同样丢弃。
+            Logger::Log("PatchRegistry::RevertAllInRange: VirtualProtect failed target=%p err=%lu (dropping record)",
+                t, GetLastError());
+        }
+        Registry().erase(it);
+    }
+    LeaveCriticalSection(&Cs());
+    if (!targets.empty()) {
+        Logger::Log("PatchRegistry::RevertAllInRange: base=0x%llX size=0x%llX cleared=%zu reverted=%zu",
+            static_cast<unsigned long long>(base),
+            static_cast<unsigned long long>(size), targets.size(), reverted);
+    }
+    return reverted;
+}
+
 }  // namespace PatchRegistry
