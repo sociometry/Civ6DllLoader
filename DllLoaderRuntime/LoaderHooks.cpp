@@ -8,15 +8,14 @@
 //   - AppLuaModdingLibrary::lDisableMod @ RVA 0x4CCD50（阶段 C，同上）
 // 一切失败仅日志 + 静默降级（已装上的 hook 保持），由调用方 WorkerMain 记录降级。
 //
-// 地址换算统一走 GameAddress（Base/Function/Global 基础封装）；RVA 常量与入口特征码
-// 仍由本文件持有。以后换获取方案时，本文件的 RVA/特征码随方案演进，GameAddress 只做换算。
+// 地址换算统一走 ImageAddress；RVA 常量与入口特征码仍由本文件持有。
 // 符号/版本敏感点：RVA 相对 GetModuleHandleW(nullptr) 基址（ASLR）。
 
 #include "pch.h"
 
 #include "LoaderHooks.h"
 #include "LoaderCore.h"
-#include "GameAddress.h"
+#include "ImageAddress.h"
 #include "Runtime.h"
 #include "../common/Logger.h"
 #include "MinHook.h"
@@ -27,6 +26,8 @@
 #include <cstring>
 
 namespace {
+
+constexpr HookImageId kLoaderExeImage = kHookImageExeDx11;
 
 // ---- exe 域 RVA 常量（相对 GetModuleHandleW(nullptr) 基址；来源见 docs/ 逆向报告）----
 constexpr uintptr_t kRva_LoadDLL          = 0xF8510;    // GameCore::LoadDLL
@@ -96,8 +97,10 @@ bool BuildOfficialPath(const wchar_t* rel) {
 // GetRuleSet 返回当前规则集名字符串：0=还没进游戏；否则 "RULESET_STANDARD" /
 // "RULESET_EXPANSION_1" / "RULESET_EXPANSION_2"（来自配置库 Rulesets 表）。
 const char* GetRuleSetName() {
-    const uintptr_t cfgAddr = GameAddress::Function(kRva_GetConfiguration);
-    const uintptr_t rsAddr  = GameAddress::Function(kRva_GetRuleSet);
+    const uintptr_t cfgAddr = reinterpret_cast<uintptr_t>(
+        ImageAddress::ResolveByRva(kLoaderExeImage, kRva_GetConfiguration, 1));
+    const uintptr_t rsAddr = reinterpret_cast<uintptr_t>(
+        ImageAddress::ResolveByRva(kLoaderExeImage, kRva_GetRuleSet, 1));
     if (!cfgAddr || !rsAddr) {
         return nullptr;
     }
@@ -132,8 +135,10 @@ const wchar_t* OfficialGameCoreRelPath(const char* ruleset) {
 // 特征码读取前的统一前置检查：[addr, addr+span) 必须完整落在 exe 镜像内，
 // 否则游戏更新导致 RVA 错位时，裸读入口字节本身就是访问违例。
 bool SignatureSpanReadable(uintptr_t addr, size_t span) {
-    const uintptr_t base = GameAddress::Base();
-    const uintptr_t imageSize = GameAddress::ImageSize();
+    HookImageInfo info{ sizeof(HookImageInfo) };
+    if (!ImageAddress::GetInfo(kLoaderExeImage, &info)) return false;
+    const uintptr_t base = info.base;
+    const uintptr_t imageSize = info.imageSize;
     if (!addr || !base || !imageSize) {
         return false;
     }
@@ -235,8 +240,9 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
             Logger::Log("InitializeGameCorePhase failed; GameCore plugins not loaded");
         }
     } else {
-        // 区分幂等短路与真失败：读 exe 全局 hModule 槽（数据槽，GameAddress::Global 换算）
-        const uintptr_t hModAddr = GameAddress::GlobalVariable(kRva_hModule);
+        // 区分幂等短路与真失败：读 exe 全局 hModule 槽。
+        const uintptr_t hModAddr = reinterpret_cast<uintptr_t>(
+            ImageAddress::ResolveByRva(kLoaderExeImage, kRva_hModule, sizeof(HMODULE)));
         HMODULE* hMod = reinterpret_cast<HMODULE*>(hModAddr);
         if (hMod && *hMod != nullptr) {
             Logger::Log("LoadDLL idempotent short-circuit; (re)initializing plugins against loaded module");
@@ -292,7 +298,8 @@ bool LoaderHooks::InstallAll() {
     bool ok = true;
 
     // ---- LoadDLL @ RVA 0xF8510 ----
-    const uintptr_t loadDllAddr = GameAddress::Function(kRva_LoadDLL);
+    const uintptr_t loadDllAddr = reinterpret_cast<uintptr_t>(
+        ImageAddress::ResolveByRva(kLoaderExeImage, kRva_LoadDLL, 1));
     if (!loadDllAddr || !CheckLoadDllSignature(loadDllAddr)) {
         Logger::Log("LoadDLL signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(loadDllAddr), GetLastError());
@@ -311,7 +318,8 @@ bool LoaderHooks::InstallAll() {
     }
 
     // ---- lDisableMod @ RVA 0x4CCD50 ----
-    const uintptr_t disableAddr = GameAddress::Function(kRva_lDisableMod);
+    const uintptr_t disableAddr = reinterpret_cast<uintptr_t>(
+        ImageAddress::ResolveByRva(kLoaderExeImage, kRva_lDisableMod, 1));
     if (!disableAddr || !CheckModToggleSignature(disableAddr)) {
         Logger::Log("lDisableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(disableAddr), GetLastError());
@@ -330,7 +338,8 @@ bool LoaderHooks::InstallAll() {
     }
 
     // ---- lEnableMod @ RVA 0x4CCFE0 ----
-    const uintptr_t enableAddr = GameAddress::Function(kRva_lEnableMod);
+    const uintptr_t enableAddr = reinterpret_cast<uintptr_t>(
+        ImageAddress::ResolveByRva(kLoaderExeImage, kRva_lEnableMod, 1));
     if (!enableAddr || !CheckModToggleSignature(enableAddr)) {
         Logger::Log("lEnableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(enableAddr), GetLastError());
@@ -349,7 +358,8 @@ bool LoaderHooks::InstallAll() {
     }
 
     // ---- UnloadDLL @ RVA 0xF8E30 ----
-    const uintptr_t unloadDllAddr = GameAddress::Function(kRva_UnloadDLL);
+    const uintptr_t unloadDllAddr = reinterpret_cast<uintptr_t>(
+        ImageAddress::ResolveByRva(kLoaderExeImage, kRva_UnloadDLL, 1));
     if (!unloadDllAddr || !CheckUnloadDllSignature(unloadDllAddr)) {
         Logger::Log("UnloadDLL signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(unloadDllAddr), GetLastError());

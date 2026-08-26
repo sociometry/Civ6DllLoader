@@ -111,7 +111,7 @@
     <ClInclude Include="Runtime.h" />
     <ClInclude Include="SymbolDb.h" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="GameAddress.h" />
+    <ClInclude Include="ImageAddress.h" />
     <ClInclude Include="LoaderUpdate.h" />
     <ClInclude Include="PatchRegistry.h" />
     <ClInclude Include="pch.h" />
@@ -121,7 +121,7 @@
     <ClCompile Include="RuntimeEntry.cpp" />
     <ClCompile Include="ProxyExports.cpp" />
     <ClCompile Include="LoaderUpdate.cpp" />
-    <ClCompile Include="GameAddress.cpp" />
+    <ClCompile Include="ImageAddress.cpp" />
     <ClCompile Include="LoaderHooks.cpp" />
     <ClCompile Include="PatchRegistry.cpp" />
     <ClCompile Include="..\common\ModScan.cpp" />

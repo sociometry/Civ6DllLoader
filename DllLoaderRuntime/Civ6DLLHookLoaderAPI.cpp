@@ -18,6 +18,7 @@
 #include "Localization.h"
 #include "HavokScript.h"
 #include "SymbolDb.h"
+#include "ImageAddress.h"
 
 #include <cstdarg>
 #include <cstdlib>
@@ -113,9 +114,6 @@ static LoaderCore::PluginCategory CategoryForPath(const std::wstring& path) {
         : LoaderCore::PluginCategory::GameCore;
 }
 
-static uintptr_t g_GameCoreAddress;
-static uint32_t g_GameCoreSizeOfImage;
-static uint64_t g_gameCoreGeneration;
 static uintptr_t g_gameCoreTeardownAddress;
 static uint32_t g_gameCoreTeardownSizeOfImage;
 
@@ -193,9 +191,8 @@ static std::optional<std::wstring> RequirePluginOwner(const void* codeAddress,
 }
 
 static bool TargetInCurrentGameCore(void* target) {
-    const uintptr_t p = reinterpret_cast<uintptr_t>(target);
-    return g_GameCoreAddress && p >= g_GameCoreAddress &&
-        p - g_GameCoreAddress < g_GameCoreSizeOfImage;
+    const HookImageId image = ImageAddress::LoadedGameCore();
+    return image != kHookImageInvalid && ImageAddress::Contains(image, target);
 }
 
 static bool TargetInTearingDownGameCore(void* target) {
@@ -220,7 +217,7 @@ static MH_STATUS InstallHookOwnedByLocked(void* target, void* detour, void** ori
         existing->second.kind == HookKind::Plugin &&
         existing->second.owner == (owner ? owner : L"") &&
         existing->second.gameCoreGeneration != 0 &&
-        existing->second.gameCoreGeneration < g_gameCoreGeneration &&
+        existing->second.gameCoreGeneration < ImageAddress::GameCoreGeneration() &&
         TargetInCurrentGameCore(target);
     if (recoverStalePlugin && SafeRemoveHookLocked(target, false)) {
         status = MH_CreateHook(target, detour, original);
@@ -240,7 +237,7 @@ static MH_STATUS InstallHookOwnedByLocked(void* target, void* detour, void** ori
     g_hookRecords[target] = HookRecord{
         owner ? owner : L"",
         kind,
-        TargetInCurrentGameCore(target) ? g_gameCoreGeneration : 0,
+        TargetInCurrentGameCore(target) ? ImageAddress::GameCoreGeneration() : 0,
     };
     return MH_OK;
 }
@@ -310,33 +307,53 @@ void SendMessageToImpl(const char* pluginName, const char* topic, const void* da
     g_bus.SendTo(pluginName, topic, data, len);
 }
 
-uintptr_t GetGameCoreAddressImpl() {
+bool IsImageLoadedImpl(HookImageId image) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    return g_GameCoreAddress;
+    return ImageAddress::IsLoaded(image);
 }
 
-void* GetFunctionByNameImpl(const char* name) {
+bool GetImageInfoImpl(HookImageId image, HookImageInfo* outInfo) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    if (!name || !*name || !g_GameCoreAddress) return nullptr;
+    return ImageAddress::GetInfo(image, outInfo);
+}
+
+void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    void* result = ImageAddress::ResolveByRva(image, rva, span);
+    if (!result && ImageAddress::IsLoaded(image)) {
+        Logger::Log("ResolveByRva: rejected image=%u rva=0x%llX span=%zu",
+            static_cast<unsigned>(image),
+            static_cast<unsigned long long>(rva), span);
+    }
+    return result;
+}
+
+void* ResolveByNameImpl(HookImageId image, const char* name) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (!name || !*name || !ImageAddress::IsLoaded(image)) return nullptr;
+
+    // 当前符号包只对应 XP2 GameCore。exe/Base/XP1 暂无名字数据库；
+    // 接口保留同一语义，后续可按 image 分发各自符号表。
+    if (image != kHookImageGameCoreXP2) {
+        Logger::Log("ResolveByName: no symbol database for image=%u name=%s",
+            static_cast<unsigned>(image), name);
+        return nullptr;
+    }
+
     const uint32_t rva = SymbolDb::LookupRva(name);
-    if (rva == 0 || rva >= g_GameCoreSizeOfImage) {
-        if (rva != 0) {
-            Logger::Log("GetFunctionByName: out-of-range RVA name=%s rva=0x%X image=0x%X",
-                name, rva, g_GameCoreSizeOfImage);
-        }
-        return nullptr;
+    if (rva == 0) return nullptr;
+    void* result = ImageAddress::ResolveByRva(image, rva, 1);
+    if (!result) {
+        Logger::Log("ResolveByName: out-of-range RVA image=%u name=%s rva=0x%X",
+            static_cast<unsigned>(image), name, rva);
     }
-    return reinterpret_cast<void*>(g_GameCoreAddress + rva);
+    return result;
 }
 
-void* GetFunctionByAddressImpl(uintptr_t address) {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    if (!g_GameCoreAddress || address == 0 || address >= g_GameCoreSizeOfImage) {
-        Logger::Log("GetFunctionByAddress: rejected RVA=0x%llX image=0x%X",
-            static_cast<unsigned long long>(address), g_GameCoreSizeOfImage);
-        return nullptr;
-    }
-    return reinterpret_cast<void*>(g_GameCoreAddress + address);
+void* ResolveCurrentGameCoreByName(const char* name) {
+    const HookImageId image = ImageAddress::LoadedGameCore();
+    if (image == kHookImageInvalid) return nullptr;
+    return ResolveByNameImpl(image, name);
 }
 
 using PushMethodsNoFunc = void(__fastcall*)(hks::lua_State* L, int stackOffset);
@@ -393,7 +410,7 @@ void* PushLuaMethodsImpl(const char* name, const LuaMethodInfo* methods, uint32_
     std::string symbolName = targetName + "::PushMethods";
     if (sigIt->second == PushMethodSigType::NoManager) {
         auto target = reinterpret_cast<PushMethodsNoFunc>(
-            GetFunctionByNameImpl(symbolName.c_str()));
+            ResolveCurrentGameCoreByName(symbolName.c_str()));
         if (!target) {
             Logger::Log("PushLuaMethods: deferred until GameCore is ready: %s",
                         symbolName.c_str());
@@ -402,7 +419,7 @@ void* PushLuaMethodsImpl(const char* name, const LuaMethodInfo* methods, uint32_
         return InstallPushMethodsNoManager(target, stored, *owner);
     }
     auto target = reinterpret_cast<PushMethodsWithFunc>(
-        GetFunctionByNameImpl(symbolName.c_str()));
+        ResolveCurrentGameCoreByName(symbolName.c_str()));
     if (!target) {
         Logger::Log("PushLuaMethods: deferred until GameCore is ready: %s",
                     symbolName.c_str());
@@ -418,7 +435,7 @@ constexpr size_t kCurTurnDwordOffset = 0xC0;
 unsigned int GetCurTurnImpl() {
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     auto* slot = reinterpret_cast<uint64_t**>(
-        GetFunctionByNameImpl("GameCore::Globals::CurrentTurnStorage"));
+        ResolveCurrentGameCoreByName("GameCore::Globals::CurrentTurnStorage"));
     if (!slot || !Runtime::IsReadableSpan(slot, sizeof(uint64_t*)) || !*slot) {
         Logger::Log("GetCurTurn: current-turn storage unavailable");
         return 0;
@@ -519,7 +536,7 @@ static bool InstallSharedHook(void* target, void* detour, void** orig, void** ta
         status == MH_ERROR_ALREADY_CREATED &&
         it != g_hookRecords.end() &&
         it->second.owner.empty() &&
-        it->second.gameCoreGeneration < g_gameCoreGeneration &&
+        it->second.gameCoreGeneration < ImageAddress::GameCoreGeneration() &&
         g_activeSharedDetours.load(std::memory_order_acquire) == 0;
     if (isOurStaleHook && SafeRemoveHookLocked(target) &&
         InstallHookOwnedByLocked(target, detour, orig, L"",
@@ -541,7 +558,7 @@ static void EnsureScriptHooksInstalled() {
     if (!g_gameCorePhaseReady) return;
 
     if (!g_scriptHookInstalled && !g_scriptGlobals.empty()) {
-        void* target = GetFunctionByNameImpl("GameCore::RegisterScriptData");
+        void* target = ResolveCurrentGameCoreByName("GameCore::RegisterScriptData");
         if (!target) {
             Logger::Log("EnsureScriptHooksInstalled: RegisterScriptData address missing");
         } else if (InstallSharedHook(target, reinterpret_cast<void*>(&Hook_RegisterScriptData),
@@ -551,7 +568,7 @@ static void EnsureScriptHooksInstalled() {
         }
     }
     if (!g_scriptUIHookInstalled && !g_scriptGlobalsUI.empty()) {
-        void* target = GetFunctionByNameImpl("GameCore::RegisterScriptDataForUI");
+        void* target = ResolveCurrentGameCoreByName("GameCore::RegisterScriptDataForUI");
         if (!target) {
             Logger::Log("EnsureScriptHooksInstalled: RegisterScriptDataForUI address missing");
         } else if (InstallSharedHook(target, reinterpret_cast<void*>(&Hook_RegisterScriptDataForUI),
@@ -957,7 +974,7 @@ static bool RecoverStalePushHookLocked(void* target, MH_STATUS status) {
     if (it == g_hookRecords.end() ||
         it->second.kind != HookKind::PushMethods ||
         !it->second.owner.empty() ||
-        it->second.gameCoreGeneration >= g_gameCoreGeneration ||
+        it->second.gameCoreGeneration >= ImageAddress::GameCoreGeneration() ||
         g_activeSharedDetours.load(std::memory_order_acquire) != 0) {
         return false;
     }
@@ -1007,7 +1024,7 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
         return nullptr;
     }
     g_hookRecords[target] = HookRecord{
-        L"", HookKind::PushMethods, g_gameCoreGeneration
+        L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
     };
     state.methods.insert(state.methods.end(), methods.begin(), methods.end());
     return reinterpret_cast<void*>(state.base);
@@ -1053,7 +1070,7 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
         return nullptr;
     }
     g_hookRecords[target] = HookRecord{
-        L"", HookKind::PushMethods, g_gameCoreGeneration
+        L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
     };
     state.methods.insert(state.methods.end(), methods.begin(), methods.end());
     return reinterpret_cast<void*>(state.base);
@@ -1064,7 +1081,7 @@ static void ReinstallPushRegistrations() {
     size_t installed = 0;
     for (const auto& registration : g_pushRegistrations) {
         const std::string symbolName = registration.targetName + "::PushMethods";
-        void* target = GetFunctionByNameImpl(symbolName.c_str());
+        void* target = ResolveCurrentGameCoreByName(symbolName.c_str());
         if (!target) {
             Logger::Log("ReinstallPushRegistrations: missing %s",
                         symbolName.c_str());
@@ -1391,19 +1408,19 @@ using MakeHashFn = uint32_t(__fastcall*)(const char* str);
 
 static SendGameEventFn ResolveSendGameEvent() {
     return reinterpret_cast<SendGameEventFn>(
-        GetFunctionByNameImpl("GameCore::Reporting::Event::Send"));
+        ResolveCurrentGameCoreByName("GameCore::Reporting::Event::Send"));
 }
 static EditPlayerFn ResolveEditPlayer() {
     return reinterpret_cast<EditPlayerFn>(
-        GetFunctionByNameImpl("GameCore::Context::Globals::EditPlayer"));
+        ResolveCurrentGameCoreByName("GameCore::Context::Globals::EditPlayer"));
 }
 static GetCivDescFn ResolveGetCivDesc() {
     return reinterpret_cast<GetCivDescFn>(
-        GetFunctionByNameImpl("GameCore::Player::Instance::GetCivilizationDescription"));
+        ResolveCurrentGameCoreByName("GameCore::Player::Instance::GetCivilizationDescription"));
 }
 static MakeHashFn ResolveMakeHash() {
     return reinterpret_cast<MakeHashFn>(
-        GetFunctionByNameImpl("GameCore::Utilities::MakeHash"));
+        ResolveCurrentGameCoreByName("GameCore::Utilities::MakeHash"));
 }
 
 int64_t SendGameEventImpl(int64_t eventId, unsigned int a, unsigned int b) {
@@ -1441,36 +1458,6 @@ uint32_t MakeHashImpl(const char* str) {
     return fn(str);
 }
 
-void* RequireFunctionImpl(const char* functionName) {
-    void* p = GetFunctionByNameImpl(functionName);
-    if (!p) {
-        Logger::Log("RequireFunction: missing %s", functionName ? functionName : "(null)");
-    }
-    return p;
-}
-
-int ResolveSymbolImpl(const char* functionName, void** out) {
-    if (!out) return 0;
-    *out = GetFunctionByNameImpl(functionName);
-    return *out ? 1 : 0;
-}
-
-int RegisterGameCoreRvaImpl(const char* name, uint32_t rva) {
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    if (rva == 0 || rva >= g_GameCoreSizeOfImage) {
-        Logger::Log("RegisterGameCoreRva: out-of-range name=%s rva=0x%X image=0x%X",
-            name ? name : "(null)", rva, g_GameCoreSizeOfImage);
-        return 0;
-    }
-    if (!SymbolDb::RegisterRva(name, rva)) {
-        Logger::Log("RegisterGameCoreRva: rejected name=%s rva=0x%X",
-            name ? name : "(null)", rva);
-        return 0;
-    }
-    Logger::Log("RegisterGameCoreRva: %s -> 0x%X", name, rva);
-    return 1;
-}
-
 int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pushMethodsSymbol) {
     if (!name || !*name) return 0;
     if (sigType != kHookApiPushNoManager && sigType != kHookApiPushWithManager) {
@@ -1486,7 +1473,7 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
     std::string sym = pushMethodsSymbol && *pushMethodsSymbol
         ? pushMethodsSymbol
         : (std::string(name) + "::PushMethods");
-    // Ensure GetFunctionByName can resolve the PushMethods symbol if only alias name differs.
+    // Ensure ResolveByName can resolve the PushMethods symbol if only alias name differs.
     if (pushMethodsSymbol && *pushMethodsSymbol) {
         const uint32_t rva = SymbolDb::LookupRva(pushMethodsSymbol);
         if (rva != 0) {
@@ -1524,9 +1511,10 @@ static HookAPI g_hookApi = {
     &RegisterMessageHandlerImpl,
     &SendMessageToImpl,
 
-    &GetGameCoreAddressImpl,
-    &GetFunctionByNameImpl,
-    &GetFunctionByAddressImpl,
+    &IsImageLoadedImpl,
+    &GetImageInfoImpl,
+    &ResolveByRvaImpl,
+    &ResolveByNameImpl,
     &PushLuaMethodsImpl,
 
     &GetCurTurnImpl,
@@ -1594,9 +1582,6 @@ static HookAPI g_hookApi = {
     &GetCivilizationDescriptionImpl,
     &MakeHashImpl,
 
-    &RequireFunctionImpl,
-    &ResolveSymbolImpl,
-    &RegisterGameCoreRvaImpl,
     &RegisterPushMethodsTargetImpl,
 
     &HookPatch,
@@ -1622,24 +1607,32 @@ static DWORD GetModuleSizeOfImage(HMODULE module) {
 bool AttachGameCore(HMODULE gameCore) {
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     const DWORD sizeOfImage = GetModuleSizeOfImage(gameCore);
+    const HookImageId image = ImageAddress::IdentifyGameCore(gameCore);
     const uint32_t expected = SymbolDb::ExpectedSizeOfImage();
-    if (sizeOfImage == 0) {
-        Logger::Log("GameCore rejected: invalid PE image");
+    if (sizeOfImage == 0 || image == kHookImageInvalid) {
+        Logger::Log("GameCore rejected: invalid or unknown PE image");
         return false;
     }
-    if (expected != 0 && sizeOfImage != expected) {
+    if (image == kHookImageGameCoreXP2 && expected != 0 && sizeOfImage != expected) {
         Logger::Log("GameCore rejected: SizeOfImage mismatch symbols=0x%08X actual=0x%08X",
             expected, sizeOfImage);
         return false;
     }
 
-    g_GameCoreAddress = reinterpret_cast<uintptr_t>(gameCore);
-    g_GameCoreSizeOfImage = sizeOfImage;
-    ++g_gameCoreGeneration;
+    if (!ImageAddress::AttachGameCore(gameCore)) {
+        Logger::Log("GameCore rejected: ImageAddress attach failed");
+        return false;
+    }
+    HookImageInfo info{ sizeof(HookImageInfo) };
+    if (!ImageAddress::GetInfo(image, &info)) {
+        ImageAddress::DetachGameCore();
+        return false;
+    }
 
-    Logger::Log("GameCore attached base=0x%llX SizeOfImage=0x%08X generation=%llu",
-        static_cast<unsigned long long>(g_GameCoreAddress), sizeOfImage,
-        static_cast<unsigned long long>(g_gameCoreGeneration));
+    Logger::Log("GameCore attached image=%u base=0x%llX SizeOfImage=0x%08X generation=%llu",
+        static_cast<unsigned>(image),
+        static_cast<unsigned long long>(info.base), sizeOfImage,
+        static_cast<unsigned long long>(info.generation));
     return true;
 }
 
@@ -2049,16 +2042,14 @@ bool LoaderCore::InitializeGameCorePhase() {
     // v2 无薄壳：以当前进程 exe 模块作扫描锚。
     if (!InitializeLoader(GetModuleHandleW(nullptr))) {
         Logger::Log("InitializeGameCorePhase: InitializeLoader failed");
-        g_GameCoreAddress = 0;
-        g_GameCoreSizeOfImage = 0;
+        ImageAddress::DetachGameCore();
         return false;
     }
     // HavokScript 导入缺失 = Lua API 半可用，对插件是崩溃源：停用 GameCore 插件
     // 加载（本会话游戏本体照常运行）。
     if (!hks::InitHavokScript()) {
         Logger::Log("InitializeGameCorePhase: InitHavokScript incomplete; GameCore plugins disabled");
-        g_GameCoreAddress = 0;
-        g_GameCoreSizeOfImage = 0;
+        ImageAddress::DetachGameCore();
         return false;
     }
     Localization::InitScript();
@@ -2169,10 +2160,13 @@ static void ResetSharedGameCoreHooks(
 
     // 禁止新的 GameCore API 解析后释放生命周期锁，让已经进入 detour 的插件回调
     // 能正常调用 HookAPI 并退出；不能在持 lifecycle/hook 锁时等待。
-    g_gameCoreTeardownAddress = g_GameCoreAddress;
-    g_gameCoreTeardownSizeOfImage = g_GameCoreSizeOfImage;
-    g_GameCoreAddress = 0;
-    g_GameCoreSizeOfImage = 0;
+    HookImageInfo current{ sizeof(HookImageInfo) };
+    const HookImageId currentId = ImageAddress::LoadedGameCore();
+    if (ImageAddress::GetInfo(currentId, &current)) {
+        g_gameCoreTeardownAddress = current.base;
+        g_gameCoreTeardownSizeOfImage = static_cast<uint32_t>(current.imageSize);
+    }
+    ImageAddress::DetachGameCore();
     lifecycleLock.unlock();
     {
         unique_lock<mutex> drainLock(g_detourDrainMutex);
@@ -2265,10 +2259,17 @@ void LoaderCore::ResetForReload() {
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     g_gameCorePhaseReady = false;
     // 先进入 teardown 窗口（InstallHook/Patch 对旧映像的目标从此被拒绝），
-    // g_GameCoreAddress 暂不清零——teardown 回调内仍可解析符号读数据收尾。
-    g_gameCoreTeardownAddress = g_GameCoreAddress;
-    g_gameCoreTeardownSizeOfImage = g_GameCoreSizeOfImage;
-    const uint64_t teardownGeneration = g_gameCoreGeneration;
+    // ImageAddress 暂不 detach——teardown 回调内仍可解析符号读数据收尾。
+    HookImageInfo current{ sizeof(HookImageInfo) };
+    const HookImageId currentId = ImageAddress::LoadedGameCore();
+    if (ImageAddress::GetInfo(currentId, &current)) {
+        g_gameCoreTeardownAddress = current.base;
+        g_gameCoreTeardownSizeOfImage = static_cast<uint32_t>(current.imageSize);
+    } else {
+        g_gameCoreTeardownAddress = 0;
+        g_gameCoreTeardownSizeOfImage = 0;
+    }
+    const uint64_t teardownGeneration = ImageAddress::GameCoreGeneration();
     lifecycleLock.unlock();
 
     // phaseReady 已关闭，不会再有新的 Ready 准入；先等已准入回调结束，

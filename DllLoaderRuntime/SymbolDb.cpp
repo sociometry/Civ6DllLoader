@@ -36,7 +36,7 @@ struct Entry {
 static_assert(sizeof(Header) == 28, "SymbolDb header size");
 
 // 保护 g_map / g_expectedSizeOfImage / g_loaded 的跨线程访问：
-// LookupRva 在游戏线程（GetFunctionByName 路径）被调，RegisterRva 可在 Loader
+// LookupRva 在游戏线程（ResolveByName 路径）被调，RegisterRva 可在 Loader
 // 工作线程（Global 插件 OnLoad）被调，unordered_map 并发读写是 UB。
 std::mutex g_stateMutex;
 
@@ -158,7 +158,7 @@ bool Init(HMODULE runtimeModule) {
     if (LoadResource(runtimeModule)) {
         return true;
     }
-    Logger::Log("SymbolDb: no symbol database (sidecar or RCDATA) — GetFunctionByName limited");
+    Logger::Log("SymbolDb: no symbol database (sidecar or RCDATA) — ResolveByName limited");
     return false;
 }
 

@@ -8,7 +8,7 @@
 // Bump ONLY on breaking changes (reorder/remove/change existing fields or PushLuaMethods contract).
 // Appending new fields at the end must NOT bump this - old plugins rely on structSize.
 #ifndef CIV6_HOOK_API_VERSION
-#define CIV6_HOOK_API_VERSION 1u
+#define CIV6_HOOK_API_VERSION 2u
 #endif
 
 // Opaque Localization::String storage size for stack buffers (bytes). Prefer LocCreate/LocDestroy.
@@ -36,6 +36,24 @@ typedef void (*ScriptGlobalsFn)(void* L);
 typedef void (*GameCoreReadyFn)(void* context);
 typedef void (*GameCoreTeardownFn)(void* context);
 
+// 可被插件寻址的具体 PE 映像。同一时刻一个 exe 与一个 GameCore 可以共存。
+typedef enum HookImageId {
+    kHookImageInvalid = 0,
+    kHookImageExeDx11,
+    kHookImageExeDx12,
+    kHookImageGameCoreBase,
+    kHookImageGameCoreXP1,
+    kHookImageGameCoreXP2
+} HookImageId;
+
+typedef struct HookImageInfo {
+    uint32_t structSize;  // 调用前设为 sizeof(HookImageInfo)；0 视为当前头文件大小
+    HookImageId image;
+    uintptr_t base;
+    size_t imageSize;
+    uint64_t generation;  // exe 恒为 1；GameCore 每次 attach 递增
+} HookImageInfo;
+
 // Matches hks::LUA_GLOBAL - plugins can use this with LuaSetField.
 enum { kHookApiLuaGlobal = -10002 };
 
@@ -54,9 +72,10 @@ typedef struct HookAPI {
     void (*RegisterMessageHandler)(const char* pluginName, MessageHandlerFn handler);
     void (*SendMessageTo)(const char* pluginName, const char* topic, const void* data, size_t len);
 
-    uintptr_t (*GetGameCoreAddress)(void);
-    void* (*GetFunctionByName)(const char* functionName);
-    void* (*GetFunctionByAddress)(uintptr_t address);
+    bool (*IsImageLoaded)(HookImageId image);
+    bool (*GetImageInfo)(HookImageId image, HookImageInfo* outInfo);
+    void* (*ResolveByRva)(HookImageId image, uintptr_t rva, size_t span);
+    void* (*ResolveByName)(HookImageId image, const char* name);
     void* (*PushLuaMethods)(const char* name, const LuaMethodInfo* methods, uint32_t count);
 
     unsigned int (*GetCurTurn)(void);
@@ -125,9 +144,6 @@ typedef struct HookAPI {
     const char* (*GetCivilizationDescription)(void* player);
     uint32_t (*MakeHash)(const char* str);
 
-    void* (*RequireFunction)(const char* functionName);
-    int (*ResolveSymbol)(const char* functionName, void** out);
-    int (*RegisterGameCoreRva)(const char* name, uint32_t rva);
     int (*RegisterPushMethodsTarget)(const char* name, int sigType, const char* pushMethodsSymbol);
 
     // v2: 原始字节补丁（单层存档，见 patch registry）。由运行时在初始化时填表。
@@ -136,7 +152,7 @@ typedef struct HookAPI {
 
     // v2.1: GameCore 生命周期回调 —— Global 插件延迟挂钩的标准姿势：
     //   OnLoad → 先 RegisterGameCoreTeardown(teardown) → 再 RegisterGameCoreReady(ready)
-    //   → ready 内 GetFunctionByName + InstallHook。
+    //   → ready 内 ResolveByName/ResolveByRva + InstallHook/Patch。
     // 语义要点：
     //  - Ready 回调在游戏线程、新 GameCore attach 后触发（早于 GameCore 插件加载）；
     //    注册时若 GameCore 已就绪（如对局中加载的插件），回调立即补调一次。
@@ -174,13 +190,8 @@ static inline int HookAPI_HasMinSize(const HookAPI* api, uint32_t minStructSize)
 }  // extern "C"
 
 template <typename T>
-T GetFunctionByName(HookAPI* api, const char* functionName) {
-    return reinterpret_cast<T>(api->GetFunctionByName(functionName));
-}
-
-template <typename T>
-T GetFunctionByAddress(HookAPI* api, uintptr_t address) {
-    return reinterpret_cast<T>(api->GetFunctionByAddress(address));
+T ResolveByName(HookAPI* api, HookImageId image, const char* name) {
+    return reinterpret_cast<T>(api->ResolveByName(image, name));
 }
 
 template <typename T>
@@ -189,8 +200,8 @@ void InstallHook(HookAPI* api, LPVOID pTarget, LPVOID pDetour, T** ppOriginal) {
 }
 
 template <typename T>
-T RequireFunction(HookAPI* api, const char* functionName) {
-    return reinterpret_cast<T>(api->RequireFunction(functionName));
+T ResolveByRva(HookAPI* api, HookImageId image, uintptr_t rva, size_t span = 1) {
+    return reinterpret_cast<T>(api->ResolveByRva(image, rva, span));
 }
 #endif
 
