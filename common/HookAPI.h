@@ -46,6 +46,15 @@ typedef enum HookImageId {
     kHookImageGameCoreXP2
 } HookImageId;
 
+// 段限定：ResolveByRvaEx / ResolveByPattern 用。kSectionImage = 整个镜像（镜像相对 RVA）。
+typedef enum HookImageSection {
+    kSectionImage = 0,   // 默认：整个镜像（不按段切）
+    kSectionText,        // .text
+    kSectionIdata,       // .idata
+    kSectionRdata,       // .rdata
+    kSectionData         // .data
+} HookImageSection;
+
 typedef struct HookImageInfo {
     uint32_t structSize;  // 调用前设为 sizeof(HookImageInfo)；0 视为当前头文件大小
     HookImageId image;
@@ -166,6 +175,16 @@ typedef struct HookAPI {
     //    会被 SEH 捕获，插件随之被隔离（其全部注册被回滚）。
     void (*RegisterGameCoreReady)(GameCoreReadyFn fn, void* context);
     void (*RegisterGameCoreTeardown)(GameCoreTeardownFn fn, void* context);
+
+    // ---- Append-only extensions (do not bump CIV6_HOOK_API_VERSION) ----
+    // 不修正 + 段限定：原始 RVA 直接解析（镜像相对或段相对），不走 pdata 矫正。
+    void* (*ResolveByRvaEx)(HookImageId image, uintptr_t rva, size_t span, HookImageSection section);
+    // AOB 特征搜索：pattern 形如 "48 8B ?? ?? 74 ?? E8"（?? 通配符），在指定段搜首个命中。
+    void* (*ResolveByPattern)(HookImageId image, const char* pattern, HookImageSection section);
+    // 注册全局变量捕获：hook providerFunction，运行时用机器码生成 stub 捕获其第 paramIndex 个
+    // 参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。同一 providerFunction
+    // 只 hook 一次，后续注册的 out 追加到列表，触发时统一赋值。返回 false = 注册失败（providerFunction 解析失败等）。
+    bool (*RegisterGlobalCapture)(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out);
 } HookAPI;
 
 // True if this runtime can serve a plugin built against the current header.
@@ -202,6 +221,16 @@ void InstallHook(HookAPI* api, LPVOID pTarget, LPVOID pDetour, T** ppOriginal) {
 template <typename T>
 T ResolveByRva(HookAPI* api, HookImageId image, uintptr_t rva, size_t span = 1) {
     return reinterpret_cast<T>(api->ResolveByRva(image, rva, span));
+}
+
+template <typename T>
+T ResolveByRvaEx(HookAPI* api, HookImageId image, uintptr_t rva, HookImageSection section = kSectionImage, size_t span = 1) {
+    return reinterpret_cast<T>(api->ResolveByRvaEx(image, rva, span, section));
+}
+
+template <typename T>
+T ResolveByPattern(HookAPI* api, HookImageId image, const char* pattern, HookImageSection section = kSectionImage) {
+    return reinterpret_cast<T>(api->ResolveByPattern(image, pattern, section));
 }
 #endif
 

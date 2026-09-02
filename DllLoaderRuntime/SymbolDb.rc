@@ -1,3 +1,0 @@
-#include "resource.h"
-
-IDR_SYMBOL_DB RCDATA "..\\tools\\out\\Civ6DllLoader.symbols.bin"

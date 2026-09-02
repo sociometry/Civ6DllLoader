@@ -23,7 +23,7 @@
 #include "LoaderUpdate.h"
 #include "../common/Logger.h"
 #include "Runtime.h"
-#include "SymbolDb.h"
+#include "PdataMatch.h"
 
 namespace {
 
@@ -68,7 +68,7 @@ bool LoadedFromExeDirectory(HMODULE hModule) {
 DWORD WINAPI WorkerMain(LPVOID) {
     g_wakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // 手动重置事件
 
-    // 1) 基础初始化：Logger / SymbolDb / MinHook
+    // 1) 基础初始化：Logger / PdataMatch / MinHook
     LoaderCore::InitEarly();
 
     // 2) hook 安装（LoadDLL / lEnableMod / lDisableMod；失败静默降级）
@@ -107,8 +107,8 @@ HMODULE LoaderCore::RuntimeModuleHandle() {
 void LoaderCore::InitEarly() {
     Logger::Init(L"Civ6DllLoader_Loader.log");
     Logger::Log("InitEarly: runtimeVersion=0x%08X", kLoaderRuntimeVersion);
-    if (!SymbolDb::Init(g_runtimeModule)) {
-        Logger::Log("InitEarly: SymbolDb::Init 失败（符号表缺失，继续）");
+    if (!PdataMatch::Init(g_runtimeModule)) {
+        Logger::Log("InitEarly: PdataMatch::Init 失败（sidecar 缺失，继续）");
     }
     if (!Runtime::InitMinHook()) {
         Logger::Log("InitEarly: Runtime::InitMinHook 失败（hook 功能不可用，继续）");

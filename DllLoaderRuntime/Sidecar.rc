@@ -1,0 +1,3 @@
+// Sidecar.rc — 打包压缩 sidecar（XPRESS_HUFF）为 RCDATA 资源，id=102
+// 与 PdataMatch::kSidecarResourceId 对应；Civ6DllLoader.symdb.bin.xp = [uint32 size][XPRESS_HUFF]
+102 RCDATA "Civ6DllLoader.symdb.bin.xp"

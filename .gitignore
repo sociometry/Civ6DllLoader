@@ -44,3 +44,15 @@ tools/out/
 
 # Local leftovers
 example1.log
+
+# third_party：保留 sqlite、hde；asmjit_src 仅保留 asmjit 子目录，其余不纳入版本管理
+third_party/*
+!third_party/sqlite/
+!third_party/hde/
+!third_party/asmjit_src/
+third_party/asmjit_src/*
+!third_party/asmjit_src/asmjit/
+
+# old sidecar（depot 版本，仅跨版本测试用，不纳入版本管理）
+tools/Civ6DllLoader.symdb.old.bin
+tools/Civ6DllLoader.symdb.old.json

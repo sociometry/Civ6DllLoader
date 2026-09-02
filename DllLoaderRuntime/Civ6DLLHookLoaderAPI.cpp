@@ -17,7 +17,7 @@
 #include "ProxyTypes.h"
 #include "Localization.h"
 #include "HavokScript.h"
-#include "SymbolDb.h"
+#include "PdataMatch.h"
 #include "ImageAddress.h"
 
 #include <cstdarg>
@@ -32,6 +32,7 @@
 
 #include "PatchRegistry.h"
 #include "LoaderCore.h"
+#include <asmjit/x86.h>
 
 using namespace std;
 
@@ -130,7 +131,7 @@ struct PushRegistration {
 };
 static std::vector<PushRegistration> g_pushRegistrations;
 
-// Symbol RVAs live in Civ6DllLoader.symbols.bin (see tools/pack_symbol_db.py).
+// Symbol RVAs live in Civ6DllLoader.symdb.bin (see PdataMatch.cpp).
 
 static mutex g_scriptStateMutex;
 static mutex g_pushStateMutex;
@@ -317,13 +318,59 @@ bool GetImageInfoImpl(HookImageId image, HookImageInfo* outInfo) {
     return ImageAddress::GetInfo(image, outInfo);
 }
 
+// 按段名（.text/.idata/.rdata/.data；PE 段名为 8 字节非 NUL 终止数组）定位镜像内段的
+// RVA 与大小（大小 = max(SizeOfRawData, VirtualSize)）。找不到段返回 false。
+static bool ResolveSectionRva(HookImageId image, const char* sectionName,
+    uintptr_t* outRva, size_t* outSize) {
+    if (!sectionName || !outRva || !outSize) return false;
+    HookImageInfo info{ sizeof(HookImageInfo) };
+    if (!ImageAddress::GetInfo(image, &info) || info.base == 0) return false;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(info.base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
+        reinterpret_cast<uint8_t*>(info.base) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    // 段名比较：name 以 NUL 结束，逐字节对比至多 8 字节；name 提前结束即匹配成功
+    // （PE 惯例段名 NUL/空格填充；name 更长时须 8 字节精确相等）。
+    auto nameMatches = [](const IMAGE_SECTION_HEADER& sh, const char* name) -> bool {
+        for (int i = 0; i < 8; ++i) {
+            if (sh.Name[i] != static_cast<unsigned char>(name[i])) return false;
+            if (name[i] == '\0') return true;
+        }
+        return true;
+    };
+
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (!nameMatches(*sec, sectionName)) continue;
+        const size_t size = sec->Misc.VirtualSize > sec->SizeOfRawData
+            ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        *outRva = sec->VirtualAddress;
+        *outSize = size;
+        return true;
+    }
+    return false;
+}
+
 void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    void* result = ImageAddress::ResolveByRva(image, rva, span);
+    uintptr_t effectiveRva = rva;
+    if (image == kHookImageGameCoreXP2) {
+        // XP2：插件传入的是旧映像坐标，先经 pdata 矫正表映射到当前映像。
+        const uintptr_t corrected = PdataMatch::CorrectRva(rva);
+        if (corrected == 0) {
+            Logger::Log("ResolveByRva: XP2 no pdata correction for rva=0x%llX span=%zu",
+                static_cast<unsigned long long>(rva), span);
+            return nullptr;
+        }
+        effectiveRva = corrected;
+    }
+    void* result = ImageAddress::ResolveByRva(image, effectiveRva, span);
     if (!result && ImageAddress::IsLoaded(image)) {
         Logger::Log("ResolveByRva: rejected image=%u rva=0x%llX span=%zu",
             static_cast<unsigned>(image),
-            static_cast<unsigned long long>(rva), span);
+            static_cast<unsigned long long>(effectiveRva), span);
     }
     return result;
 }
@@ -340,14 +387,387 @@ void* ResolveByNameImpl(HookImageId image, const char* name) {
         return nullptr;
     }
 
-    const uint32_t rva = SymbolDb::LookupRva(name);
-    if (rva == 0) return nullptr;
-    void* result = ImageAddress::ResolveByRva(image, rva, 1);
+    // PdataMatch：sidecar 符号表存旧映像 RVA，按名矫正到当前映像后解析。
+    const uintptr_t corrected = PdataMatch::CorrectByName(name);
+    if (corrected == 0) {
+        Logger::Log("ResolveByName: no symbol for image=%u name=%s",
+            static_cast<unsigned>(image), name);
+        return nullptr;
+    }
+    void* result = ImageAddress::ResolveByRva(image, corrected, 1);
     if (!result) {
-        Logger::Log("ResolveByName: out-of-range RVA image=%u name=%s rva=0x%X",
-            static_cast<unsigned>(image), name, rva);
+        Logger::Log("ResolveByName: out-of-range RVA image=%u name=%s rva=0x%llX",
+            static_cast<unsigned>(image), name,
+            static_cast<unsigned long long>(corrected));
     }
     return result;
+}
+
+void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImageSection section) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (section == kSectionImage) {
+        // 不修正：镜像相对 RVA 直接解析（供已按新映像坐标算好的调用方使用）。
+        return ImageAddress::ResolveByRva(image, rva, span);
+    }
+    const char* sectionName = nullptr;
+    switch (section) {
+        case kSectionText:  sectionName = ".text";  break;
+        case kSectionIdata: sectionName = ".idata"; break;
+        case kSectionRdata: sectionName = ".rdata"; break;
+        case kSectionData:  sectionName = ".data";  break;
+        default: break;
+    }
+    if (!sectionName) {
+        Logger::Log("ResolveByRvaEx: unknown section=%d image=%u rva=0x%llX span=%zu",
+            static_cast<int>(section), static_cast<unsigned>(image),
+            static_cast<unsigned long long>(rva), span);
+        return nullptr;
+    }
+    uintptr_t sectionRva = 0;
+    size_t sectionSize = 0;
+    if (!ResolveSectionRva(image, sectionName, &sectionRva, &sectionSize)) {
+        Logger::Log("ResolveByRvaEx: section %s not found image=%u",
+            sectionName, static_cast<unsigned>(image));
+        return nullptr;
+    }
+    return ImageAddress::ResolveByRva(image, sectionRva + rva, span);
+}
+
+void* ResolveByPatternImpl(HookImageId image, const char* pattern, HookImageSection section) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (!pattern || !*pattern) {
+        Logger::Log("ResolveByPattern: empty pattern");
+        return nullptr;
+    }
+    // 解析 AOB："48 8B ?? ?? 74 ?? E8"（?? 整字节通配，也支持单 nibble 如 4?）。
+    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> masks;
+    const char* p = pattern;
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (!*p) break;
+        uint8_t byte = 0, mask = 0;
+        for (int nib = 0; nib < 2; ++nib) {
+            const char c = *p;
+            if (c == '?') {
+                ++p;
+            } else if (c >= '0' && c <= '9') {
+                byte = static_cast<uint8_t>((byte << 4) | (c - '0'));
+                mask = static_cast<uint8_t>((mask << 4) | 0xF);
+                ++p;
+            } else if (c >= 'a' && c <= 'f') {
+                byte = static_cast<uint8_t>((byte << 4) | (c - 'a' + 10));
+                mask = static_cast<uint8_t>((mask << 4) | 0xF);
+                ++p;
+            } else if (c >= 'A' && c <= 'F') {
+                byte = static_cast<uint8_t>((byte << 4) | (c - 'A' + 10));
+                mask = static_cast<uint8_t>((mask << 4) | 0xF);
+                ++p;
+            } else {
+                Logger::Log("ResolveByPattern: invalid char '%c' in pattern \"%s\"", c, pattern);
+                return nullptr;
+            }
+        }
+        bytes.push_back(byte);
+        masks.push_back(mask);
+    }
+    if (bytes.empty()) {
+        Logger::Log("ResolveByPattern: empty pattern \"%s\"", pattern);
+        return nullptr;
+    }
+
+    // 定位搜索范围（kSectionImage = 整个镜像；否则按段定位）。
+    HookImageInfo info{ sizeof(HookImageInfo) };
+    if (!ImageAddress::GetInfo(image, &info) || info.base == 0) {
+        Logger::Log("ResolveByPattern: image not loaded image=%u",
+            static_cast<unsigned>(image));
+        return nullptr;
+    }
+    uintptr_t searchBase = info.base;
+    size_t searchSize = info.imageSize;
+    if (section != kSectionImage) {
+        const char* sectionName = nullptr;
+        switch (section) {
+            case kSectionText:  sectionName = ".text";  break;
+            case kSectionIdata: sectionName = ".idata"; break;
+            case kSectionRdata: sectionName = ".rdata"; break;
+            case kSectionData:  sectionName = ".data";  break;
+            default: break;
+        }
+        if (!sectionName) {
+            Logger::Log("ResolveByPattern: unknown section=%d image=%u",
+                static_cast<int>(section), static_cast<unsigned>(image));
+            return nullptr;
+        }
+        uintptr_t sectionRva = 0;
+        size_t sectionSize = 0;
+        if (!ResolveSectionRva(image, sectionName, &sectionRva, &sectionSize)) {
+            Logger::Log("ResolveByPattern: section %s not found image=%u",
+                sectionName, static_cast<unsigned>(image));
+            return nullptr;
+        }
+        const size_t avail = sectionRva < info.imageSize ? info.imageSize - sectionRva : 0;
+        if (sectionSize > avail) sectionSize = avail;  // 防御：不越出映像映射
+        searchBase = info.base + sectionRva;
+        searchSize = sectionSize;
+    }
+    if (searchSize < bytes.size()) {
+        Logger::Log("ResolveByPattern: pattern longer than region image=%u section=%d len=%zu",
+            static_cast<unsigned>(image), static_cast<int>(section), bytes.size());
+        return nullptr;
+    }
+
+    // 线性首命中搜索（mask 0 位 = 通配）。
+    const uint8_t* basePtr = reinterpret_cast<const uint8_t*>(searchBase);
+    const size_t limit = searchSize - bytes.size() + 1;
+    for (size_t i = 0; i < limit; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < bytes.size(); ++j) {
+            if ((basePtr[i + j] & masks[j]) != bytes[j]) { match = false; break; }
+        }
+        if (match) {
+            Logger::Log("ResolveByPattern: hit image=%u section=%d rva=0x%llX",
+                static_cast<unsigned>(image), static_cast<int>(section),
+                static_cast<unsigned long long>(i));
+            return const_cast<uint8_t*>(basePtr + i);
+        }
+    }
+    Logger::Log("ResolveByPattern: no hit image=%u section=%d pattern=\"%s\"",
+        static_cast<unsigned>(image), static_cast<int>(section), pattern);
+    return nullptr;
+}
+
+// ---------------- RegisterGlobalCapture（全局参数捕获站） ----------------
+// 每个 providerFunction（经 pdata 矫正后的目标地址）对应一个捕获站点：首个注册者
+// 生成裸机码 stub 并 MinHook 挂到目标函数入口；后续同一站点的注册只追加 out 槽。
+// 目标函数每次被调用时，stub 把第 paramIndex 个整数参数（rcx/rdx/r8/r9 之一）写入
+// 该站点注册的全部 out 槽。
+struct CaptureSite {
+    void* original = nullptr;    // MH_CreateHook 产出的 trampoline（stub 尾跳目标）
+    void* stubCode = nullptr;    // JitRuntime 分配的 stub 入口
+    uint32_t paramIndex = 0;
+    std::wstring ownerId;        // 站点首个注册者的插件 owner（重载/卸载清理用）
+    std::vector<void**> outs;
+};
+static std::map<uintptr_t, CaptureSite> g_captureSites;
+static std::mutex g_captureMutex;
+static asmjit::JitRuntime g_captureRuntime;
+
+// stub 调用的分发器：regs 指向 stub 栈帧里保存的 4 个整数参数槽（rcx/rdx/r8/r9），
+// 取第 paramIndex 个值写入站点全部 out 槽。与注册路径共用 g_captureMutex。
+extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr) {
+    CaptureSite* site = static_cast<CaptureSite*>(sitePtr);
+    if (!site || !regs || paramIndex > 3) return;
+    const void* val = static_cast<void* const*>(regs)[paramIndex];
+    std::lock_guard<std::mutex> lock(g_captureMutex);
+    for (void** out : site->outs) {
+        if (out) *out = const_cast<void*>(val);
+    }
+}
+
+// 生成捕获站点 stub（裸 x64 机器码，Windows x64 调用约定）：
+//   MinHook 跳入时：rcx/rdx/r8/r9 = 前 4 个整数参数，xmm0-3 = 前 4 个浮点参数，
+//   [rsp] = 返回地址（此时 rsp ≡ 8 (mod 16)）。sub rsp, 0x98 后 rsp ≡ 0 (mod 16)：
+//   [rsp+0x00..0x20) 恰好充当调 CaptureDispatch 的 shadow space，
+//   [rsp+0x20..0x80) 保存参数（movaps 目标全部 16 字节对齐）。
+// original 回填方案（免写可执行内存、免扫描/免 reloc）：stub 尾部
+//   mov rax, imm64(&site->original)  —— 生成时固化的 C++ 站点成员地址
+//                                      （std::map 节点地址稳定，绝对寻址）
+//   mov rax, [rax]                   —— 运行时读 trampoline 指针
+//   jmp rax                          —— 尾跳 MinHook trampoline
+// MH_CreateHook 在 MH_EnableHook 之前把 trampoline 写入 site->original，因此 stub
+// 首次可执行时该值必已就绪，无需生成后回填任何 stub 字节。
+static bool BuildCaptureStub(CaptureSite* site, void** outStub) {
+    using namespace asmjit;
+    CodeHolder code;
+    if (code.init(g_captureRuntime.environment(), g_captureRuntime.cpu_features()) != Error::kOk) {
+        return false;
+    }
+    x86::Assembler a(&code);
+    a.sub(x86::rsp, 0x98);
+    a.mov(x86::ptr(x86::rsp, 0x20), x86::rcx);
+    a.mov(x86::ptr(x86::rsp, 0x28), x86::rdx);
+    a.mov(x86::ptr(x86::rsp, 0x30), x86::r8);
+    a.mov(x86::ptr(x86::rsp, 0x38), x86::r9);
+    a.movaps(x86::ptr(x86::rsp, 0x40), x86::xmm0);
+    a.movaps(x86::ptr(x86::rsp, 0x50), x86::xmm1);
+    a.movaps(x86::ptr(x86::rsp, 0x60), x86::xmm2);
+    a.movaps(x86::ptr(x86::rsp, 0x70), x86::xmm3);
+    a.lea(x86::rcx, x86::ptr(x86::rsp, 0x20));
+    a.mov(x86::edx, static_cast<uint32_t>(site->paramIndex));
+    a.mov(x86::r8, reinterpret_cast<uintptr_t>(site));
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureDispatch));
+    a.call(x86::r10);
+    a.mov(x86::rcx, x86::ptr(x86::rsp, 0x20));
+    a.mov(x86::rdx, x86::ptr(x86::rsp, 0x28));
+    a.mov(x86::r8, x86::ptr(x86::rsp, 0x30));
+    a.mov(x86::r9, x86::ptr(x86::rsp, 0x38));
+    a.movaps(x86::xmm0, x86::ptr(x86::rsp, 0x40));
+    a.movaps(x86::xmm1, x86::ptr(x86::rsp, 0x50));
+    a.movaps(x86::xmm2, x86::ptr(x86::rsp, 0x60));
+    a.movaps(x86::xmm3, x86::ptr(x86::rsp, 0x70));
+    a.add(x86::rsp, 0x98);
+    a.mov(x86::rax, reinterpret_cast<uintptr_t>(&site->original));
+    a.mov(x86::rax, x86::ptr(x86::rax));
+    a.jmp(x86::rax);
+
+    void* stub = nullptr;
+    if (g_captureRuntime.add(&stub, &code) != Error::kOk || !stub) {
+        return false;
+    }
+    *outStub = stub;
+    return true;
+}
+
+bool RegisterGlobalCaptureImpl(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (image != kHookImageGameCoreXP2 || !providerFunction || !*providerFunction ||
+            paramIndex > 3 || !out) {
+        Logger::Log("RegisterGlobalCapture rejected: bad args image=%u provider=%s param=%u",
+            static_cast<unsigned>(image),
+            providerFunction ? providerFunction : "(null)",
+            static_cast<unsigned>(paramIndex));
+        return false;
+    }
+    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(out), "RegisterGlobalCapture");
+    if (!owner) return false;
+
+    // CorrectByName 返回旧→新矫正后的 RVA（非地址），须经 ResolveByRva 换算为当前映像地址。
+    const uintptr_t corrected = PdataMatch::CorrectByName(providerFunction);
+    void* target = corrected ? ImageAddress::ResolveByRva(kHookImageGameCoreXP2, corrected, 1) : nullptr;
+    if (!target) {
+        Logger::Log("RegisterGlobalCapture: no pdata correction for provider=%s", providerFunction);
+        return false;
+    }
+
+    lock_guard<std::mutex> captureLock(g_captureMutex);
+    CaptureSite& site = g_captureSites[reinterpret_cast<uintptr_t>(target)];
+    if (site.stubCode) {
+        // 已存在站点：paramIndex 必须一致，仅追加 out 槽。
+        if (site.paramIndex != paramIndex) {
+            Logger::Log("RegisterGlobalCapture: paramIndex conflict provider=%s have=%u want=%u",
+                providerFunction, static_cast<unsigned>(site.paramIndex),
+                static_cast<unsigned>(paramIndex));
+            return false;
+        }
+        site.outs.push_back(out);
+        return true;
+    }
+
+    // 新站点：生成 stub → MH_CreateHook → MH_EnableHook，全部成功后才把 out 入列。
+    // ownerId 记录首个注册者（后续共享站点的 out 追加不区分 owner，见清理函数注释）。
+    site.paramIndex = paramIndex;
+    site.ownerId = *owner;
+    if (!BuildCaptureStub(&site, &site.stubCode)) {
+        Logger::Log("RegisterGlobalCapture: stub build failed provider=%s", providerFunction);
+        g_captureSites.erase(reinterpret_cast<uintptr_t>(target));
+        return false;
+    }
+    MH_STATUS status;
+    {
+        lock_guard<std::mutex> mhLock(Runtime::MinHookMutex());
+        status = MH_CreateHook(target, site.stubCode, &site.original);
+        if (status == MH_OK) {
+            status = MH_EnableHook(target);
+        }
+    }
+    if (status != MH_OK) {
+        Logger::Log("RegisterGlobalCapture: hook failed %s provider=%s",
+            MH_StatusToString(status), providerFunction);
+        g_captureSites.erase(reinterpret_cast<uintptr_t>(target));
+        return false;
+    }
+    site.outs.push_back(out);
+    Logger::Log("RegisterGlobalCapture: installed provider=%s target=%p param=%u owner=%ls",
+        providerFunction, target, static_cast<unsigned>(paramIndex), owner->c_str());
+    return true;
+}
+
+// ---------------- capture 站点生命周期清理 ----------------
+// 两个失效场景：
+//  1) GameCore 重载：providerFunction 位于旧 GameCore 映像内，重载后地址失效，必须
+//     随重载清掉全部站点（ResetForReload 调用 CleanupAllCaptureSites），等下次
+//     Ready 回调由插件重新注册；
+//  2) 插件卸载：站点 out 槽指向插件内存，卸载后悬空（UnloadPluginByOwnerId 调用
+//     CleanupCaptureSitesForOwner）。
+// 锁序约定：g_captureMutex 只保护站点表与 out 槽（CaptureDispatch 也持它写槽）；
+// MinHook 摘钩单独持 Runtime::MinHookMutex()。两把锁不在同一时刻同时持有——
+// RegisterGlobalCaptureImpl 的 capture→mh 顺序是注册路径的必然（在持 capture 锁的
+// 新站点建立块里调 MH_CreateHook），清理路径则反过来：先在 g_captureMutex 下收集
+// 快照、释放锁后再摘钩/释放 stub，避免在持 g_captureMutex 时等待摘钩（那会与在飞
+// 的 CaptureDispatch 在该锁上互相等待，且摘钩本身与注册路径的 mh 锁顺序冲突）。
+// 简化处理说明：MH_DisableHook/MH_RemoveHook 不等待在飞调用退出，摘钩后随即释放
+// stub 时理论上仍可能有线程位于 stub 内（极短窗口）。本任务接受该简化：与
+// ResetForReload 的 teardown 语义一致（旧 GameCore 映像随后即卸载），capture 站点
+// 是短暂的同步写路径，不跨线程长期驻留。
+static void CleanupAllCaptureSites() {
+    vector<pair<uintptr_t, void*>> snapshot;  // (target 地址, stubCode)
+    {
+        lock_guard<mutex> lock(g_captureMutex);
+        snapshot.reserve(g_captureSites.size());
+        for (const auto& [target, site] : g_captureSites) {
+            snapshot.emplace_back(target, site.stubCode);
+        }
+    }
+    for (const auto& [target, stub] : snapshot) {
+        void* addr = reinterpret_cast<void*>(target);
+        {
+            lock_guard<mutex> mhLock(Runtime::MinHookMutex());
+            const MH_STATUS status = MH_DisableHook(addr);
+            if (status == MH_OK || status == MH_ERROR_DISABLED) {
+                MH_RemoveHook(addr);
+            }
+        }
+        if (stub) g_captureRuntime.release(stub);
+    }
+    {
+        lock_guard<mutex> lock(g_captureMutex);
+        g_captureSites.clear();
+    }
+}
+
+// 插件卸载：摘除 ownerId == owner 的 capture 站点（该插件是站点首个注册者）。
+// 局限说明：站点 outs 可能被多个插件的 out 槽共享（out 追加不区分 owner），本实现
+// 不做 per-out owner 过滤——只要该插件是站点 ownerId 就整站摘除，其余插件共享的
+// out 槽一并失效（它们会在下次 GameCore 重载后经 Ready 回调重新注册）。完整
+// per-out owner 追踪需把 owner 记到每个 out 槽上，当前使用方（单插件独占 provider）
+// 不触发共享路径，故保持最小实现。
+static void CleanupCaptureSitesForOwner(const std::wstring& owner) {
+    if (owner.empty()) return;
+    vector<pair<uintptr_t, void*>> snapshot;
+    {
+        lock_guard<mutex> lock(g_captureMutex);
+        for (const auto& [target, site] : g_captureSites) {
+            if (site.ownerId == owner) {
+                snapshot.emplace_back(target, site.stubCode);
+            }
+        }
+    }
+    if (snapshot.empty()) return;
+    for (const auto& [target, stub] : snapshot) {
+        void* addr = reinterpret_cast<void*>(target);
+        {
+            lock_guard<mutex> mhLock(Runtime::MinHookMutex());
+            const MH_STATUS status = MH_DisableHook(addr);
+            if (status == MH_OK || status == MH_ERROR_DISABLED) {
+                MH_RemoveHook(addr);
+            }
+        }
+        if (stub) g_captureRuntime.release(stub);
+    }
+    {
+        // 摘钩后清表；防御：若摘钩窗口内同 target 已被重新注册（新 stub），
+        // 只删 stub 仍匹配的旧站点。
+        lock_guard<mutex> lock(g_captureMutex);
+        for (const auto& [target, stub] : snapshot) {
+            const auto it = g_captureSites.find(target);
+            if (it != g_captureSites.end() && it->second.stubCode == stub) {
+                g_captureSites.erase(it);
+            }
+        }
+    }
+    Logger::Log("CleanupCaptureSitesForOwner: owner=%ls removed=%zu site(s)",
+        owner.c_str(), snapshot.size());
 }
 
 void* ResolveCurrentGameCoreByName(const char* name) {
@@ -1473,14 +1893,6 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
     std::string sym = pushMethodsSymbol && *pushMethodsSymbol
         ? pushMethodsSymbol
         : (std::string(name) + "::PushMethods");
-    // Ensure ResolveByName can resolve the PushMethods symbol if only alias name differs.
-    if (pushMethodsSymbol && *pushMethodsSymbol) {
-        const uint32_t rva = SymbolDb::LookupRva(pushMethodsSymbol);
-        if (rva != 0) {
-            const std::string key = std::string(name) + "::PushMethods";
-            SymbolDb::RegisterRva(key.c_str(), rva);
-        }
-    }
     Logger::Log("RegisterPushMethodsTarget: %s sig=%d sym=%s", name, sigType, sym.c_str());
     return 1;
 }
@@ -1589,6 +2001,10 @@ static HookAPI g_hookApi = {
 
     &RegisterGameCoreReadyImpl,
     &RegisterGameCoreTeardownImpl,
+
+    &ResolveByRvaExImpl,
+    &ResolveByPatternImpl,
+    &RegisterGlobalCaptureImpl,
 };
 
 typedef void (*OnLoadFunc)(HookAPI*);
@@ -1608,14 +2024,14 @@ bool AttachGameCore(HMODULE gameCore) {
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     const DWORD sizeOfImage = GetModuleSizeOfImage(gameCore);
     const HookImageId image = ImageAddress::IdentifyGameCore(gameCore);
-    const uint32_t expected = SymbolDb::ExpectedSizeOfImage();
     if (sizeOfImage == 0 || image == kHookImageInvalid) {
         Logger::Log("GameCore rejected: invalid or unknown PE image");
         return false;
     }
-    if (image == kHookImageGameCoreXP2 && expected != 0 && sizeOfImage != expected) {
-        Logger::Log("GameCore rejected: SizeOfImage mismatch symbols=0x%08X actual=0x%08X",
-            expected, sizeOfImage);
+    // XP2：先建 pdata 矫正表（sidecar 由 RuntimeEntry InitEarly 装载）。失败 = 无法矫正，
+    // 拒绝注入（GameCore 本身照常运行）。
+    if (image == kHookImageGameCoreXP2 && !PdataMatch::BuildNewTable(gameCore)) {
+        Logger::Log("GameCore rejected: XP2 pdata table build failed");
         return false;
     }
 
@@ -1929,6 +2345,9 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
     PatchRegistry::RevertAllFor(entry.ownerId.c_str());
     // 撤销该插件的 MinHook 钩子：否则 GameCore 重载后重新 OnLoad 会撞 MH_ERROR_ALREADY_CREATED。
     RemovePluginHooks(entry.ownerId.c_str());
+    // 撤销该插件注册的全局参数捕获站：out 槽指向插件内存，卸载后悬空
+    //（ownerId == 站点首个注册者时整站摘除，见 CleanupCaptureSitesForOwner 注释）。
+    CleanupCaptureSitesForOwner(entry.ownerId);
     // 撤销该插件注册的回调类条目（见 RemovePluginOwnedRegistrations）。
     RemovePluginOwnedRegistrations(entry.ownerId);
     ClearActivePluginContext();
@@ -2283,6 +2702,11 @@ void LoaderCore::ResetForReload() {
     // Global 插件收尾回调：置于 GameCore 插件卸载之前（它们可能依赖后者仍在
     // 钩上维护的数据）；旧映像此刻仍存活。
     FireGameCoreCallbacks(g_gameCoreTeardownCallbacks, "GameCoreTeardown");
+
+    // capture 站点的 providerFunction 位于旧 GameCore 映像内，重载后地址失效，
+    // 必须随重载清掉全部站点。此刻旧映像仍存活（尚未 detach），MH_RemoveHook
+    // 能干净摘除；等下次 Ready 回调由插件重新注册。
+    CleanupAllCaptureSites();
 
     // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。
     UnloadPluginsOf(PluginCategory::GameCore);

@@ -54,11 +54,11 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS;ASMJIT_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\DllLoader;$(ProjectDir)..\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\DllLoader;$(ProjectDir)..\common;$(ProjectDir)..\third_party\asmjit_src\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -67,7 +67,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)..\DllLoader\resources;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libMinHook.x64.lib;Dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libAsmJit.x64.debug.lib;libMinHook.x64.lib;Dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -76,11 +76,11 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS;ASMJIT_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\DllLoader;$(ProjectDir)..\common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\DllLoader;$(ProjectDir)..\common;$(ProjectDir)..\third_party\asmjit_src\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WholeProgramOptimization>false</WholeProgramOptimization>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -92,7 +92,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <LinkTimeCodeGeneration>Default</LinkTimeCodeGeneration>
       <AdditionalLibraryDirectories>$(ProjectDir)..\DllLoader\resources;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libMinHook.x64.lib;Dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libAsmJit.x64.lib;libMinHook.x64.lib;Dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -107,15 +107,15 @@
     <ClInclude Include="Localization.h" />
     <ClInclude Include="..\common\Logger.h" />
     <ClInclude Include="MinHook.h" />
+    <ClInclude Include="NormHash.h" />
+    <ClInclude Include="PdataMatch.h" />
     <ClInclude Include="ProxyTypes.h" />
     <ClInclude Include="Runtime.h" />
-    <ClInclude Include="SymbolDb.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="ImageAddress.h" />
     <ClInclude Include="LoaderUpdate.h" />
     <ClInclude Include="PatchRegistry.h" />
     <ClInclude Include="pch.h" />
-    <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="RuntimeEntry.cpp" />
@@ -131,24 +131,24 @@
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
+    <ClCompile Include="..\third_party\hde\hde64.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
     <ClCompile Include="Civ6DLLHookLoaderAPI.cpp" />
     <ClCompile Include="Civ6MessageBus.cpp" />
     <ClCompile Include="HavokScript.cpp" />
     <ClCompile Include="Localization.cpp" />
     <ClCompile Include="..\common\Logger.cpp" />
+    <ClCompile Include="NormHash.cpp" />
+    <ClCompile Include="PdataMatch.cpp" />
     <ClCompile Include="Runtime.cpp" />
-    <ClCompile Include="SymbolDb.cpp" />
     <ClCompile Include="pch.cpp"><PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader></ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="SymbolDb.rc" />
+    <ResourceCompile Include="Sidecar.rc" />
   </ItemGroup>
-  <Target Name="PackSymbolDb" BeforeTargets="ResourceCompile;ClCompile">
-    <Exec Command="python &quot;$(ProjectDir)..\tools\pack_symbol_db.py&quot; --unique &quot;$(ProjectDir)..\tools\out\map_new_rva_unique.jsonl&quot; --aliases &quot;$(ProjectDir)..\tools\symbol_aliases.json&quot; --out &quot;$(ProjectDir)..\tools\out\Civ6DllLoader.symbols.bin&quot;" />
-  </Target>
-  <Target Name="CopySymbolDbSidecar" AfterTargets="Build">
-    <Copy SourceFiles="$(ProjectDir)..\tools\out\Civ6DllLoader.symbols.bin" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
 
