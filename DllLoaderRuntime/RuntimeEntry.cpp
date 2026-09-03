@@ -24,6 +24,7 @@
 #include "../common/Logger.h"
 #include "Runtime.h"
 #include "PdataMatch.h"
+#include "UiInject.h"
 
 namespace {
 
@@ -71,9 +72,17 @@ DWORD WINAPI WorkerMain(LPVOID) {
     // 1) 基础初始化：Logger / PdataMatch / MinHook
     LoaderCore::InitEarly();
 
+    // 1.5) 释放内嵌 FrontEnd UI 资源到 exe 目录的 Civ6DllLoader 子目录
+    UiInject::ExtractResources();
+
     // 2) hook 安装（LoadDLL / lEnableMod / lDisableMod；失败静默降级）
     if (!LoaderHooks::InstallAll()) {
         Logger::Log("hook 安装降级");
+    }
+
+    // 2.5) FrontEnd UI 注入 hook（失败静默降级）
+    if (!UiInject::Install()) {
+        Logger::Log("FrontEnd UI 注入 hook 降级");
     }
 
     // 3) 自更新检查

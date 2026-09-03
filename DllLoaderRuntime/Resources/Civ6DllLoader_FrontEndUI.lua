@@ -1,0 +1,3 @@
+-- 根容器 context 的 lua：内容留空。
+-- Mod 的 UI（FrontEndUI_*.xml + FrontEndUI_*.lua）由 loader 用 C++ 遍历加载
+-- （见 DllLoaderRuntime/UiInject.cpp 的 FindModUiFiles / InjectSingleContext）。
