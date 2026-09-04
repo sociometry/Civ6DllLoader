@@ -126,6 +126,7 @@ void LoaderCore::InitEarly() {
 
 // ---- 阶段 C 唤醒请求（S3a，本文件实现；EnableMod/DisableMod detour 调用）----
 void LoaderCore::RequestReconcile() {
+    UiInject::RequestRefresh();
     g_reconcileRequested.store(true);
     if (g_wakeEvent) {
         SetEvent(g_wakeEvent);

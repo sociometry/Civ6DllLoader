@@ -17,6 +17,7 @@
 #include "LoaderCore.h"
 #include "ImageAddress.h"
 #include "Runtime.h"
+#include "UiInject.h"
 #include "../common/Logger.h"
 #include "MinHook.h"
 
@@ -273,12 +274,14 @@ static char __fastcall UnloadDllDetour() {
 static __int64 __fastcall EnableModDetour(void* L) {
     __int64 r = g_origEnableMod(L);
     LoaderCore::RequestReconcile();
+    UiInject::RefreshOnUiThread();
     return r;
 }
 
 static __int64 __fastcall DisableModDetour(void* L) {
     __int64 r = g_origDisableMod(L);
     LoaderCore::RequestReconcile();
+    UiInject::RefreshOnUiThread();
     return r;
 }
 

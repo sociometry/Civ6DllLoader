@@ -36,6 +36,7 @@
 #include <iterator>
 #include <string>
 #include <string.h>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -59,6 +60,7 @@ constexpr const char* kModUiPrefix = "FrontEndUI_";
 constexpr uintptr_t kRva_LoadUI       = 0x8AB40;   // MainMenuState::LoadUI
 constexpr uintptr_t kRva_AllocLuaCtx  = 0x7A500;   // AllocateControl<LuaContext>
 constexpr uintptr_t kRva_ChangeParent = 0x8707D0;  // ControlBase::ChangeParent（导出兜底）
+constexpr uintptr_t kRva_DestroyChild = 0x871410;  // ControlBase::DestroyChild（刷新时销毁根 context）
 constexpr uintptr_t kRva_UIManager    = 0x235F7C8; // ForgeUI::UIManager 全局指针槽
 
 // LuaContext 虚表 Initialize 槽偏移（LoadUI 汇编：call [vftable+200h]）
@@ -69,6 +71,9 @@ constexpr ptrdiff_t kOff_FrontEndContext = 0x230;
 // ChangeParent 导出符号（exe 导出表 entry 93）
 constexpr const char* kChangeParentExport =
     "?ChangeParent@ControlBase@ForgeUI@@QEAAXPEAV12@@Z";
+// DestroyChild 导出符号（用于在 UI 重载前销毁 loader 自己的根 context）
+constexpr const char* kDestroyChildExport =
+    "?DestroyChild@ControlBase@ForgeUI@@UEAAXPEAV12@@Z";
 
 // ---- 特征码（入口前 N 字节，全部固定，运行时校验）----
 const uint8_t kSigLoadUI[] = {
@@ -80,15 +85,25 @@ const uint8_t kSigAlloc[] = {
 const uint8_t kSigChangeParent[] = {
     0x48,0x85,0xD2,0x74,0x6C,0x48,0x89,0x5C,0x24,0x08
 };
+const uint8_t kSigDestroyChild[] = {
+    0x40,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF9,0x48,0x8B,0x49,0x08
+};
 
 // ---- 类型 ----
 typedef void* (__fastcall* AllocLuaContextFn)(void* uiManager);   // AllocateControl<LuaContext>(UIManager*)
 typedef void  (__fastcall* ChangeParentFn)(void* child, void* parent);
+typedef void  (__fastcall* DestroyChildFn)(void* parent, void* child);
 typedef void  (__fastcall* LuaInitFn)(void* ctx, const wchar_t* name);
 typedef void* (__fastcall* LoadUiFn)(void* state);
 
 // ---- 状态 ----
-std::atomic<bool> g_injected{ false };
+// UI 对象只能在游戏/UI 线程操作；刷新请求由 Mod toggle detour 设置，
+// 具体销毁与重建只在 LoadUI detour 或明确的 UI 线程刷新点执行。
+std::atomic<bool> g_refreshRequested{ true };
+std::atomic<bool> g_injectionInProgress{ false };
+void* g_lastLoadUiState = nullptr;
+void* g_frontEndContext = nullptr;
+void* g_rootContext = nullptr;
 LoadUiFn g_origLoadUI = nullptr;
 
 // 进程 exe 所在目录（去文件名段）。失败返回空串。
@@ -203,51 +218,185 @@ std::string ReadModinfo(const std::filesystem::path& modDir) {
     return {};
 }
 
-// 从 .modinfo 文本解析所有 <ImportFiles> 块里的 <File>，收集 FrontEndUI_*.xml 的 base name
-// （ImportFiles 的 <File> 路径去 .xml，保持 '/' 分隔，供 ForgeUI VFS 解析）。
-std::vector<std::wstring> ParseModinfoUiFiles(const std::string& text) {
-    std::vector<std::wstring> out;
-    size_t pos = 0;
-    while ((pos = text.find("<ImportFiles", pos)) != std::string::npos) {
-        const size_t blockEnd = text.find("</ImportFiles>", pos);
-        if (blockEnd == std::string::npos) break;
-        const std::string block = text.substr(pos, blockEnd - pos);
-
-        size_t fpos = 0;
-        while ((fpos = block.find("<File", fpos)) != std::string::npos) {
-            const size_t gt = block.find('>', fpos);
-            if (gt == std::string::npos) break;
-            const size_t fstart = gt + 1;
-            const size_t fend = block.find("</File>", fstart);
-            if (fend == std::string::npos) break;
-            const std::string file = TrimAscii(block.substr(fstart, fend - fstart));
-
-            // 文件名（最后 '/' 或 '\' 后）
-            size_t slash = file.find_last_of('/');
-            const size_t backslash = file.find_last_of('\\');
-            if (backslash != std::string::npos && (slash == std::string::npos || backslash > slash)) {
-                slash = backslash;
-            }
-            const std::string fname = (slash == std::string::npos) ? file : file.substr(slash + 1);
-
-            if (fname.size() <= 11) { fpos = fend + 7; continue; }
-            if (_strnicmp(fname.c_str(), kModUiPrefix, 11) != 0) { fpos = fend + 7; continue; }
-            if (fname.size() < 4 ||
-                _stricmp(fname.c_str() + fname.size() - 4, ".xml") != 0) { fpos = fend + 7; continue; }
-
-            // base name = <File> 路径去 .xml（保持目录，如 UI/FrontEndUI_Test）
-            out.push_back(ModScan::NarrowToWide(file.substr(0, file.size() - 4)));
-            fpos = fend + 7;
+// XML 的最小词法辅助：只识别这里需要的元素，避免把注释、<FileName> 等相似文本
+// 当成真实节点。modinfo 是游戏自己的 XML，完整 DOM 解析没有必要，但必须先去注释。
+size_t FindTagEnd(std::string_view text, size_t start) {
+    bool quoted = false;
+    char quote = 0;
+    for (size_t i = start; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (quoted) {
+            if (ch == quote) quoted = false;
+        } else if (ch == '\"' || ch == '\'') {
+            quoted = true;
+            quote = ch;
+        } else if (ch == '>') {
+            return i;
         }
-        pos = blockEnd + 14;
+    }
+    return std::string_view::npos;
+}
+
+bool IsXmlNameBoundary(char ch) {
+    return ch == '>' || ch == '/' || std::isspace(static_cast<unsigned char>(ch)) != 0;
+}
+
+size_t FindOpeningTag(std::string_view text, std::string_view name, size_t from) {
+    const std::string needle = "<" + std::string(name);
+    size_t pos = from;
+    while ((pos = text.find(needle, pos)) != std::string_view::npos) {
+        const size_t after = pos + needle.size();
+        if (after < text.size() && IsXmlNameBoundary(text[after])) return pos;
+        pos = after;
+    }
+    return std::string_view::npos;
+}
+
+size_t FindClosingTag(std::string_view text, std::string_view name, size_t from) {
+    const std::string needle = "</" + std::string(name);
+    size_t pos = from;
+    while ((pos = text.find(needle, pos)) != std::string_view::npos) {
+        const size_t after = pos + needle.size();
+        if (after < text.size() && IsXmlNameBoundary(text[after])) return pos;
+        pos = after;
+    }
+    return std::string_view::npos;
+}
+
+std::string StripXmlComments(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t begin = text.find("<!--", pos);
+        if (begin == std::string::npos) {
+            out.append(text, pos, std::string::npos);
+            break;
+        }
+        out.append(text, pos, begin - pos);
+        const size_t end = text.find("-->", begin + 4);
+        if (end == std::string::npos) break;
+        pos = end + 3;
     }
     return out;
 }
 
-// 遍历启用 Mod，解析各 .modinfo 的 ImportFiles，收集 FrontEndUI_*.xml base name。
+bool HasCriteriaAttribute(std::string_view tag) {
+    size_t pos = 0;
+    while ((pos = tag.find("criteria", pos)) != std::string_view::npos) {
+        const bool nameStart = pos == 0 || std::isspace(static_cast<unsigned char>(tag[pos - 1])) != 0;
+        size_t after = pos + 8;
+        while (nameStart && after < tag.size() &&
+               std::isspace(static_cast<unsigned char>(tag[after])) != 0) {
+            ++after;
+        }
+        if (nameStart && after < tag.size() && tag[after] == '=') return true;
+        pos += 8;
+    }
+    return false;
+}
+
+bool IsSelfClosingTag(std::string_view tag) {
+    if (tag.empty()) return false;
+    size_t end = tag.size();
+    while (end > 0 && std::isspace(static_cast<unsigned char>(tag[end - 1])) != 0) --end;
+    return end > 0 && tag[end - 1] == '/';
+}
+
+// 只接受无 Criteria 的 FrontEndActions/ImportFiles。条件表达式由游戏求值，
+// loader 无法安全复现其语义；使用 loader 注入的 UI 应放在无条件 FrontEndActions 中。
+std::vector<std::wstring> ParseModinfoUiFiles(const std::string& text) {
+    std::vector<std::wstring> out;
+    const std::string clean = StripXmlComments(text);
+    size_t actionPos = 0;
+    while ((actionPos = FindOpeningTag(clean, "FrontEndActions", actionPos)) != std::string_view::npos) {
+        const size_t actionTagEnd = FindTagEnd(clean, actionPos);
+        if (actionTagEnd == std::string_view::npos) break;
+        const std::string_view actionTag(clean.data() + actionPos,
+                                         actionTagEnd - actionPos + 1);
+        if (IsSelfClosingTag(actionTag)) {
+            actionPos = actionTagEnd + 1;
+            continue;
+        }
+        const size_t actionEnd = FindClosingTag(clean, "FrontEndActions", actionTagEnd + 1);
+        if (actionEnd == std::string_view::npos) break;
+        const std::string_view action(clean.data() + actionTagEnd + 1,
+                                      actionEnd - actionTagEnd - 1);
+
+        size_t importPos = 0;
+        while ((importPos = FindOpeningTag(action, "ImportFiles", importPos)) != std::string_view::npos) {
+            const size_t importTagEnd = FindTagEnd(action, importPos);
+            if (importTagEnd == std::string_view::npos) break;
+            const std::string_view importTag(action.data() + importPos,
+                                             importTagEnd - importPos + 1);
+            if (IsSelfClosingTag(importTag)) {
+                importPos = importTagEnd + 1;
+                continue;
+            }
+            const size_t importEnd = FindClosingTag(action, "ImportFiles", importTagEnd + 1);
+            if (importEnd == std::string_view::npos) break;
+            const std::string_view block(action.data() + importTagEnd + 1,
+                                         importEnd - importTagEnd - 1);
+            const bool conditional = HasCriteriaAttribute(importTag) ||
+                FindOpeningTag(block, "Criteria", 0) != std::string_view::npos;
+
+            if (!conditional) {
+                size_t filePos = 0;
+                while ((filePos = FindOpeningTag(block, "File", filePos)) != std::string_view::npos) {
+                    const size_t fileTagEnd = FindTagEnd(block, filePos);
+                    if (fileTagEnd == std::string_view::npos) break;
+                    const std::string_view fileTag(block.data() + filePos,
+                                                   fileTagEnd - filePos + 1);
+                    if (IsSelfClosingTag(fileTag)) {
+                        filePos = fileTagEnd + 1;
+                        continue;
+                    }
+                    const size_t fileEnd = FindClosingTag(block, "File", fileTagEnd + 1);
+                    if (fileEnd == std::string_view::npos) break;
+                    const std::string file = TrimAscii(std::string(
+                        block.substr(fileTagEnd + 1, fileEnd - fileTagEnd - 1)));
+
+                    size_t slash = file.find_last_of('/');
+                    const size_t backslash = file.find_last_of('\\');
+                    if (backslash != std::string::npos &&
+                        (slash == std::string::npos || backslash > slash)) {
+                        slash = backslash;
+                    }
+                    const std::string fname = (slash == std::string::npos) ? file : file.substr(slash + 1);
+
+                    if (fname.size() > 11 &&
+                        _strnicmp(fname.c_str(), kModUiPrefix, 11) == 0 &&
+                        fname.size() >= 4 &&
+                        _stricmp(fname.c_str() + fname.size() - 4, ".xml") == 0) {
+                        const std::wstring wide = ModScan::NarrowToWide(
+                            file.substr(0, file.size() - 4));
+                        if (!wide.empty()) out.push_back(wide);
+                    }
+                    const size_t fileCloseEnd = FindTagEnd(block, fileEnd);
+                    if (fileCloseEnd == std::string_view::npos) break;
+                    filePos = fileCloseEnd + 1;
+                }
+            }
+            const size_t importCloseEnd = FindTagEnd(action, importEnd);
+            if (importCloseEnd == std::string_view::npos) break;
+            importPos = importCloseEnd + 1;
+        }
+        const size_t actionCloseEnd = FindTagEnd(clean, actionEnd);
+        if (actionCloseEnd == std::string_view::npos) break;
+        actionPos = actionCloseEnd + 1;
+    }
+    return out;
+}
+
+// 遍历启用 Mod，解析各 .modinfo 的 FrontEndActions/ImportFiles，收集 FrontEndUI_*.xml base name。
 std::vector<std::wstring> FindModUiFiles(HMODULE anchor) {
     std::vector<std::wstring> out;
     const EnabledMods::Snapshot snap = EnabledMods::Load();
+    if (!snap.ok) {
+        Logger::Log("UiInject: EnabledMods 不可用（%s），跳过所有 Mod UI",
+                    snap.error.empty() ? "unknown" : snap.error.c_str());
+        return out;
+    }
 
     for (const auto& root : ModScan::CollectScanRoots(anchor)) {
         std::error_code ec;
@@ -257,7 +406,7 @@ std::vector<std::wstring> FindModUiFiles(HMODULE anchor) {
             std::error_code de;
             if (!it->is_directory(de)) continue;
             const std::filesystem::path modDir = it->path();
-            if (snap.ok && !EnabledMods::AllowsPath(snap, modDir.wstring())) continue;
+            if (!EnabledMods::AllowsPath(snap, modDir.wstring())) continue;
 
             const std::string modinfo = ReadModinfo(modDir);
             if (modinfo.empty()) continue;
@@ -276,7 +425,13 @@ std::vector<std::wstring> FindModUiFiles(HMODULE anchor) {
         }
         return a.size() < b.size();
     });
-    out.erase(std::unique(out.begin(), out.end()), out.end());
+    out.erase(std::unique(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (towlower(a[i]) != towlower(b[i])) return false;
+        }
+        return true;
+    }), out.end());
     return out;
 }
 
@@ -284,6 +439,7 @@ std::vector<std::wstring> FindModUiFiles(HMODULE anchor) {
 struct UiApi {
     AllocLuaContextFn alloc = nullptr;
     ChangeParentFn changeParent = nullptr;
+    DestroyChildFn destroyChild = nullptr;
 };
 
 // 创建 + 挂载 + 初始化一个 LuaContext（加载 baseName.xml + baseName.lua），挂到 parent 下。
@@ -311,9 +467,8 @@ void* InjectSingleContext(const UiApi& api, void* mgr, void* parent, const wchar
 
 // 注入主体：在 LoadUI 原函数返回后调用。state = MainMenuState*。
 void InjectFrontEndUi(void* state) {
-    if (g_injected.exchange(true)) {
-        return;  // 幂等：进程内只注入一次
-    }
+    g_lastLoadUiState = state;
+    const bool refresh = g_refreshRequested.exchange(false, std::memory_order_acq_rel);
 
     // 1) 读 UIManager 全局 + FrontEnd context 指针
     void* mgr = nullptr;
@@ -322,7 +477,7 @@ void InjectFrontEndUi(void* state) {
         void* slot = ImageAddress::ResolveByRva(kExeImage, kRva_UIManager, sizeof(void*));
         if (!slot || !Runtime::IsReadableSpan(slot, sizeof(void*))) {
             Logger::Log("UiInject: UIManager 全局不可读，放弃注入");
-            g_injected.store(false);
+            if (refresh) g_refreshRequested.store(true, std::memory_order_release);
             return;
         }
         mgr = *reinterpret_cast<void**>(slot);
@@ -331,15 +486,31 @@ void InjectFrontEndUi(void* state) {
     }
     if (!mgr || !frontEnd) {
         Logger::Log("UiInject: mgr/frontEnd 为空（FrontEnd 未就绪），放弃");
-        g_injected.store(false);
+        if (refresh) g_refreshRequested.store(true, std::memory_order_release);
         return;
+    }
+
+    const bool newFrontEnd = g_frontEndContext != frontEnd;
+    if (!newFrontEnd && !refresh && g_rootContext) {
+        return;  // 当前 FrontEnd 已经注入，且没有 Mod toggle 请求
+    }
+
+    // LoadUI 重建时旧 FrontEnd 通常已经由游戏销毁；不能再访问旧指针。
+    // 只有同一个 FrontEnd 收到刷新请求时，才使用游戏导出的 DestroyChild 安全销毁
+    // 我们自己的根 context，然后在同一线程重新构建。
+    if (newFrontEnd) {
+        g_frontEndContext = frontEnd;
+        g_rootContext = nullptr;
     }
 
     // 2) 解析注入链路函数指针
     UiApi api;
     uintptr_t allocAddr = ResolveChecked(kRva_AllocLuaCtx, kSigAlloc, sizeof(kSigAlloc),
                                          "AllocateControl<LuaContext>");
-    if (!allocAddr) { g_injected.store(false); return; }
+    if (!allocAddr) {
+        if (refresh) g_refreshRequested.store(true, std::memory_order_release);
+        return;
+    }
     api.alloc = reinterpret_cast<AllocLuaContextFn>(allocAddr);
 
     api.changeParent = reinterpret_cast<ChangeParentFn>(
@@ -349,11 +520,37 @@ void InjectFrontEndUi(void* state) {
                                           sizeof(kSigChangeParent), "ChangeParent");
         api.changeParent = reinterpret_cast<ChangeParentFn>(cpAddr);
     }
-    if (!api.changeParent) { g_injected.store(false); return; }
+    if (!api.changeParent) {
+        if (refresh) g_refreshRequested.store(true, std::memory_order_release);
+        return;
+    }
+
+    if (!newFrontEnd && refresh && g_rootContext) {
+        api.destroyChild = reinterpret_cast<DestroyChildFn>(
+            GetProcAddress(GetModuleHandleW(nullptr), kDestroyChildExport));
+        if (!api.destroyChild) {
+            const uintptr_t destroyAddr = ResolveChecked(kRva_DestroyChild, kSigDestroyChild,
+                                                         sizeof(kSigDestroyChild), "DestroyChild");
+            api.destroyChild = reinterpret_cast<DestroyChildFn>(destroyAddr);
+        }
+        if (!api.destroyChild) {
+            Logger::Log("UiInject: DestroyChild 不可用，保留当前 UI，跳过刷新");
+            g_refreshRequested.store(true, std::memory_order_release);
+            return;
+        }
+
+        void* oldRoot = g_rootContext;
+        g_rootContext = nullptr;
+        api.destroyChild(frontEnd, oldRoot);
+    }
 
     // 3) 注入根容器 context（lua 已留空），挂到 FrontEnd 下（其 Name = AdditionalFrontEndUI）
     void* rootCtx = InjectSingleContext(api, mgr, frontEnd, kUiBaseName);
-    if (!rootCtx) { g_injected.store(false); return; }
+    if (!rootCtx) {
+        g_refreshRequested.store(true, std::memory_order_release);
+        return;
+    }
+    g_rootContext = rootCtx;
 
     // 4) 遍历启用 Mod 的 ImportFiles 声明，加载 FrontEndUI_*.xml，挂到根容器下
     HMODULE anchor = LoaderCore::RuntimeModuleHandle();
@@ -364,14 +561,26 @@ void InjectFrontEndUi(void* state) {
     }
 }
 
-// ---- MainMenuState::LoadUI detour ----
-void* __fastcall LoadUiDetour(void* state) {
-    void* result = g_origLoadUI(state);  // 先让原函数创建 FrontEnd + InvitePopup
+void RunInjectionSafely(void* state) {
+    if (g_injectionInProgress.exchange(true, std::memory_order_acq_rel)) {
+        g_refreshRequested.store(true, std::memory_order_release);
+        return;
+    }
     __try {
         InjectFrontEndUi(state);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // 若异常发生在某个 Mod context 初始化之后，保留已登记的 root，
+        // 让下一次刷新先通过 DestroyChild 回收，避免重复挂载。
+        g_refreshRequested.store(true, std::memory_order_release);
         Logger::Log("UiInject: 注入异常（已捕获），降级");
     }
+    g_injectionInProgress.store(false, std::memory_order_release);
+}
+
+// ---- MainMenuState::LoadUI detour ----
+void* __fastcall LoadUiDetour(void* state) {
+    void* result = g_origLoadUI(state);  // 先让原函数创建 FrontEnd + InvitePopup
+    RunInjectionSafely(state);
     return result;
 }
 
@@ -385,6 +594,15 @@ void UiInject::ExtractResources() {
     }
     ExtractOne(module, kLuaResourceId, kLuaFileName);
     ExtractOne(module, kXmlResourceId, kXmlFileName);
+}
+
+void UiInject::RequestRefresh() {
+    g_refreshRequested.store(true, std::memory_order_release);
+}
+
+void UiInject::RefreshOnUiThread() {
+    if (!g_lastLoadUiState) return;
+    RunInjectionSafely(g_lastLoadUiState);
 }
 
 bool UiInject::Install() {
