@@ -185,6 +185,10 @@ typedef struct HookAPI {
     // 参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。同一 providerFunction
     // 只 hook 一次，后续注册的 out 追加到列表，触发时统一赋值。返回 false = 注册失败（providerFunction 解析失败等）。
     bool (*RegisterGlobalCapture)(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out);
+    // 按 vtable 符号名（demangled/mangled）解析第 index 个虚函数槽位（0 起）：
+    // 定位 vtable 地址（版本一致恒等，跨版本走槽位结构匹配），读 [vtable + index*8] 的
+    // 槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。
+    void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
 } HookAPI;
 
 // True if this runtime can serve a plugin built against the current header.
@@ -231,6 +235,11 @@ T ResolveByRvaEx(HookAPI* api, HookImageId image, uintptr_t rva, HookImageSectio
 template <typename T>
 T ResolveByPattern(HookAPI* api, HookImageId image, const char* pattern, HookImageSection section = kSectionImage) {
     return reinterpret_cast<T>(api->ResolveByPattern(image, pattern, section));
+}
+
+template <typename T>
+T ResolveByVTable(HookAPI* api, HookImageId image, const char* vtableSymbol, uint32_t index) {
+    return reinterpret_cast<T>(api->ResolveByVTable(image, vtableSymbol, index));
 }
 #endif
 

@@ -138,11 +138,17 @@ struct AobInfo {                // 函数体 AOB 条目信息（v2 sidecar）
     uint32_t bodySize = 0;
     size_t dataOffset = 0;      // 在 g_aobData 里的偏移（body 起始，mask 紧随其后）
 };
+struct VtableInfo {              // vtable 符号信息（跨版本定位用）
+    uint32_t old_rva = 0;        // vtable 地址（.rdata）
+    std::vector<VtableSlot> slots;  // 槽位表（offset + funcRva，含叶子槽函数）
+};
 std::vector<uint8_t> g_aobData;                    // 函数体 AOB 表原始数据（v2）
 std::unordered_map<uint32_t, AobInfo> g_aobByRva;  // old_rva -> AOB 信息
 uint64_t g_oldFingerprint = 0;                 // old pdata 表指纹（sidecar 内容）
 uint32_t g_baseSizeOfImage = 0;
 bool g_loaded = false;
+bool g_identical = false;  // 版本一致（恒等映射）：跳过一切 pdata 匹配，RVA 恒等解析
+std::unordered_map<uint32_t, uint32_t> g_leafMap;  // 叶子符号 old_rva -> new_rva（跨版本 AOB 匹配结果）
 
 std::vector<PdataSig> g_newPdata;                 // new 签名表（按 begin_rva 升序）
 std::vector<uint32_t> g_map;                      // old_idx -> new_idx / kUnmatched
@@ -752,6 +758,267 @@ std::vector<uint32_t> AlignTables(
     return mapping;
 }
 
+// 叶子函数 AOB 匹配：对 old_rva 不在 pdata 里的叶子符号（gap），在前后最近已匹配 pdata
+// 函数划定的 new RVA 区间内用归一化字节（body+mask）做唯一 AOB 搜索。
+// 返回 old_rva -> new_rva 映射（命中为叶子函数入口 RVA）。
+std::unordered_map<uint32_t, uint32_t> BuildLeafMap(
+    const std::vector<PdataSig>& oldTable,
+    const std::vector<uint32_t>& mapping,
+    const std::vector<PdataSig>& newTable,
+    const uint8_t* newBase,
+    uint32_t newImageSize) {
+    std::unordered_map<uint32_t, uint32_t> leafMap;
+    const size_t n = oldTable.size();
+    const size_t m = newTable.size();
+    if (m == 0) return leafMap;
+
+    // 已匹配 old 索引（oldTable 按 begin_rva 升序，故该列表也按 begin_rva 升序）
+    std::vector<size_t> matchedOld;
+    matchedOld.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (mapping[i] != kUnmatched) matchedOld.push_back(i);
+    }
+
+    size_t recovered = 0;
+    for (const auto& kv : g_aobByRva) {
+        const uint32_t rva = kv.first;
+        const AobInfo& info = kv.second;
+        const size_t span = static_cast<size_t>(info.bodySize) * 2;
+        if (info.bodySize == 0 || info.dataOffset + span > g_aobData.size()) continue;
+        // 包含判断：rva 在某个 pdata 条目内 = 非叶子，跳过
+        bool inPdata = false;
+        {
+            size_t lo = 0, hi = n;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (oldTable[mid].begin_rva <= rva) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo > 0) {
+                size_t idx = lo - 1;
+                size_t scanned = 0;
+                for (;;) {
+                    const PdataSig& oe = oldTable[idx];
+                    if (rva < static_cast<uintptr_t>(oe.begin_rva) + oe.size) { inPdata = true; break; }
+                    if (idx == 0 || scanned >= 64) break;
+                    --idx;
+                    ++scanned;
+                }
+            }
+        }
+        if (inPdata) continue;
+        // 前后最近已匹配 pdata 函数划定 new RVA 区间
+        auto itNext = std::lower_bound(matchedOld.begin(), matchedOld.end(), rva,
+            [&](size_t idx, uint32_t v) { return oldTable[idx].begin_rva < v; });
+        uint64_t loRva = 0;
+        uint64_t hiRva = newImageSize;
+        if (itNext != matchedOld.end()) hiRva = newTable[mapping[*itNext]].begin_rva;
+        if (itNext != matchedOld.begin()) {
+            const PdataSig& pe = newTable[mapping[*(itNext - 1)]];
+            loRva = static_cast<uint64_t>(pe.begin_rva) + pe.size;
+        }
+        if (loRva >= hiRva || hiRva - loRva < info.bodySize) continue;
+        // AOB 唯一搜索
+        const uint8_t* body = g_aobData.data() + info.dataOffset;
+        const uint8_t* mask = body + info.bodySize;
+        const uint8_t* lo = newBase + loRva;
+        const uint8_t* hi = newBase + hiRva;
+        const uint8_t* hitPtr = nullptr;
+        size_t hitCount = 0;
+        for (const uint8_t* p = lo; p + info.bodySize <= hi; ++p) {
+            bool match = true;
+            for (size_t k = 0; k < info.bodySize; ++k) {
+                if (mask[k] && p[k] != body[k]) { match = false; break; }
+            }
+            if (match) {
+                hitPtr = p;
+                ++hitCount;
+                if (hitCount > 1) break;
+            }
+        }
+        if (hitCount != 1) continue;
+        const uint32_t hitRva = static_cast<uint32_t>(hitPtr - newBase);
+        leafMap.emplace(rva, hitRva);
+        ++recovered;
+    }
+    if (recovered != 0) {
+        Logger::Log("PdataMatch: leaf AOB recovery matched %zu", recovered);
+    }
+    return leafMap;
+}
+
+// 矫正任意 old RVA（局部版本）：pdata 条目走 mapping，gap 走叶子 AOB 结果
+uint32_t CorrectRvaLocal(uint32_t rva,
+    const std::vector<PdataSig>& oldTable,
+    const std::vector<uint32_t>& mapping,
+    const std::vector<PdataSig>& newTable,
+    const std::unordered_map<uint32_t, uint32_t>& leafMap) {
+    const size_t n = oldTable.size();
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (oldTable[mid].begin_rva <= rva) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo > 0) {
+        size_t idx = lo - 1;
+        size_t scanned = 0;
+        for (;;) {
+            const PdataSig& oe = oldTable[idx];
+            if (rva < static_cast<uintptr_t>(oe.begin_rva) + oe.size) {
+                const uint32_t newIdx = mapping[idx];
+                if (newIdx == kUnmatched || newIdx >= newTable.size()) return 0;
+                const PdataSig& ne = newTable[newIdx];
+                const uintptr_t offset = rva - oe.begin_rva;
+                if (offset == 0) return ne.begin_rva;
+                if (ne.size == oe.size) return ne.begin_rva + static_cast<uint32_t>(offset);
+                return 0;
+            }
+            if (idx == 0 || scanned >= 64) break;
+            --idx;
+            ++scanned;
+        }
+    }
+    const auto lit = leafMap.find(rva);
+    return lit != leafMap.end() ? lit->second : 0;
+}
+
+// vtable 跨版本定位：矫正槽函数（pdata 或叶子）后，在 new 的 .rdata 段里搜
+// 「槽函数绝对地址的指针序列」（vtable 里存的就是槽函数地址指针）。
+// 优先级：单个 pdata 槽函数 → 连续 pdata 槽函数组合 → 单个叶子槽函数 → 连续叶子组合。
+// 命中唯一则 vtable 新地址 = 命中位置 - 序列首槽 offset。
+std::unordered_map<uint32_t, uint32_t> BuildVtableMap(
+    const std::vector<VtableInfo>& vtables,
+    const std::vector<PdataSig>& oldTable,
+    const std::vector<uint32_t>& mapping,
+    const std::vector<PdataSig>& newTable,
+    const std::unordered_map<uint32_t, uint32_t>& leafMap,
+    const uint8_t* newBase,
+    uint32_t newImageSize) {
+    std::unordered_map<uint32_t, uint32_t> vtableMap;
+    if (!newBase || vtables.empty()) return vtableMap;
+
+    // 解析 new 映像的 .rdata 段范围
+    uintptr_t rdataVa = 0;
+    size_t rdataSize = 0;
+    {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(newBase);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(newBase + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                const auto* sec = IMAGE_FIRST_SECTION(nt);
+                for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+                    char name[9]{};
+                    std::memcpy(name, sec->Name, 8);
+                    if (std::strcmp(name, ".rdata") == 0) {
+                        rdataVa = sec->VirtualAddress;
+                        rdataSize = std::max<size_t>(sec->Misc.VirtualSize, sec->SizeOfRawData);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (rdataVa == 0 || rdataSize < 8) return vtableMap;
+    const uint8_t* rdataBegin = newBase + rdataVa;
+    const uint8_t* rdataEnd = rdataBegin + rdataSize;
+    const uint8_t* imgEnd = newBase + newImageSize;
+    if (rdataEnd > imgEnd) rdataEnd = imgEnd;
+
+    // 搜索辅助：在 .rdata 里搜一段 8 字节对齐的指针序列，唯一命中返回位置（否则 nullptr）
+    const auto searchPtrs = [&](const std::vector<uint64_t>& absList) -> const uint8_t* {
+        if (absList.empty()) return nullptr;
+        std::vector<uint8_t> pat(absList.size() * 8);
+        for (size_t i = 0; i < absList.size(); ++i) {
+            std::memcpy(pat.data() + i * 8, &absList[i], 8);
+        }
+        const uint8_t* hit = nullptr;
+        size_t count = 0;
+        for (const uint8_t* p = rdataBegin; p + pat.size() <= rdataEnd; p += 8) {
+            if (std::memcmp(p, pat.data(), pat.size()) == 0) {
+                if (count == 0) hit = p;
+                ++count;
+                if (count > 1) return nullptr;  // 多命中，放弃
+            }
+        }
+        return (count == 1) ? hit : nullptr;
+    };
+
+    size_t recovered = 0;
+    for (const VtableInfo& vt : vtables) {
+        // 矫正全部槽函数：收集 (offset, 绝对地址, 是否叶子)
+        struct SlotC { uint32_t offset; uint64_t abs; bool leaf; };
+        std::vector<SlotC> all;
+        all.reserve(vt.slots.size());
+        for (const VtableSlot& s : vt.slots) {
+            const uint32_t f = CorrectRvaLocal(s.slotOldRva, oldTable, mapping, newTable, leafMap);
+            if (f == 0) continue;
+            const bool leaf = leafMap.find(s.slotOldRva) != leafMap.end();
+            all.push_back(SlotC{ s.slotOffset,
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(newBase) + f), leaf });
+        }
+        if (all.empty()) continue;
+
+        // 分 pdata 与叶子（slot 按 offset 升序，sidecar 生成端保证）
+        std::vector<SlotC> pdataCs, leafCs;
+        for (const SlotC& c : all) (c.leaf ? leafCs : pdataCs).push_back(c);
+
+        const uint8_t* hit = nullptr;
+        uint32_t hitOffset = 0;
+
+        // 1) 单个 pdata 槽函数
+        for (const SlotC& c : pdataCs) {
+            const uint8_t* h = searchPtrs({ c.abs });
+            if (h) { hit = h; hitOffset = c.offset; break; }
+        }
+        // 2) 连续 pdata 槽函数组合（2 个起）
+        if (!hit && pdataCs.size() >= 2) {
+            for (size_t i = 0; i < pdataCs.size() && !hit; ++i) {
+                std::vector<uint64_t> seq;
+                seq.push_back(pdataCs[i].abs);
+                for (size_t j = i + 1; j < pdataCs.size(); ++j) {
+                    if (pdataCs[j].offset != pdataCs[j - 1].offset + 8) break;  // 必须连续
+                    seq.push_back(pdataCs[j].abs);
+                    const uint8_t* h = searchPtrs(seq);
+                    if (h) { hit = h; hitOffset = pdataCs[i].offset; break; }
+                }
+            }
+        }
+        // 3) 单个叶子槽函数
+        if (!hit) {
+            for (const SlotC& c : leafCs) {
+                const uint8_t* h = searchPtrs({ c.abs });
+                if (h) { hit = h; hitOffset = c.offset; break; }
+            }
+        }
+        // 4) 连续叶子槽函数组合（2 个起）
+        if (!hit && leafCs.size() >= 2) {
+            for (size_t i = 0; i < leafCs.size() && !hit; ++i) {
+                std::vector<uint64_t> seq;
+                seq.push_back(leafCs[i].abs);
+                for (size_t j = i + 1; j < leafCs.size(); ++j) {
+                    if (leafCs[j].offset != leafCs[j - 1].offset + 8) break;
+                    seq.push_back(leafCs[j].abs);
+                    const uint8_t* h = searchPtrs(seq);
+                    if (h) { hit = h; hitOffset = leafCs[i].offset; break; }
+                }
+            }
+        }
+
+        if (hit) {
+            const uintptr_t hitRva = static_cast<uintptr_t>(hit - newBase);
+            if (hitRva >= hitOffset) {
+                vtableMap.emplace(vt.old_rva, static_cast<uint32_t>(hitRva - hitOffset));
+                ++recovered;
+            }
+        }
+    }
+    if (recovered != 0) {
+        Logger::Log("PdataMatch: vtable recovery matched %zu", recovered);
+    }
+    return vtableMap;
+}
+
 // exe 目录下 Civ6DllLoader\pdata_cache.bin（目录不存在则创建）
 std::wstring CachePath() {
     wchar_t exePath[MAX_PATH]{};
@@ -822,6 +1089,8 @@ bool SaveCache(const std::wstring& path, uint64_t fingerprint, uint64_t oldFinge
 
 // 需持有 g_mutex 调用：在 old pdata 表二分查找包含 oldRva 的条目并矫正
 uintptr_t CorrectRvaLocked(uintptr_t oldRva) {
+    // 版本一致：跳过一切 pdata 匹配，直接恒等解析（gap 符号/vtable 的 RVA 也有效）
+    if (g_identical) return oldRva;
     if (!g_tableReady || g_oldPdata.empty() || g_newPdata.empty() ||
         g_map.size() != g_oldPdata.size()) {
         return 0;
@@ -834,7 +1103,11 @@ uintptr_t CorrectRvaLocked(uintptr_t oldRva) {
         if (g_oldPdata[mid].begin_rva <= oldRva) lo = mid + 1;
         else hi = mid;
     }
-    if (lo == 0) return 0;
+    if (lo == 0) {
+        // gap（第一个函数之前）：查叶子 AOB 匹配结果
+        const auto lit = g_leafMap.find(static_cast<uint32_t>(oldRva));
+        return lit != g_leafMap.end() ? lit->second : 0;
+    }
 
     // 从最内层候选向前回扫找包含 oldRva 的条目（嵌套深度通常 <= 3，封顶防退化）
     constexpr size_t kMaxBackscan = 64;
@@ -843,7 +1116,11 @@ uintptr_t CorrectRvaLocked(uintptr_t oldRva) {
     for (;;) {
         const PdataSig& oe = g_oldPdata[idx];
         if (oldRva < static_cast<uintptr_t>(oe.begin_rva) + oe.size) break;  // 包含
-        if (idx == 0 || scanned >= kMaxBackscan) return 0;                   // gap / 数据段
+        if (idx == 0 || scanned >= kMaxBackscan) {
+            // gap / 数据段：查叶子 AOB 匹配结果
+            const auto lit = g_leafMap.find(static_cast<uint32_t>(oldRva));
+            return lit != g_leafMap.end() ? lit->second : 0;
+        }
         --idx;
         ++scanned;
     }
@@ -872,6 +1149,8 @@ bool Init(HMODULE runtimeModule) {
         g_aobData.clear();
         g_aobByRva.clear();
         g_oldFingerprint = 0;
+        g_identical = false;
+        g_leafMap.clear();
         g_baseSizeOfImage = 0;
         g_loaded = false;
         g_newPdata.clear();
@@ -888,6 +1167,7 @@ bool Init(HMODULE runtimeModule) {
 bool BuildNewTable(HMODULE gameCore) {
     std::vector<PdataSig> oldTable;
     std::unordered_map<uint32_t, uint64_t> headHashByRva;
+    std::vector<VtableInfo> vtables;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_loaded || g_oldPdata.empty()) {
@@ -896,6 +1176,14 @@ bool BuildNewTable(HMODULE gameCore) {
         }
         oldTable = g_oldPdata;
         headHashByRva = g_headHashByRva;
+        for (const Symbol& sym : g_symbols) {
+            if (sym.kind == 1 && !sym.slots.empty()) {
+                VtableInfo vi;
+                vi.old_rva = sym.old_rva;
+                vi.slots = sym.slots;
+                vtables.push_back(std::move(vi));
+            }
+        }
     }
 
     std::vector<PdataSig> newTable;
@@ -953,6 +1241,17 @@ bool BuildNewTable(HMODULE gameCore) {
         }
     }
 
+    // 叶子函数 AOB 匹配 + vtable 槽位反推（仅跨版本；版本一致时恒等解析，无需匹配）
+    std::unordered_map<uint32_t, uint32_t> leafMap;
+    if (!identical) {
+        leafMap = BuildLeafMap(oldTable, mapping, newTable,
+            reinterpret_cast<const uint8_t*>(gameCore), imageSize);
+        // vtable 定位：矫正槽函数后在 .rdata 搜指针序列，结果并入 leafMap
+        const auto vtableMap = BuildVtableMap(vtables, oldTable, mapping, newTable, leafMap,
+            reinterpret_cast<const uint8_t*>(gameCore), imageSize);
+        for (const auto& kv : vtableMap) leafMap.emplace(kv.first, kv.second);
+    }
+
     size_t matched = 0;
     for (uint32_t v : mapping) if (v != kUnmatched) ++matched;
     if (matched == 0) {
@@ -965,7 +1264,9 @@ bool BuildNewTable(HMODULE gameCore) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_newPdata = std::move(newTable);
         g_map = std::move(mapping);
+        g_leafMap = std::move(leafMap);
         g_fingerprint = fingerprint;
+        g_identical = identical;
         g_tableReady = true;
     }
     Logger::Log("PdataMatch: table ready old=%zu new=%zu matched=%zu%s",
@@ -999,6 +1300,28 @@ uintptr_t CorrectByName(const char* name) {
 uint64_t Fingerprint() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_fingerprint;
+}
+
+bool CorrectVTableByName(const char* name, uint32_t& outRva, uint32_t& outSlotCount) {
+    if (!name || !*name) return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    size_t symIdx = SIZE_MAX;
+    const auto itD = g_byDemangled.find(name);
+    if (itD != g_byDemangled.end()) {
+        symIdx = itD->second;
+    } else {
+        const auto itM = g_byMangled.find(name);
+        if (itM != g_byMangled.end()) symIdx = itM->second;
+    }
+    if (symIdx == SIZE_MAX || symIdx >= g_symbols.size()) return false;
+    const Symbol& sym = g_symbols[symIdx];
+    if (sym.kind != 1 || sym.slots.empty()) return false;  // 非 vtable
+    // vtable RVA 矫正：版本一致恒等；跨版本查 g_leafMap（vtable 槽位结构匹配结果）
+    const uintptr_t corrected = CorrectRvaLocked(sym.old_rva);
+    if (corrected == 0) return false;
+    outRva = static_cast<uint32_t>(corrected);
+    outSlotCount = static_cast<uint32_t>(sym.slots.size());
+    return true;
 }
 
 }  // namespace PdataMatch

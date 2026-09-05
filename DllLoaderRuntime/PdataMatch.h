@@ -19,4 +19,8 @@ namespace PdataMatch {
 
     // 版本指纹（全表 (size,unwind_hash) 聚合 hash），供缓存键。
     uint64_t Fingerprint();
+
+    // 按 vtable 符号名（demangled/mangled）查矫正后的 vtable RVA 与槽位数。
+    // 返回 false = 符号不存在 / 非 vtable / 无法矫正。
+    bool CorrectVTableByName(const char* name, uint32_t& outRva, uint32_t& outSlotCount);
 }

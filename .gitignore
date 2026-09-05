@@ -52,6 +52,7 @@ third_party/*
 !third_party/asmjit_src/
 third_party/asmjit_src/*
 !third_party/asmjit_src/asmjit/
+!third_party/asmjit_src/asmjit/x86/
 
 # old sidecar（depot 版本，仅跨版本测试用，不纳入版本管理）
 tools/Civ6DllLoader.symdb.old.bin

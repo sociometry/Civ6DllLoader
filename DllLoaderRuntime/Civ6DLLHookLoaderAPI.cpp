@@ -683,6 +683,52 @@ bool RegisterGlobalCaptureImpl(HookImageId image, const char* providerFunction, 
     return true;
 }
 
+// 读 [vtable + index*8] 的槽函数指针。本函数无 C++ 对象（无展开要求），可用 SEH 兜底。
+static void* ReadVTableSlotSafe(void* vtable, uint32_t index) {
+    void* slotFunc = nullptr;
+    __try {
+        slotFunc = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(vtable) + static_cast<uintptr_t>(index) * 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+    return slotFunc;
+}
+
+// ---------------- ResolveByVTable（按 vtable 符号 + 槽序号解析虚函数） ----------------
+void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbol, uint32_t index) {
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (!vtableSymbol || !*vtableSymbol) {
+        Logger::Log("ResolveByVTable rejected: empty vtable symbol");
+        return nullptr;
+    }
+    uint32_t vtableRva = 0;
+    uint32_t slotCount = 0;
+    if (!PdataMatch::CorrectVTableByName(vtableSymbol, vtableRva, slotCount)) {
+        Logger::Log("ResolveByVTable: no vtable for symbol=%s (not found / not vtable / not corrected)",
+            vtableSymbol);
+        return nullptr;
+    }
+    if (index >= slotCount) {
+        Logger::Log("ResolveByVTable: index %u out of range for vtable=%s (slotCount=%u)",
+            static_cast<unsigned>(index), vtableSymbol, static_cast<unsigned>(slotCount));
+        return nullptr;
+    }
+    void* vtable = ImageAddress::ResolveByRva(image, vtableRva, 1);
+    if (!vtable) {
+        Logger::Log("ResolveByVTable: vtable address resolve failed symbol=%s rva=0x%X",
+            vtableSymbol, static_cast<unsigned>(vtableRva));
+        return nullptr;
+    }
+    // 读 [vtable + index*8] 的槽函数指针（SEH 兜底防坏地址）
+    void* slotFunc = ReadVTableSlotSafe(vtable, index);
+    if (!slotFunc) {
+        Logger::Log("ResolveByVTable: slot read fault vtable=%s index=%u",
+            vtableSymbol, static_cast<unsigned>(index));
+    }
+    return slotFunc;
+}
+
 // ---------------- capture 站点生命周期清理 ----------------
 // 两个失效场景：
 //  1) GameCore 重载：providerFunction 位于旧 GameCore 映像内，重载后地址失效，必须
@@ -2005,6 +2051,7 @@ static HookAPI g_hookApi = {
     &ResolveByRvaExImpl,
     &ResolveByPatternImpl,
     &RegisterGlobalCaptureImpl,
+    &ResolveByVTableImpl,
 };
 
 typedef void (*OnLoadFunc)(HookAPI*);
