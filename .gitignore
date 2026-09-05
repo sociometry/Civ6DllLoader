@@ -57,3 +57,6 @@ third_party/asmjit_src/*
 # old sidecar（depot 版本，仅跨版本测试用，不纳入版本管理）
 tools/Civ6DllLoader.symdb.old.bin
 tools/Civ6DllLoader.symdb.old.json
+
+# Rust 工具编译产物
+tools/rva_to_symbol/target/
