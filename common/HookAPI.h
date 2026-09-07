@@ -17,6 +17,125 @@
 #endif
 
 #ifdef __cplusplus
+
+// ---- GameEvent 参数容器（IScriptSystemArgs1）vtable 包装 ----
+// 槽位布局 = 引擎 ms_pkScriptSystemArgs_vtbl（18 槽，exe IDA @0x140FC0588 逐槽反编译验证）。
+// 本类是"指针直通"包装：ScriptSystemArgs* 直接就是引擎 args 对象指针（单指针
+// 布局，static_assert 锁死），成员函数按槽位调用其 vtable。
+// 用法：RegisterGameEvent 注册的 pushArgsFn 回调第一个参数即本类型：
+//
+//   void MyPushArgs(ScriptSystemArgs* args, const void* payload) {
+//       args->PushInt(42);
+//       args->PushString("hello", 5);
+//   }
+//
+// 生命周期：args 仅在回调执行期间存活（runtime 侧 CreateArgs/DestroyArgs 管理），
+// 不要在回调外缓存。回调整体在 runtime 的 SEH 保护内执行。
+class ScriptSystemArgs {
+public:
+    // ---- Push：追加参数（返回新参数的索引）----
+    // 以下 5 槽调用约定经 exe IDA 反编译逐槽验证（Push_int(this, uint)、
+    // Push_String(this, const void*, size_t) 等），也是引擎官方桥接 lambda
+    // （CityBuilt 等）使用的全部参数形态。
+    uint64_t PushFloat(float value)     { return call<uint64_t, 4>(value); }
+    uint64_t PushInt(int value)         { return call<uint64_t, 5>(value); }
+    uint64_t PushString(const char* s, uint64_t len) { return call<uint64_t, 6>(s, len); }
+    uint64_t PushBool(bool value)       { return call<uint64_t, 7>(value); }
+    uint64_t PushNull()                 { return call<uint64_t, 8>(); }
+    // ---- Push：table 参数（引擎 Data::TypedVariantMap，官方 Events.Combat 同机制）----
+    // 表对象经 GameEventTable 构造填充（见下）；引擎解包时该参数成为 Lua table。
+    // PushTable 调 args vtable 槽2（Push_ContainerRvalue）——引擎按右值/移动语义接管
+    // 表所有权（与 SetVariant 槽21 按值拷贝条目一致）；PushTable 后表析构变 no-op，
+    // 禁止继续使用该表（尤其禁止再 SetXxx / 再次 PushTable）。
+    // 约束：表对象须存活到 PushTable 调用结束（回调内栈对象天然满足）。
+    uint64_t PushTable(const class GameEventTable& table);
+    // 刻意不暴露的槽位（同样经反编译确认，见 docs）：
+    //  - 槽[3] Push_UserData：把裸 8 字节指针塞进 Lua（userdata）——Lua 侧可长期持有，
+    //    C++ 对象生存期无法约束，悬空即崩，不开放。
+    //  - 槽[1] Push_Container(ConstRef)：借用语义，不开放。槽[2] Push_Container(Rvalue)
+    //    由 PushTable 使用：参数是引擎 Data::TypedVariantMap 真对象指针（经 GameEventTable
+    //    构造装真 vtable，非插件伪造的接口对象）。Lua 侧需要结构化数据时用 PushTable
+    //    或 JSON 字符串自行约定。
+
+    // ---- Get：按索引查询已 Push 的参数（索引从 0 起）----
+    // 真实签名（exe IDA 反编译逐槽验证）：(this, index, T* out) → bool（成功标志），
+    // 值写入 out；索引越界或类型不匹配返回 false 且不写 out。
+    // GetType 返回引擎类型码（0=无效 1=bool 2=int 3=float? 4=int 5=string 6=user 7=table，
+    // 精确含义见引擎 VariantType 枚举），Count 返回已 Push 参数个数。
+    uint64_t    Count() const                        { return call<uint64_t, 9>(); }
+    int         GetType(uint32_t index) const        { return call<int, 10>(index); }
+    bool        GetBool(uint32_t index, bool* out) const          { return call<bool, 11>(index, out); }
+    bool        GetInt(uint32_t index, int32_t* out) const        { return call<bool, 12>(index, out); }
+    bool        GetFloat(uint32_t index, float* out) const        { return call<bool, 13>(index, out); }
+    bool        GetString(uint32_t index, const char** out) const { return call<bool, 14>(index, out); }
+    void*       GetParent() const                                { return call<void*, 17>(); }
+    // 槽[15] GetTable / [16] GetUser 不暴露：容器与 userdata 是刻意不开放的
+    // 参数形态（见 Push 段注释），对应的读回通道一并收口。
+
+    // 裸指针（本类即指针直通包装，raw() 仅在需要喂给 void* 形参的引擎 API 时用）。
+    void* raw() const { return reinterpret_cast<void*>(const_cast<ScriptSystemArgs*>(this)); }
+
+private:
+    // 槽 [0] 为析构相关（不暴露：args 生命周期由 runtime 的 DestroyArgs 管理）。
+    template <typename Ret, size_t Slot, typename... A>
+    Ret call(A... args) const {
+        using Fn = Ret(__fastcall*)(const ScriptSystemArgs*, A...);
+        const void* const* vt = *reinterpret_cast<const void* const* const*>(this);
+        return reinterpret_cast<Fn>(vt[Slot])(this, args...);
+    }
+};
+// 指针直通说明：本类无数据成员，ScriptSystemArgs* 的值即引擎 IScriptSystemArgs1
+// 对象指针（call() 以 this 调用其 vtable 槽位）。sizeof 无意义（空类恒为 1），
+// 禁止按值传递或存储本类——只用指针。
+
+// ---- GameEvent table 参数（Data::TypedVariantMap 包装）----
+// 引擎官方 Events.Combat 的 combatResult 同机制：88 字节堆对象 + 引擎真 vtable。
+// 构造/析构经 HookAPI 新增的 AllocTypedVariantMap/FreeTypedVariantMap；键哈希用
+// api->MakeHash("字段名")；SetXxx 全部虚槽直调（零额外 API 表面积）。
+// 用法（pushArgsFn 回调内）：
+//   GameEventTable t(api);                    // api = OnLoad 收到的 HookAPI*
+//   t.SetInt   (api->MakeHash("playerId"), 42);
+//   t.SetString(api->MakeHash("name"), "Caesar");
+//   GameEventTable child(api);
+//   child.SetUInt(api->MakeHash("hp"), 100);
+//   t.SetChild (api->MakeHash("units"), child);   // 嵌套子表
+//   args->PushTable(t);                        // 所有权移交引擎（t 析构变 no-op）
+typedef struct HookAPI HookAPI;  // 前向声明（完整定义见下方 C 区）
+class GameEventTable {
+public:
+    explicit GameEventTable(const HookAPI* api);   // AllocTypedVariantMap：分配 88 字节并调引擎构造
+    ~GameEventTable();                             // 未 Push 过才 FreeTypedVariantMap；已 Push 则 no-op
+    GameEventTable(const GameEventTable&) = delete;
+    GameEventTable& operator=(const GameEventTable&) = delete;
+    GameEventTable(GameEventTable&& other) noexcept;       // 移动：转移 m_map/m_pushed/m_api，源置空
+    GameEventTable& operator=(GameEventTable&& other) noexcept;
+
+    bool   valid() const { return m_map != nullptr; }
+    void*  raw() const { return m_map; }
+    // 键 = api->MakeHash("字段名")。全部经引擎 vtable 虚槽（构造时装的真表）。
+    void SetInt   (uint32_t key, int32_t value);
+    void SetUInt  (uint32_t key, uint32_t value);
+    void SetFloat (uint32_t key, float value);
+    void SetBool  (uint32_t key, bool value);
+    void SetString(uint32_t key, const char* value);          // 空指针/空串 → 不写键（Lua 侧为 nil）
+    void SetChild (uint32_t key, const GameEventTable& child); // child 保持独立（引擎按值拷贝条目）
+    void Remove   (uint32_t key);
+
+    // 内部：PushTable 调用后置位（引擎接管生存期，析构变 no-op）
+    void markPushed() { m_pushed = true; }
+private:
+    // 引擎 vtable 虚槽直调（模式同 ScriptSystemArgs::call，this 为 m_map）
+    template <typename Ret, size_t Slot, typename... A>
+    Ret vtCall(A... args) const {
+        using Fn = Ret(__fastcall*)(void*, A...);
+        const void* const* vt = *reinterpret_cast<const void* const* const*>(m_map);
+        return reinterpret_cast<Fn>(vt[Slot])(m_map, args...);
+    }
+    void* m_map = nullptr;
+    mutable bool m_pushed = false;   // mutable：PushTable 以 const 引用置位（免 friend）
+    const HookAPI* m_api = nullptr;  // 仅析构/移动需要（Set 全走虚槽）
+};
+
 extern "C" {
 #endif
 
@@ -29,6 +148,10 @@ typedef struct LuaMethodInfo {
 } LuaMethodInfo;
 
 typedef void (*MessageHandlerFn)(const char* topic, const void* data, size_t len);
+// GameEvents 参数打包回调：把 payload 解析成 Lua 参数塞进 args。
+// args 即 ScriptSystemArgs（见上方类定义），直接调 Push* 成员。
+// payload 仅回调执行期间有效；广播路径为 nullptr。
+typedef void (*GameEventPushArgsFn)(ScriptSystemArgs* args, const void* payload);
 typedef void (*ScriptGlobalsFn)(void* L);
 
 // GameCore 生命周期回调（Global 插件延迟挂钩的标准姿势）。
@@ -189,6 +312,25 @@ typedef struct HookAPI {
     // 定位 vtable 地址（版本一致恒等，跨版本走槽位结构匹配），读 [vtable + index*8] 的
     // 槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。
     void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
+
+    // GameEvents：注册/触发（GameCore XP2 信号桥接）。name 为 GameEvent 名（如 "MyCustomEvent"）。
+    // RegisterGameEvent：注册事件，把 name 挂到游戏已有的 PlayerTurnStartComplete 信号上。
+    //   pushArgsFn 可为 null = 无参事件；非 null 时在每次触发（广播或手动）被调：
+    //   pushArgsFn(args, payload) —— args 用 ScriptSystemArgs 包装后 Push 参数（见 C++ 区）。
+    //   广播（PlayerTurnStartComplete 每玩家每回合——多人局每游戏回合广播 N 次）时 payload 为 nullptr。
+    //   返回 false = 注册失败（未就绪/无空槽/队列满等）。
+    bool (*RegisterGameEvent)(const char* name, GameEventPushArgsFn pushArgsFn);
+    // TriggerGameEvent：手动触发一次（必须先注册——回查注册记录拿 pushArgsFn，未注册返回 false），
+    //   payload 传给注册时的 pushArgsFn（payload 仅在本调用期间有效，同步使用）。
+    //   必须在游戏线程调用——Lua 状态非线程安全。
+    bool (*TriggerGameEvent)(const char* name, const void* payload);
+
+    // GameEvent table 参数支持（Data::TypedVariantMap 生命周期管理；SetXxx 在头文件类内联）。
+    // Alloc：分配 88 字节并调引擎构造（返回引擎对象指针；失败 nullptr——GameCore 未就绪等）。
+    // Free：调引擎 scalar deleting destructor 并释放（传 engineObj 指针；仅对未 Push 的表调用，
+    //        PushTable 后所有权归引擎，禁止 Free）。
+    void* (*AllocTypedVariantMap)(void);
+    void  (*FreeTypedVariantMap)(void* engineObj);
 } HookAPI;
 
 // True if this runtime can serve a plugin built against the current header.
@@ -240,6 +382,102 @@ T ResolveByPattern(HookAPI* api, HookImageId image, const char* pattern, HookIma
 template <typename T>
 T ResolveByVTable(HookAPI* api, HookImageId image, const char* vtableSymbol, uint32_t index) {
     return reinterpret_cast<T>(api->ResolveByVTable(image, vtableSymbol, index));
+}
+
+// ---- GameEventTable 实现 / ScriptSystemArgs::PushTable（此处 HookAPI 已完整定义）----
+
+// vtable 槽位（rva_map vtable_xrefs 双向验证：槽号×8 = vtable 偏移）：
+//   槽21 (+0xA8) SetVariant(uint, TypedVariantMap*)   嵌套子表
+//   槽33 (+0x108) SetVariant(uint, const char*)       字符串
+//   槽36 (+0x120) SetVariant(uint, float)
+//   槽37 (+0x128) SetVariant(uint, uint)
+//   槽38 (+0x130) SetVariant(uint, int)
+//   槽39 (+0x138) SetVariant(uint, bool)
+//   槽40 (+0x140) RemoveVariant(uint)
+enum GameEventTableVtSlot : uint32_t {
+    kGameEventTableVtSetChild  = 21,
+    kGameEventTableVtSetString = 33,
+    kGameEventTableVtSetFloat  = 36,
+    kGameEventTableVtSetUInt   = 37,
+    kGameEventTableVtSetInt    = 38,
+    kGameEventTableVtSetBool   = 39,
+    kGameEventTableVtRemove    = 40
+};
+
+inline GameEventTable::GameEventTable(const HookAPI* api)
+    : m_map(api ? api->AllocTypedVariantMap() : nullptr), m_api(api) {}
+
+inline GameEventTable::~GameEventTable() {
+    // 已 Push（所有权移交引擎）或从未分配：no-op。未 Push：FreeTypedVariantMap 析构+释放。
+    if (m_map && !m_pushed && m_api) {
+        m_api->FreeTypedVariantMap(m_map);
+    }
+    m_map = nullptr;
+}
+
+inline GameEventTable::GameEventTable(GameEventTable&& other) noexcept
+    : m_map(other.m_map), m_pushed(other.m_pushed), m_api(other.m_api) {
+    other.m_map = nullptr;
+    other.m_pushed = false;
+    other.m_api = nullptr;
+}
+
+inline GameEventTable& GameEventTable::operator=(GameEventTable&& other) noexcept {
+    if (this != &other) {
+        if (m_map && !m_pushed && m_api) m_api->FreeTypedVariantMap(m_map);
+        m_map = other.m_map;
+        m_pushed = other.m_pushed;
+        m_api = other.m_api;
+        other.m_map = nullptr;
+        other.m_pushed = false;
+        other.m_api = nullptr;
+    }
+    return *this;
+}
+
+inline void GameEventTable::SetInt(uint32_t key, int32_t value) {
+    if (m_map) vtCall<void*, kGameEventTableVtSetInt>(key, value);
+}
+
+inline void GameEventTable::SetUInt(uint32_t key, uint32_t value) {
+    if (m_map) vtCall<void*, kGameEventTableVtSetUInt>(key, value);
+}
+
+inline void GameEventTable::SetFloat(uint32_t key, float value) {
+    if (m_map) vtCall<void*, kGameEventTableVtSetFloat>(key, value);
+}
+
+inline void GameEventTable::SetBool(uint32_t key, bool value) {
+    if (m_map) vtCall<void*, kGameEventTableVtSetBool>(key, value);
+}
+
+inline void GameEventTable::SetString(uint32_t key, const char* value) {
+    if (!m_map) return;
+    // 空指针/空串：不写键（Lua 侧读 nil），避免制造空串条目
+    if (!value || !*value) return;
+    vtCall<void*, kGameEventTableVtSetString>(key, value);
+}
+
+inline void GameEventTable::SetChild(uint32_t key, const GameEventTable& child) {
+    if (!m_map || !child.valid()) return;
+    vtCall<void*, kGameEventTableVtSetChild>(key, child.raw());
+}
+
+inline void GameEventTable::Remove(uint32_t key) {
+    if (m_map) vtCall<void*, kGameEventTableVtRemove>(key);
+}
+
+inline uint64_t ScriptSystemArgs::PushTable(const GameEventTable& table) {
+    if (!table.valid()) return 0;
+    // args vtable 槽2 = Push_ContainerRvalue：引擎按右值/移动语义接管表对象
+    //（与 SetVariant 槽21 按值拷贝条目一致；官方 Combat 链路同机制）。槽2 之后表
+    // 所有权视为已移交：markPushed 使析构 no-op（若引擎实际为借用语义，表由引擎
+    // 生命周期管理，同样安全——两种情况都要求 PushTable 后不再使用该表）。
+    using Fn = uint64_t(__fastcall*)(const ScriptSystemArgs*, void*);
+    const void* const* vt = *reinterpret_cast<const void* const* const*>(this);
+    const uint64_t idx = reinterpret_cast<Fn>(vt[2])(this, table.raw());
+    const_cast<GameEventTable&>(table).markPushed();
+    return idx;
 }
 #endif
 
