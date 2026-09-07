@@ -150,7 +150,7 @@ typedef struct LuaMethodInfo {
 typedef void (*MessageHandlerFn)(const char* topic, const void* data, size_t len);
 // GameEvents 参数打包回调：把 payload 解析成 Lua 参数塞进 args。
 // args 即 ScriptSystemArgs（见上方类定义），直接调 Push* 成员。
-// payload 仅回调执行期间有效；广播路径为 nullptr。
+// payload 由 TriggerGameEvent 传入、pushArgsFn 同步解析，仅调用期间有效；为 null = 无参触发。
 typedef void (*GameEventPushArgsFn)(ScriptSystemArgs* args, const void* payload);
 typedef void (*ScriptGlobalsFn)(void* L);
 
@@ -313,15 +313,14 @@ typedef struct HookAPI {
     // 槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。
     void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
 
-    // GameEvents：注册/触发（GameCore XP2 信号桥接）。name 为 GameEvent 名（如 "MyCustomEvent"）。
-    // RegisterGameEvent：注册事件，把 name 挂到游戏已有的 PlayerTurnStartComplete 信号上。
-    //   pushArgsFn 可为 null = 无参事件；非 null 时在每次触发（广播或手动）被调：
+    // GameEvents：纯登记 + 插件端手动触发。name 为 GameEvent 名（如 "MyCustomEvent"）。
+    // RegisterGameEvent：只登记名字与参数打包回调（owner 生命周期保留），不挂任何信号环、无自动广播。
+    //   pushArgsFn 可为 null = 无参事件；非 null 时在每次 TriggerGameEvent 触发时被调：
     //   pushArgsFn(args, payload) —— args 用 ScriptSystemArgs 包装后 Push 参数（见 C++ 区）。
-    //   广播（PlayerTurnStartComplete 每玩家每回合——多人局每游戏回合广播 N 次）时 payload 为 nullptr。
-    //   返回 false = 注册失败（未就绪/无空槽/队列满等）。
+    //   返回 false = 注册失败（未就绪/无空槽等）。同名重复注册幂等返回 true。
     bool (*RegisterGameEvent)(const char* name, GameEventPushArgsFn pushArgsFn);
     // TriggerGameEvent：手动触发一次（必须先注册——回查注册记录拿 pushArgsFn，未注册返回 false），
-    //   payload 传给注册时的 pushArgsFn（payload 仅在本调用期间有效，同步使用）。
+    //   payload 传给注册时的 pushArgsFn（payload 同步解析，仅在本调用期间有效；pushArgsFn 为 null = 无参触发）。
     //   必须在游戏线程调用——Lua 状态非线程安全。
     bool (*TriggerGameEvent)(const char* name, const void* payload);
 

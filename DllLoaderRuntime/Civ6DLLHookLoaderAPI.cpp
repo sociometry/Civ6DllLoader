@@ -827,50 +827,21 @@ static void CleanupCaptureSitesForOwner(const std::wstring& owner) {
 }
 
 // ================= GameEvents 桥接（RegisterGameEvent / TriggerGameEvent） =================
-// 机制（已逆向，见 docs/GameEvents_链路.md；本文件内地址为 ida-34472 验证值）：
-//  - GameEvents = ProtoSignal 信号系统 + CallHook 桥到 Lua（不是 Events 库那套）。
-//  - 信号容器 = *(ms_pkCurrentGame + 0x280)；PlayerTurnStartComplete 信号对象在容器 +0x9D8，
-//    其 SignalLink 环头指针存于信号对象 +0x8（即容器 +0x9E0）。
-//  - 订阅 = 信号->EnsureRing()（0x1666d0660，幂等：环已存在则直接返回）+
-//           SignalLink::AddBefore(std::function const&)（0x1662d08e0）。这两个模板函数
-//           经 ICF 合并为所有信号共用的一份代码；symdb 里有各自的 mangled 实例，
-//           ResolveByName 即可解析（版本矫正由 PdataMatch 完成）。
-//  - 触发 = 信号->Dispatch(args...)：遍历环，对每个节点调 _Func_impl vftable[2]
-//           （_Do_call），参数以指针形式传入（(this, &arg1, &arg2)）。
-//  - std::function（MSVC x64 SBO，64 字节）布局（GameSignals::Subscribe @0x1666596aa、
-//    AddBefore @0x1662d08e0 验证）：
-//      +0x00 _Func_impl vftable
-//      +0x08 lambda 捕获数据（本实现 = 事件名指针）
-//      +0x10..+0x37 未使用（0）
-//      +0x38 _Functor（SBO 时为指向函数对象自身的指针；AddBefore 读它做函数复制）
-//  - 官方 _Func_impl vtable（0x166ac38a0）槽位：[0]=_Copy [1]=_Copy(双槽)
-//    [2]=_Do_call [3]=_Target_type [4]=_Delete_this [5]=_Get。
-//    本实现用自定义 vtable 模仿该结构：_Copy 供 AddBefore 复制函数到环节点（node+0x10），
-//    _Do_call 供 Dispatch 触发（调 CallHook 通知 Lua），其余槽位安全 stub。
-bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn);  // 前向声明：GameEventFlushPending 调用
+// GameEvents = 纯登记 + 插件端手动触发（不再挂游戏信号环，无每回合自动广播）：
+//  - 登记：RegisterGameEvent(name, pushArgsFn)——只在注册表记下名字与参数打包回调（owner 生命周期保留）。
+//  - 触发：TriggerGameEvent(name, payload)——插件主动触发 → GameEventInvoke → CallHook 桥到 Lua。
+//  - 播放：CallHook（GameCore::Lua::Utility::CallHook）+ scriptSystem 的 CreateArgs/DestroyArgs
+//        每次实时解析（见 GetGameEventScriptSystem / GameEventResolve），跨 GameCore 代安全。
+//  - pushArgsFn 同步解析 payload（仅调用期间有效），为 null = 无参事件。
 
 namespace {
 
 using GameEventCallHookFn = bool(__fastcall*)(void* scriptSystem, const char* name,
                                               void* args, bool* flag);
-using GameEventEnsureRingFn = void(__fastcall*)(void* signal);
-using GameEventAddBeforeFn = uint64_t(__fastcall*)(void* link, const void* fn);
 
-// 三件套：CallHook 用 demangled（symdb 唯一、已验证）；EnsureRing/AddBefore 维持
-// mangled（symdb 去重后重载组的 demangled 只映射第一个重载，模板实例有歧义），
-// demangled 全名见各常量注释。
+// CallHook：demangled（symdb 唯一、已验证）。
 static const char kGameEventCallHookSymbol[] =
     "GameCore::Lua::Utility::CallHook";
-static const char kGameEventEnsureRingSymbol[] =
-    "?EnsureRing@?$ProtoSignal@$$A6AXPEAVInstance@Player@GameCore@@0W4WarTypes@3@_N@ZU?$CollectorDefault@X@SignalBase@Message@3@@SignalBase@Message@GameCore@@AEAAXXZ";
-    // = GameCore::Message::SignalBase::ProtoSignal<void (GameCore::Player::Instance*,
-    //   GameCore::Player::Instance*, GameCore::WarTypes, bool),
-    //   GameCore::Message::SignalBase::CollectorDefault<void>>::EnsureRing(void)
-static const char kGameEventAddBeforeSymbol[] =
-    "?AddBefore@SignalLink@?$ProtoSignal@$$A6AXW4DistrictTypes@GameCore@@I@ZU?$CollectorDefault@X@SignalBase@Message@2@@SignalBase@Message@GameCore@@QEAA_KAEBV?$function@$$A6AXW4DistrictTypes@GameCore@@I@Z@std@@@Z";
-    // = bool GameCore::Message::SignalBase::ProtoSignal<void (GameCore::DistrictTypes,
-    //   unsigned int), GameCore::Message::SignalBase::CollectorDefault<void>>::SignalLink::
-    //   AddBefore(std::function<void (GameCore::DistrictTypes, unsigned int)> const&)
 
 // ---- GameEvent table 参数（Data::TypedVariantMap）符号 ----
 // mangled 直用（symdb 去重后重载组的 demangled 只映射第一个重载，SetVariant 的
@@ -902,22 +873,19 @@ static const char kGameEventTableSetChildSymbol[] =
     "?SetVariant@TypedVariantMap@Data@@UEAAPEAVTypedVariant@2@IPEAV12@@Z";
     // = SetVariant(uint, TypedVariantMap*)
 
-// ---- GameEvent 引擎 ABI 常量（ida-22912 当前版 / ida-29644 旧版双版本验证；docs/GameEvents_链路.md）----
-constexpr size_t   kGameEventSignalsOffset     = 0x280; // ms_pkCurrentGame → Game::Signals 信号容器
-constexpr size_t   kGameEventTurnSignalOffset  = 0x9D8; // 容器 → PlayerTurnStartComplete 信号（每玩家每回合触发）
-constexpr size_t   kGameEventScriptSystemDelta = 0x20;  // ms_pkCurrentGame → ms_pkScriptSystem 全局槽间距
-constexpr size_t   kGameEventRingHeadOffset    = 0x8;   // 信号对象 → SignalLink 环头指针
-constexpr size_t   kGameEventFnNameOffset      = 0x8;   // std::function 拷贝区 → namePtr
-constexpr size_t   kGameEventFnPushArgsOffset  = 0x10;  // 拷贝区 → pushArgsFn
-constexpr size_t   kGameEventFnSelfOffset      = 0x38;  // SBO 自指指针
+// ---- GameEvent 引擎 ABI 常量 ----
+// ms_pkCurrentGame → ms_pkScriptSystem 全局槽间距（当前版 0x14bfbaa88 vs
+// 0x14bfbaa68、旧版 0x180b88a88 vs 0x180b88a68，间距恒 0x20，双版本验证）。
+constexpr size_t   kGameEventScriptSystemDelta = 0x20;
 constexpr uint32_t kScriptSystemVtCreateArgs   = 8;     // IScriptSystem1 vtable 槽
 constexpr uint32_t kScriptSystemVtDestroyArgs  = 9;
-constexpr size_t   kGameEventNameMax           = 96;    // 事件名副本容量（注册表与 pending 共用）
+constexpr size_t   kGameEventNameMax           = 96;    // 事件名副本容量（注册表）
 // 注：IScriptSystemArgs1 的 18 槽 vtable（Push/Get 族）已封装为公共头文件类
 // ScriptSystemArgs（common/HookAPI.h），插件在 pushArgsFn 回调内直调，不经 API 表。
 
 // ms_pkCurrentGame 定位 pattern（GameSignals::Subscribe 开头 mov rdi, cs:ms_pkCurrentGame
-// 序列；读命中+3 的 disp32，目标槽 = 命中+7+disp32）。
+// 序列；读命中+3 的 disp32，目标槽 = 命中+7+disp32）。GetCurrentGameSlot 用它解析
+// ms_pkCurrentGame 槽，GetGameEventScriptSystem 主方案读相邻槽取得 scriptSystem。
 constexpr char kGameEventCurrentGamePattern[] =
     "48 8B 3D ?? ?? ?? ?? 48 85 FF 0F 84 ?? ?? ?? ?? 48 8B BF 80 02 00 00";
 // ms_pkScriptSystem 兜底定位 pattern（独立于 ms_pkCurrentGame；两版本各命中 5 处且
@@ -928,8 +896,6 @@ constexpr char kGameEventScriptSystemPattern[] =
 // 一次性解析并缓存 GameCore 侧函数指针；重载后旧指针失效，Contains 校验失败即重解。
 struct GameEventSymbols {
     void* callHook = nullptr;
-    void* ensureRing = nullptr;
-    void* addBefore = nullptr;
 };
 static GameEventSymbols g_gameEventSymbols;
 
@@ -951,15 +917,11 @@ static void* g_gameEventContainerHit = nullptr;
 
 constexpr int kMaxRegisteredGameEvents = 32;
 
-// 每个注册的 GameEvent 一条记录：名字副本 + 64 字节 std::function(SBO) 对象。
+// 每个注册的 GameEvent 一条记录：名字 + owner + 参数打包回调。槽位判空用 name[0]。
 struct RegisteredGameEvent {
-    void* vftable = nullptr;              // +0x00 _Func_impl vftable
-    const char* namePtr = nullptr;        // +0x08 lambda 捕获 = 事件名指针
-    GameEventPushArgsFn pushArgsFn = nullptr;  // +0x10 参数打包回调（插件提供，可为空）
-    uint8_t pad[0x20] = {};               // +0x18..+0x37 未使用
-    void* self = nullptr;                 // +0x38 _Functor 自指（恒 = this）
+    GameEventPushArgsFn pushArgsFn = nullptr;  // 参数打包回调（插件提供，可为 null = 无参事件）
     std::wstring ownerId;                 // 注册者插件 owner（卸载/隔离按 owner 清理）
-    char name[kGameEventNameMax] = {};    // 名字副本（对象末尾，长期存活）
+    char name[kGameEventNameMax] = {};    // 名字副本（对象末尾，长期存活；name[0]==0 即空槽）
 };
 static RegisteredGameEvent g_gameEvents[kMaxRegisteredGameEvents];
 
@@ -991,8 +953,7 @@ using GameEventCreateArgsFn = void*(__fastcall*)(void* scriptSystem);
 using GameEventDestroyArgsFn = void(__fastcall*)(void* scriptSystem, void* args);
 
 // 按名解析并缓存（版本矫正后的当前映像地址）；失败打日志并返回 nullptr。
-// 线程假设：所有调用点都在游戏线程——CallHook detour（游戏线程触发）与 Trigger
-// （文档要求游戏线程调用），因此缓存读写无需额外加锁。
+// 线程假设：调用点（Trigger / Register）都在游戏线程（文档要求），缓存读写无需加锁。
 template <typename T>
 static T GameEventResolve(void** cache, const char* symbol, const char* what) {
     if (*cache && ImageAddress::Contains(kHookImageGameCoreXP2, *cache)) {
@@ -1017,20 +978,6 @@ static void* GetCurrentGameSlot() {
         static_cast<const char*>(g_gameEventContainerHit) + 3);
     if (disp == 0) return nullptr;
     return static_cast<char*>(g_gameEventContainerHit) + 7 + disp;
-}
-
-// 信号容器 = *(ms_pkCurrentGame + 0x280)。ms_pkCurrentGame 是 GameCore .data 全局（不在
-// symdb），用 kGameEventCurrentGamePattern 定位它的 rip-relative 引用（GameSignals::
-// Subscribe 开头 "mov rdi, cs:ms_pkCurrentGame → test rdi,rdi → jz → mov rdi,[rdi+280h]"，
-// IDA find_bytes 验证当前二进制唯一命中 @0x16665950f）。读 disp32 算 .data 槽地址，
-// 再两级解引用取容器。选它而非 RegisterGlobalCapture(Dispatch) 方案：不依赖任何单位
-// 创建时机，GameCore attach 后任意时刻（含 Ready 回调）即可用。
-static void* GetGameEventContainer() {
-    void* currentGameSlot = GetCurrentGameSlot();
-    if (!currentGameSlot) return nullptr;
-    void* currentGame = GameEventReadPtrSafe(currentGameSlot, 0);
-    if (!currentGame) return nullptr;
-    return GameEventReadPtrSafe(currentGame, kGameEventSignalsOffset);
 }
 
 // scriptSystem（IScriptSystem1*）实时解析（不缓存——每次读，天然跨 GameCore 代安全）：
@@ -1098,312 +1045,37 @@ static bool GameEventInvoke(const char* name, GameEventPushArgsFn pushArgsFn,
     return ok;
 }
 
-// EnsureRing（幂等）+ AddBefore 一步完成订阅；GameCore teardown 竞态由 SEH 兜底。
-// AddBefore 返回 0 = 失败（调用方已有失败回滚/重排队路径）。
-static bool GameEventAttach(GameEventEnsureRingFn ensureRing, GameEventAddBeforeFn addBefore,
-                            void* signal, const void* fnObj) {
-    __try {
-        ensureRing(signal);
-        void* head = *reinterpret_cast<void* const*>(
-            static_cast<const char*>(signal) + kGameEventRingHeadOffset);
-        if (!head) return false;
-        return addBefore(head, fnObj) != 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// 把已注册槽位真正挂到游戏信号环（仅游戏线程调用：CallHook detour 冲刷 / Trigger 路径
-// 冲刷）。从 RegisterGameEvent 的直连逻辑提取：容器获取 → 符号解析 → 信号定位 →
-// GameEventAttach。失败时调用方已有回滚/重排队路径。
-static bool GameEventAttachSlot(RegisteredGameEvent* slot) {
-    if (!slot || !slot->vftable) return false;
-    void* container = GetGameEventContainer();
-    if (!container) return false;  // 对局仍未开始
-    auto ensureRing = GameEventResolve<GameEventEnsureRingFn>(
-        &g_gameEventSymbols.ensureRing, kGameEventEnsureRingSymbol, "EnsureRing");
-    auto addBefore = GameEventResolve<GameEventAddBeforeFn>(
-        &g_gameEventSymbols.addBefore, kGameEventAddBeforeSymbol, "AddBefore");
-    if (!ensureRing || !addBefore) return false;
-
-    // PlayerTurnStartComplete 信号对象 = 容器 + kGameEventTurnSignalOffset
-    //（docs §8；GameSignals::Subscribe @0x1666596aa）
-    void* signal = static_cast<char*>(container) + kGameEventTurnSignalOffset;
-    return GameEventAttach(ensureRing, addBefore, signal, slot);
-}
-
-// ---- 自定义 _Func_impl vtable 槽位实现（模仿官方 0x166ac38a0 结构） ----
-
-// _Copy：把 64 字节函数对象复制到 dest（AddBefore 的环节点存储 @node+0x10），返回 dest。
-// 官方（0x16665a420）只写 vftable；这里补上名字指针，并把自指修正为 dest（AddBefore
-// 随后也会把返回值 dest 写回 dest+0x38，双保险）。
-static void* __fastcall GameEventFuncCopy(void* self, void* dest) {
-    if (!dest) return dest;
-    memcpy(dest, self, 64);
-    *reinterpret_cast<void**>(static_cast<char*>(dest) + kGameEventFnSelfOffset) = dest;
-    return dest;
-}
-
-// _Do_call：信号触发时被 Dispatch 调用（参数以指针形式传入，此处忽略——带参路径
-// 由插件 pushArgsFn 处理 payload）。广播路径 payload = nullptr。
-// 热路径：不取锁（CallHook 指针由注册/触发路径预热缓存，Contains 校验兜底）。
-static void __fastcall GameEventFuncDoCall(void* self, void* /*arg1*/, void* /*arg2*/,
-                                           void* /*arg3*/, void* /*arg4*/) {
-    if (!self) return;
-    const char* name = *reinterpret_cast<const char* const*>(
-        static_cast<char*>(self) + kGameEventFnNameOffset);
-    if (!name || !*name) return;
-    GameEventPushArgsFn pushArgsFn =
-        *reinterpret_cast<GameEventPushArgsFn*>(
-            static_cast<char*>(self) + kGameEventFnPushArgsOffset);
-    GameEventInvoke(name, pushArgsFn, nullptr);
-}
-
-// _Target_type：type_info 不可用，返回 nullptr（无人消费）。
-static void* __fastcall GameEventFuncTargetType(void* /*self*/) {
-    return nullptr;
-}
-
-// _Delete_this：no-op。函数对象位于 loader 静态区、环内副本无堆资源（环节点内存由
-// 信号环自身 _aligned_free，不依赖 _Delete_this）。
-static void __fastcall GameEventFuncDeleteThis(void* /*self*/, bool /*deallocate*/) {
-}
-
-// _Get：返回 lambda 数据指针（= self + kGameEventFnNameOffset）。
-static void* __fastcall GameEventFuncGet(void* self) {
-    return self ? static_cast<char*>(self) + kGameEventFnNameOffset : nullptr;
-}
-
-// 槽位：[0]=_Copy [1]=_Copy [2]=_Do_call [3]=_Target_type [4]=_Delete_this [5]=_Get
-static void* g_gameEventFuncVtable[6] = {
-    reinterpret_cast<void*>(&GameEventFuncCopy),
-    reinterpret_cast<void*>(&GameEventFuncCopy),
-    reinterpret_cast<void*>(&GameEventFuncDoCall),
-    reinterpret_cast<void*>(&GameEventFuncTargetType),
-    reinterpret_cast<void*>(&GameEventFuncDeleteThis),
-    reinterpret_cast<void*>(&GameEventFuncGet),
-};
-
-// ---- CallHook detour + 延迟注册队列 ----
-// CallHook detour：游戏线程触发事件时冲刷延迟注册队列并转发原始调用。
-// scriptSystem 改为由 GameEventInvoke 每次实时读取，detour 不再捕获 scriptSystem。
-static GameEventCallHookFn g_gameEventCallHookOriginal = nullptr;
-static bool g_gameEventDetourInstalled = false;
-static uint64_t g_gameEventDetourGeneration = 0;
-
-static void GameEventFlushPending();
-
-static bool __fastcall GameEventCallHookDetour(void* scriptSystem, const char* name,
-                                               void* args, bool* flag) {
-    GameEventFlushPending();         // 游戏线程触发时冲刷延迟注册队列
-    if (g_gameEventCallHookOriginal) {
-        return g_gameEventCallHookOriginal(scriptSystem, name, args, flag);
-    }
-    return false;
-}
-
-// 幂等安装（installed + generation 判定；original 是 MinHook trampoline，不在 GameCore
-// 映像内，不能用 Contains 校验）。GameCore 重载后 generation 递增，下次 Ensure 重装：
-// 同基址重载会撞 MinHook 的 ALREADY_CREATED（旧代残留记录未随映像卸载清除），在
-// MinHookMutex 内 MH_DisableHook + SafeRemoveHookLocked 摘除后重装一次（对齐
-// InstallSharedHook 的恢复模式）。teardown 窗口内拒绝安装（对齐 InstallHookImpl）；
-// Enable/重装失败时回滚本调用创建的 MinHook 记录（对齐 InstallHookOwnedByLocked 约定），
-// 否则该 target 永远 ALREADY_CREATED 再无重试机会。
-static bool EnsureGameEventCallHookDetour() {
-    const uint64_t gen = ImageAddress::GameCoreGeneration();
-    if (g_gameEventDetourInstalled && g_gameEventDetourGeneration == gen) {
-        return true;  // 同代已装
-    }
-    g_gameEventDetourInstalled = false;
-    g_gameEventCallHookOriginal = nullptr;
-    void* callHook = ResolveByNameImpl(kHookImageGameCoreXP2, kGameEventCallHookSymbol);
-    if (!callHook) {
-        Logger::Log("GameEvent: CallHook resolve failed for detour");
-        return false;
-    }
-    if (TargetInTearingDownGameCore(callHook)) {
-        Logger::Log("GameEvent: CallHook detour rejected: target %p belongs to tearing-down GameCore",
-            callHook);
-        return false;
-    }
-    MH_STATUS status;
-    bool created = false;
-    {
-        lock_guard<std::mutex> mhLock(Runtime::MinHookMutex());
-        status = MH_CreateHook(callHook, reinterpret_cast<void*>(&GameEventCallHookDetour),
-                               reinterpret_cast<void**>(&g_gameEventCallHookOriginal));
-        if (status == MH_ERROR_ALREADY_CREATED) {
-            // 旧代残留：摘除旧钩（SafeRemoveHookLocked 内含 MH_DisableHook + RemoveHook）
-            // 后重装一次，强制按新映像重打补丁。
-            MH_DisableHook(callHook);
-            if (SafeRemoveHookLocked(callHook)) {
-                status = MH_CreateHook(callHook,
-                    reinterpret_cast<void*>(&GameEventCallHookDetour),
-                    reinterpret_cast<void**>(&g_gameEventCallHookOriginal));
-            }
-        }
-        if (status == MH_OK) {
-            created = true;
-            status = MH_EnableHook(callHook);
-        }
-        if (status != MH_OK) {
-            // Enable/重装失败回滚：本调用创建的 MinHook 记录 RemoveHook 掉，
-            // 否则该 target 永远 ALREADY_CREATED（对齐 InstallHookOwnedByLocked）。
-            if (created) MH_RemoveHook(callHook);
-            g_gameEventCallHookOriginal = nullptr;
-        }
-    }
-    if (status != MH_OK) {
-        Logger::Log("GameEvent: CallHook detour failed %s", MH_StatusToString(status));
-        return false;
-    }
-    g_gameEventDetourInstalled = true;
-    g_gameEventDetourGeneration = gen;
-    Logger::Log("GameEvent: CallHook detour installed target=%p gen=%llu",
-        callHook, static_cast<unsigned long long>(gen));
-    return true;
-}
-
-struct PendingGameEvent {
-    char name[kGameEventNameMax];
-    GameEventPushArgsFn pushArgsFn;
-};
-constexpr int kMaxPendingGameEvents = 32;
-static PendingGameEvent g_pendingGameEvents[kMaxPendingGameEvents];
-static int g_pendingGameEventCount = 0;
-
-// 入 pending 队列（同名去重，幂等）。返回 false = 队列满（调用方须回滚槽位）。
-// 与 Trigger/Flush 路径的读保持一致：持 lifecycle 锁（recursive，重入安全）。
-static bool GameEventQueuePending(const char* name, GameEventPushArgsFn pushArgsFn) {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    for (int i = 0; i < g_pendingGameEventCount; ++i) {
-        if (strcmp(g_pendingGameEvents[i].name, name) == 0) return true;  // 已排队
-    }
-    if (g_pendingGameEventCount >= kMaxPendingGameEvents) {
-        Logger::Log("GameEvent: pending queue full (max %d)", kMaxPendingGameEvents);
-        return false;
-    }
-    const size_t len = strlen(name);
-    const size_t cap = kGameEventNameMax - 1;
-    const size_t copyLen = len < cap ? len : cap;
-    memcpy(g_pendingGameEvents[g_pendingGameEventCount].name, name, copyLen);
-    g_pendingGameEvents[g_pendingGameEventCount].name[copyLen] = '\0';
-    g_pendingGameEvents[g_pendingGameEventCount].pushArgsFn = pushArgsFn;
-    ++g_pendingGameEventCount;
-    Logger::Log("GameEvent: queued pending \"%s\" pushArgs=%p (%d pending)",
-        name, reinterpret_cast<void*>(pushArgsFn), g_pendingGameEventCount);
-    return true;
-}
-
-// 游戏线程冲刷：把 pending 中的注册项真正挂到信号环。只在游戏线程调用（CallHook
-// detour 与 Trigger 都在游戏线程；recursive 锁防与 Trigger 内层锁重入死锁）。
-// 槽位已被 owner 清理（插件卸载）的项直接丢弃；挂环失败（对局未开始/符号缺失等）
-// 的项重新入队，下次冲刷再试。
-static void GameEventFlushPending() {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    if (g_pendingGameEventCount == 0) return;
-    void* container = GetGameEventContainer();
-    if (!container) return;  // 对局仍未开始
-    PendingGameEvent pending[kMaxPendingGameEvents];
-    const int count = g_pendingGameEventCount;
-    memcpy(pending, g_pendingGameEvents, sizeof(pending));
-    g_pendingGameEventCount = 0;
-    static int s_flushRetryLogged = 0;   // 冲刷失败重排队的日志限量（防刷屏）
-    for (int i = 0; i < count; ++i) {
-        // 按名找槽位（pending 与槽位同名唯一；owner 清理后槽位消失则丢弃该项）
-        RegisteredGameEvent* slot = nullptr;
-        for (auto& ev : g_gameEvents) {
-            if (ev.vftable && strcmp(ev.name, pending[i].name) == 0) {
-                slot = &ev;
-                break;
-            }
-        }
-        if (!slot) continue;  // owner 已清理：丢弃
-        if (!GameEventAttachSlot(slot)) {
-            GameEventQueuePending(pending[i].name, pending[i].pushArgsFn);  // 再排队
-            if (s_flushRetryLogged < 10) {
-                ++s_flushRetryLogged;
-                Logger::Log("GameEvent: flush attach failed, re-queued \"%s\"",
-                    pending[i].name);
-            }
-            continue;
-        }
-        Logger::Log("GameEvent: registered \"%s\" on PlayerTurnStartComplete signal pushArgs=%p",
-            slot->name, reinterpret_cast<void*>(slot->pushArgsFn));
-    }
-}
-
-// 插件卸载/隔离时清理其注册的 GameEvent：槽位 + pending 队列。
-// 关键：槽位 name[0] 置空——环节点内拷贝的 namePtr 指向这里，置空后 DoCall 的
-// if (!name || !*name) return 即短路，不会再调已卸载插件的 pushArgsFn。
+// 插件卸载/隔离时清理其注册的 GameEvent：清槽位（name[0]='\0' + 字段清空 + ownerId.clear）。
 // 调用方持 lifecycle 锁（RemovePluginOwnedRegistrations 内调用），本函数不再加锁。
 static void CleanupGameEventsForOwner(const std::wstring& owner) {
-    std::vector<std::string> cleanedNames;
+    size_t cleaned = 0;
     for (auto& ev : g_gameEvents) {
-        if (!ev.vftable || ev.ownerId != owner) continue;
-        cleanedNames.push_back(std::string(ev.name));
+        if (ev.name[0] == '\0' || ev.ownerId != owner) continue;
         ev.name[0] = '\0';
-        ev.vftable = nullptr;
-        ev.namePtr = nullptr;
         ev.pushArgsFn = nullptr;
-        ev.self = nullptr;
         ev.ownerId.clear();
+        ++cleaned;
     }
-    if (cleanedNames.empty()) return;
-    // pending 队列：与已清槽位同名的项整项移除（紧凑移动，维护计数）。
-    int write = 0;
-    for (int i = 0; i < g_pendingGameEventCount; ++i) {
-        const bool matched = std::any_of(cleanedNames.begin(), cleanedNames.end(),
-            [&](const std::string& n) {
-                return strcmp(n.c_str(), g_pendingGameEvents[i].name) == 0;
-            });
-        if (matched) continue;
-        if (write != i) g_pendingGameEvents[write] = g_pendingGameEvents[i];
-        ++write;
-    }
-    g_pendingGameEventCount = write;
+    if (cleaned == 0) return;
     Logger::Log("CleanupGameEventsForOwner: owner=%ls cleaned=%zu event(s)",
-        owner.c_str(), cleanedNames.size());
+        owner.c_str(), cleaned);
 }
 
 }  // namespace
 
-// GameCore 重载重挂：遍历已注册槽位重新入 pending 队列（GameEventQueuePending 同名
-// 去重幂等）。旧环随旧 GameCore 容器销毁；重排后由新代首次 CallHook 触发时 detour
-// 冲刷重挂到新环。
-static void GameEventRequeueAll() {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    for (const auto& ev : g_gameEvents) {
-        if (ev.vftable && ev.name[0]) {
-            GameEventQueuePending(ev.name, ev.pushArgsFn);
-        }
-    }
-}
-
-// 手动触发一次：先冲刷延迟注册，查找注册记录（区分未注册与无参事件），再通过 GameEventInvoke 派发。
+// 手动触发一次：查找注册记录（区分“未注册”与“已注册但无回调”），再通过 GameEventInvoke 派发。
 bool TriggerGameEventImpl(const char* name, const void* payload) {
     if (!name || !*name) return false;
-    if (!EnsureGameEventCallHookDetour()) return false;
-    GameEventFlushPending();
-    // 找注册记录（含延迟注册中的）：区分“未注册”与“已注册但 pushArgsFn 为 null”
+    // 找注册记录：区分“未注册”（false）与“已注册但 pushArgsFn 为 null”（无参事件，合法）。
     bool found = false;
     GameEventPushArgsFn pushArgsFn = nullptr;
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
         for (const auto& ev : g_gameEvents) {
-            if (ev.vftable && ev.name[0] && strcmp(ev.name, name) == 0) {
+            if (ev.name[0] && strcmp(ev.name, name) == 0) {
                 found = true;
                 pushArgsFn = ev.pushArgsFn;
                 break;
-            }
-        }
-        if (!found) {
-            for (int i = 0; i < g_pendingGameEventCount; ++i) {
-                if (strcmp(g_pendingGameEvents[i].name, name) == 0) {
-                    found = true;
-                    pushArgsFn = g_pendingGameEvents[i].pushArgsFn;
-                    break;
-                }
             }
         }
     }
@@ -1414,11 +1086,8 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
     return GameEventInvoke(name, pushArgsFn, payload);
 }
 
-
-
-// 注册 GameEvent：校验 owner → 同名幂等 → 找空槽 → 填槽位 → 入 pending 队列 → 返回 true。
-// 注册是异步受理：实际插环由游戏线程的 CallHook detour 冲刷（对局中每事件触发即冲刷）
-// 或 Trigger 调用时完成，不在本函数所在线程直接改游戏信号环（防跨线程竞争 Dispatch）。
+// 注册 GameEvent：入口校验 → lifecycle 锁 → owner 校验 → 同名幂等 → 找空槽 → 填槽位。返回 true。
+// 纯登记：只记名字与参数打包回调，不挂任何信号环、无延迟队列。
 bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
     if (!name || !*name) return false;
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
@@ -1433,24 +1102,22 @@ bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
         return false;
     }
 
-    // 同名幂等：已注册直接成功（首次注册的 pushArgsFn 生效）
+    // 同名幂等：name[0] 非空且 strcmp 相等 → 已注册，直接成功（首次注册的 pushArgsFn 生效）
     for (const auto& ev : g_gameEvents) {
-        if (ev.vftable && ev.name[0] && strcmp(ev.name, name) == 0) return true;
+        if (ev.name[0] && strcmp(ev.name, name) == 0) return true;
     }
+    // 找空槽：name[0] 为空 = 空槽
     RegisteredGameEvent* slot = nullptr;
     for (auto& ev : g_gameEvents) {
-        if (!ev.vftable) { slot = &ev; break; }
+        if (!ev.name[0]) { slot = &ev; break; }
     }
     if (!slot) {
         Logger::Log("RegisterGameEvent: no free slot (max %d)", kMaxRegisteredGameEvents);
         return false;
     }
 
-    // 填槽位（挂环延迟到游戏线程冲刷）
-    slot->vftable = reinterpret_cast<void*>(g_gameEventFuncVtable);
-    slot->namePtr = slot->name;
+    // 填槽位：pushArgsFn / ownerId / name
     slot->pushArgsFn = pushArgsFn;
-    slot->self = slot;
     slot->ownerId = *owner;
     {
         const size_t len = strlen(name);
@@ -1459,19 +1126,8 @@ bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
         memcpy(slot->name, name, copyLen);
         slot->name[copyLen] = '\0';
     }
-
-    if (!GameEventQueuePending(name, pushArgsFn)) {
-        // 队列满：回滚槽位全部字段
-        slot->vftable = nullptr;
-        slot->namePtr = nullptr;
-        slot->pushArgsFn = nullptr;
-        slot->self = nullptr;
-        slot->ownerId.clear();
-        slot->name[0] = '\0';
-        return false;
-    }
-    // 尽力安装 detour（冲刷通道）；失败不打断——Trigger/后续注册会重试安装。
-    EnsureGameEventCallHookDetour();
+    Logger::Log("RegisterGameEvent: registered \"%s\" pushArgs=%p", name,
+        reinterpret_cast<void*>(pushArgsFn));
     return true;
 }
 
@@ -3069,8 +2725,8 @@ static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
     const size_t registrationsRemoved =
         registrationsBefore - g_pushRegistrations.size();
 
-    // GameEvent 槽位 + pending：置空 name（环节点 namePtr 指向这里，DoCall 短路）
-    // + 清空全部字段。Quarantine/Unload 都经本函数，无需在各自路径重复接线。
+    // GameEvent 槽位：清空该 owner 注册的事件表（name/pushArgsFn/ownerId）。
+    // Quarantine/Unload 都经本函数，无需在各自路径重复接线。
     CleanupGameEventsForOwner(owner);
 
     Logger::Log("RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu registrations=%zu",
@@ -3264,11 +2920,6 @@ bool LoaderCore::InitializeGameCorePhase() {
     // 首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。
     EnsureScriptHooksInstalled();
     ReinstallPushRegistrations();
-    // GameEvent 冲刷通道随代重建：CallHook detour 不登记 g_hookRecords（自管代际），
-    // 旧代安装已失效。此刻装上新代 detour，对局开始后引擎首次触发任意事件即冲刷
-    // pending 队列（含 ResetForReload 重排的事件）——纯 Global 插件部署（重载后无人
-    // 再调 Register/Trigger）也能恢复每回合广播。
-    EnsureGameEventCallHookDetour();
     // Global 插件的 Ready 回调：此刻新映像已 attach、符号可解析——插件在此
     // InstallHook/Patch/做一次性初始化；先于 GameCore 插件加载，保证顺序确定。
     const auto readySnapshot = SnapshotGameCoreCallbacks(g_gameCoreReadyCallbacks);
@@ -3515,8 +3166,8 @@ void LoaderCore::ResetForReload() {
     ResetSharedGameCoreHooks(lifecycleLock);
     // 按代际清掉剩余的 GameCore 域插件钩（Global 插件的钩 + 各类漏网）。
     RemoveGameCoreGenerationHooks(teardownGeneration);
-    // GameEvent 重挂：已注册槽位（Global 插件的注册跨代保留）重排进 pending，
-    // 新代 attach 后首次 CallHook 触发时 detour 冲刷重挂到新环。
-    GameEventRequeueAll();
+    // GameCore 重载后 Global 插件注册的 GameEvent 槽位跨代保留：Register/Trigger 与
+    // GameEventInvoke 每次实时解析 CallHook / scriptSystem（见 GetGameEventScriptSystem /
+    // GameEventResolve），无需在此重挂任何信号环。
     Logger::Log("ResetForReload: teardown callbacks fired, GameCore plugins unloaded, shared hooks reset, generation hooks cleared");
 }
