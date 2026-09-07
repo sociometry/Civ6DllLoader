@@ -1342,20 +1342,15 @@ void __cdecl Hook_RegisterScriptData(hks::lua_State* L) {
 }
 
 void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State* L) {
+    // 高频路径：游戏每建一个 UI context 就调一次（主菜单/对局切换均触发），
+    // 逐次日志会刷屏——行为日志降噪，registrar 照常每次执行（新 context 需要重新挂全局）。
     SharedDetourActivity activity;
     const auto snapshot = SnapshotScriptGlobals(g_scriptGlobalsUI);
-    Logger::Log("RegisterScriptDataForUI: running %zu plugin global registrar(s)", snapshot.size());
-    size_t i = 0;
     for (const auto& entry : snapshot) {
-        Logger::Log("RegisterScriptDataForUI: registrar[%zu] begin", i);
         CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
-        Logger::Log("RegisterScriptDataForUI: registrar[%zu] end", i);
-        ++i;
     }
     if (g_origRegisterScriptDataForUI) {
-        Logger::Log("RegisterScriptDataForUI: calling original");
         g_origRegisterScriptDataForUI(unused, L);
-        Logger::Log("RegisterScriptDataForUI: original returned");
     }
 }
 
@@ -2189,7 +2184,9 @@ void LuaPushCFunctionFieldImpl(void* L, int tableIndex, const char* fieldName, v
     // pushnamedcclosure grows the stack by 1; relative negative indices must be
     // adjusted so they still refer to the table (e.g. -1 -> -2), matching
     // Example2's explicit LuaSetField(L, -2, ...).
-    const int idx = (tableIndex < 0) ? (tableIndex - 1) : tableIndex;
+    // 伪索引（hks 全局表 LUA_GLOBAL=-10002 等，<= -10000）不随栈增长漂移，透传。
+    const bool isPseudoIndex = (tableIndex <= -10000);
+    const int idx = (tableIndex < 0 && !isPseudoIndex) ? (tableIndex - 1) : tableIndex;
     hks::pushnamedcclosure(state, reinterpret_cast<hks::luaFunc>(fn), 0, iname, 0);
     hks::setfield(state, idx, fieldName);
 }
