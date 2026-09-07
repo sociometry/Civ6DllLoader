@@ -42,13 +42,17 @@ static void InitImports(HMODULE dll) {
         GetProcAddress(dll, "?Lookup@Localization@@YA?AVString@1@PEBD@Z"));
     PushArgumentPtr = reinterpret_cast<PushArgumentFunc>(
         GetProcAddress(dll, "?PushArgument@String@Localization@@QEAA_NPEBD@Z"));
+    // 导出表实证（dumpbin /EXPORTS Localization_FinalRelease.dll）：
+    //   ??1String@Localization@@UEAA@XZ  —— 虚析构（UEAA），非虚 QEAA 不存在
+    //   ?toUTF8@String@Localization@@QEAAPEBDXZ —— 非 const 单参版（QEAA），
+    //     const 版 QEBA 不存在；另有 ?toUTF8@...QEAAPEBDAEAIH@Z（输出缓冲三参版）
     DestructorPtr = reinterpret_cast<DestructorFunc>(
-        GetProcAddress(dll, "??1String@Localization@@QEAA@XZ"));
+        GetProcAddress(dll, "??1String@Localization@@UEAA@XZ"));
     ToUTF8Ptr = reinterpret_cast<ToUTF8Func>(
-        GetProcAddress(dll, "?toUTF8@String@Localization@@QEBAPEBDXZ"));
+        GetProcAddress(dll, "?toUTF8@String@Localization@@QEAAPEBDXZ"));
     if (!ToUTF8Ptr) {
         ToUTF8Ptr = reinterpret_cast<ToUTF8Func>(
-            GetProcAddress(dll, "?ToUTF8@String@Localization@@QEBAPEBDXZ"));
+            GetProcAddress(dll, "?toUTF8@String@Localization@@QEAAPEBDAEAIH@Z"));
     }
     GetArgumentCountPtr = reinterpret_cast<GetArgumentCountFunc>(
         GetProcAddress(dll, "?GetArgumentCount@String@Localization@@QEBAIXZ"));

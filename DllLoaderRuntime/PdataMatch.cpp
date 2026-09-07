@@ -44,7 +44,7 @@ namespace {
 
 constexpr char kSidecarMagic[4] = { 'C', '6', 'S', 'D' };
 constexpr uint32_t kSidecarVersion = 1;      // 最低支持版本
-constexpr uint32_t kSidecarVersionMax = 2;  // 最高支持版本（v2 新增函数体 AOB 表）
+constexpr uint32_t kSidecarVersionMax = 3;  // 最高支持版本（v2 新增函数体 AOB 表；v3 头部追加 8 字节，表结构同 v2，解析路径不变）
 constexpr uint32_t kSidecarResourceId = 102;  // RCDATA 资源 id（旧资源 101 已随旧符号库退役，勿复用）
 constexpr wchar_t kSidecarFileName[] = L"Civ6DllLoader.symdb.bin";
 
