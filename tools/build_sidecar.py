@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# build_sidecar.py - JSON + DLL -> sidecar bin (v3)
+# build_sidecar.py - JSON + DLL -> sidecar bin (v2)
 import argparse, json, os, struct, subprocess, sys, tempfile
 import pefile
 
@@ -66,7 +66,7 @@ def run_normhash(helper, records):
         os.unlink(inp)
 
 def main():
-    ap = argparse.ArgumentParser(description="JSON + DLL -> sidecar bin (v3)")
+    ap = argparse.ArgumentParser(description="JSON + DLL -> sidecar bin (v2)")
     ap.add_argument("--dll", default=DEFAULT_DLL)
     ap.add_argument("--json", default=os.path.join(HERE, "Civ6DllLoader.symdb.json"))
     ap.add_argument("--bin", default=os.path.join(HERE, "Civ6DllLoader.symdb.bin"))
