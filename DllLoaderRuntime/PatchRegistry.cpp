@@ -8,6 +8,7 @@
 #include "../common/Logger.h"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -66,11 +67,30 @@ bool IsWritableCommitted(void* p, size_t len) {
     return true;
 }
 
+bool RangeEnd(uintptr_t begin, size_t len, uintptr_t& end) {
+    if (len == 0 || begin > (std::numeric_limits<uintptr_t>::max)() - len) {
+        return false;
+    }
+    end = begin + len;
+    return end > begin;
+}
+
+bool RangesOverlap(uintptr_t aBegin, uintptr_t aEnd,
+                   uintptr_t bBegin, uintptr_t bEnd) {
+    return aBegin < bEnd && bBegin < aEnd;
+}
+
 }  // namespace
 
 bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     if (!target || !bytes || len == 0) {
         Logger::Log("PatchRegistry::Apply: invalid args target=%p len=%zu", target, len);
+        return false;
+    }
+    const uintptr_t targetBegin = reinterpret_cast<uintptr_t>(target);
+    uintptr_t targetEnd = 0;
+    if (!RangeEnd(targetBegin, len, targetEnd)) {
+        Logger::Log("PatchRegistry::Apply: address range overflow target=%p len=%zu", target, len);
         return false;
     }
     if (!IsWritableCommitted(target, len)) {
@@ -85,6 +105,17 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     const auto existing = Registry().find(target);
     const bool isFirst = existing == Registry().end();
     if (isFirst) {
+        for (const auto& kv : Registry()) {
+            const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(kv.first);
+            uintptr_t otherEnd = 0;
+            if (RangeEnd(otherBegin, kv.second.original.size(), otherEnd) &&
+                    RangesOverlap(targetBegin, targetEnd, otherBegin, otherEnd)) {
+                LeaveCriticalSection(&Cs());
+                Logger::Log("PatchRegistry::Apply: range overlap target=%p len=%zu existing=%p len=%zu",
+                    target, len, kv.first, kv.second.original.size());
+                return false;
+            }
+        }
         Logger::Log("PatchRegistry::Apply: first patch target=%p len=%zu owner=%ls", target, len, owner);
     } else {
         if (existing->second.owner != owner) {
@@ -92,6 +123,13 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
             LeaveCriticalSection(&Cs());
             Logger::Log("PatchRegistry::Apply: owner conflict target=%p current=%ls requested=%ls",
                         target, currentOwner.c_str(), owner);
+            return false;
+        }
+        if (existing->second.original.size() != len) {
+            const size_t currentLen = existing->second.original.size();
+            LeaveCriticalSection(&Cs());
+            Logger::Log("PatchRegistry::Apply: repeat length mismatch target=%p current=%zu requested=%zu owner=%ls",
+                target, currentLen, len, owner);
             return false;
         }
         // 重复 Apply 同一地址：更新当前字节但保留最初存档（日志告警）。
@@ -230,7 +268,11 @@ size_t RevertAllInRange(uintptr_t base, uintptr_t size) {
     targets.reserve(Registry().size());
     for (const auto& kv : Registry()) {
         const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
-        if (p >= base && p - base < size) {
+        uintptr_t patchEnd = 0;
+        uintptr_t rangeEnd = 0;
+        if (RangeEnd(p, kv.second.original.size(), patchEnd) &&
+                RangeEnd(base, size, rangeEnd) &&
+                RangesOverlap(p, patchEnd, base, rangeEnd)) {
             targets.push_back(kv.first);
         }
     }
