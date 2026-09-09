@@ -548,10 +548,26 @@ struct CaptureSite {
     uint32_t paramIndex = 0;
     std::wstring ownerId;        // 站点首个注册者的插件 owner（重载/卸载清理用）
     std::vector<void**> outs;
+    std::atomic<uint32_t> activeCalls{ 0 };
+    bool retiring = false;       // g_captureMutex 保护；阻止新 out 注册和捕获写入
 };
 static std::map<uintptr_t, CaptureSite> g_captureSites;
 static std::mutex g_captureMutex;
+static std::mutex g_captureDrainMutex;
+static std::condition_variable g_captureDrainCv;
 static asmjit::JitRuntime g_captureRuntime;
+
+extern "C" void CaptureEnter(CaptureSite* site) {
+    if (site) site->activeCalls.fetch_add(1, std::memory_order_acq_rel);
+}
+
+extern "C" void CaptureLeave(CaptureSite* site) {
+    if (!site) return;
+    if (site->activeCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::lock_guard<std::mutex> lock(g_captureDrainMutex);
+        g_captureDrainCv.notify_all();
+    }
+}
 
 // stub 调用的分发器：regs 指向 stub 栈帧里保存的 4 个整数参数槽（rcx/rdx/r8/r9），
 // 取第 paramIndex 个值写入站点全部 out 槽。与注册路径共用 g_captureMutex。
@@ -560,6 +576,7 @@ extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr) 
     if (!site || !regs || paramIndex > 3) return;
     const void* val = static_cast<void* const*>(regs)[paramIndex];
     std::lock_guard<std::mutex> lock(g_captureMutex);
+    if (site->retiring) return;
     for (void** out : site->outs) {
         if (out) *out = const_cast<void*>(val);
     }
@@ -568,7 +585,7 @@ extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr) 
 // 生成捕获站点 stub（裸 x64 机器码，Windows x64 调用约定）：
 //   MinHook 跳入时：rcx/rdx/r8/r9 = 前 4 个整数参数，xmm0-3 = 前 4 个浮点参数，
 //   [rsp] = 返回地址（此时 rsp ≡ 8 (mod 16)）。sub rsp, 0x98 后 rsp ≡ 0 (mod 16)：
-//   [rsp+0x00..0x20) 恰好充当调 CaptureDispatch 的 shadow space，
+//   [rsp+0x00..0x20) 恰好充当 CaptureEnter/CaptureDispatch/CaptureLeave 的 shadow space，
 //   [rsp+0x20..0x80) 保存参数（movaps 目标全部 16 字节对齐）。
 // original 回填方案（免写可执行内存、免扫描/免 reloc）：stub 尾部
 //   mov rax, imm64(&site->original)  —— 生成时固化的 C++ 站点成员地址
@@ -593,10 +610,16 @@ static bool BuildCaptureStub(CaptureSite* site, void** outStub) {
     a.movaps(x86::ptr(x86::rsp, 0x50), x86::xmm1);
     a.movaps(x86::ptr(x86::rsp, 0x60), x86::xmm2);
     a.movaps(x86::ptr(x86::rsp, 0x70), x86::xmm3);
+    a.mov(x86::rcx, reinterpret_cast<uintptr_t>(site));
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureEnter));
+    a.call(x86::r10);
     a.lea(x86::rcx, x86::ptr(x86::rsp, 0x20));
     a.mov(x86::edx, static_cast<uint32_t>(site->paramIndex));
     a.mov(x86::r8, reinterpret_cast<uintptr_t>(site));
     a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureDispatch));
+    a.call(x86::r10);
+    a.mov(x86::rcx, reinterpret_cast<uintptr_t>(site));
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureLeave));
     a.call(x86::r10);
     a.mov(x86::rcx, x86::ptr(x86::rsp, 0x20));
     a.mov(x86::rdx, x86::ptr(x86::rsp, 0x28));
@@ -646,6 +669,10 @@ static bool RegisterGlobalCaptureCore(HookImageId image, const char* providerFun
     lock_guard<std::mutex> captureLock(g_captureMutex);
     CaptureSite& site = g_captureSites[reinterpret_cast<uintptr_t>(target)];
     if (site.stubCode) {
+        if (site.retiring) {
+            Logger::Log("RegisterGlobalCapture: target is being retired provider=%s", providerFunction);
+            return false;
+        }
         // 已存在站点：paramIndex 必须一致，仅追加 out 槽。
         if (site.paramIndex != paramIndex) {
             Logger::Log("RegisterGlobalCapture: paramIndex conflict provider=%s have=%u want=%u",
@@ -752,34 +779,73 @@ void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbol, uint32_t 
 // 新站点建立块里调 MH_CreateHook），清理路径则反过来：先在 g_captureMutex 下收集
 // 快照、释放锁后再摘钩/释放 stub，避免在持 g_captureMutex 时等待摘钩（那会与在飞
 // 的 CaptureDispatch 在该锁上互相等待，且摘钩本身与注册路径的 mh 锁顺序冲突）。
-// 简化处理说明：MH_DisableHook/MH_RemoveHook 不等待在飞调用退出，摘钩后随即释放
-// stub 时理论上仍可能有线程位于 stub 内（极短窗口）。本任务接受该简化：与
-// ResetForReload 的 teardown 语义一致（旧 GameCore 映像随后即卸载），capture 站点
-// 是短暂的同步写路径，不跨线程长期驻留。
+// 摘钩后等待所有已进入 stub 的调用离开，再释放 stub 和站点对象，避免执行中的
+// stub 访问已释放的 JIT 代码或 std::map 节点。CaptureEnter/Leave 由 stub 本身维护计数。
+struct CaptureSiteSnapshot {
+    uintptr_t target = 0;
+    CaptureSite* site = nullptr;
+    void* stub = nullptr;
+};
+
+static bool RemoveCaptureHook(uintptr_t target) {
+    void* addr = reinterpret_cast<void*>(target);
+    lock_guard<mutex> mhLock(Runtime::MinHookMutex());
+    const MH_STATUS disableStatus = MH_DisableHook(addr);
+    if (disableStatus != MH_OK && disableStatus != MH_ERROR_DISABLED &&
+            disableStatus != MH_ERROR_NOT_CREATED) {
+        Logger::Log("RemoveCaptureHook: disable failed target=%p status=%s",
+            addr, MH_StatusToString(disableStatus));
+        return false;
+    }
+    if (disableStatus == MH_ERROR_NOT_CREATED) return true;
+    const MH_STATUS removeStatus = MH_RemoveHook(addr);
+    if (removeStatus != MH_OK && removeStatus != MH_ERROR_NOT_CREATED) {
+        Logger::Log("RemoveCaptureHook: remove failed target=%p status=%s",
+            addr, MH_StatusToString(removeStatus));
+        return false;
+    }
+    return true;
+}
+
+static void WaitForCaptureSiteDrain(CaptureSite* site) {
+    if (!site) return;
+    std::unique_lock<std::mutex> lock(g_captureDrainMutex);
+    g_captureDrainCv.wait(lock, [site] {
+        return site->activeCalls.load(std::memory_order_acquire) == 0;
+    });
+}
+
+static void RetireCaptureSites(const vector<CaptureSiteSnapshot>& snapshot) {
+    for (const auto& item : snapshot) {
+        if (!RemoveCaptureHook(item.target)) {
+            // 不能确认 target 已经不会再跳入 stub 时，保留 site/stub，优先避免 UAF。
+            continue;
+        }
+        WaitForCaptureSiteDrain(item.site);
+        {
+            lock_guard<mutex> lock(g_captureMutex);
+            const auto it = g_captureSites.find(item.target);
+            if (it == g_captureSites.end() || &it->second != item.site ||
+                    it->second.stubCode != item.stub) {
+                continue;
+            }
+            if (item.stub) g_captureRuntime.release(item.stub);
+            g_captureSites.erase(it);
+        }
+    }
+}
+
 static void CleanupAllCaptureSites() {
-    vector<pair<uintptr_t, void*>> snapshot;  // (target 地址, stubCode)
+    vector<CaptureSiteSnapshot> snapshot;
     {
         lock_guard<mutex> lock(g_captureMutex);
         snapshot.reserve(g_captureSites.size());
-        for (const auto& [target, site] : g_captureSites) {
-            snapshot.emplace_back(target, site.stubCode);
+        for (auto& [target, site] : g_captureSites) {
+            site.retiring = true;
+            snapshot.push_back({ target, &site, site.stubCode });
         }
     }
-    for (const auto& [target, stub] : snapshot) {
-        void* addr = reinterpret_cast<void*>(target);
-        {
-            lock_guard<mutex> mhLock(Runtime::MinHookMutex());
-            const MH_STATUS status = MH_DisableHook(addr);
-            if (status == MH_OK || status == MH_ERROR_DISABLED) {
-                MH_RemoveHook(addr);
-            }
-        }
-        if (stub) g_captureRuntime.release(stub);
-    }
-    {
-        lock_guard<mutex> lock(g_captureMutex);
-        g_captureSites.clear();
-    }
+    RetireCaptureSites(snapshot);
 }
 
 // 插件卸载：摘除 ownerId == owner 的 capture 站点（该插件是站点首个注册者）。
@@ -790,39 +856,19 @@ static void CleanupAllCaptureSites() {
 // 不触发共享路径，故保持最小实现。
 static void CleanupCaptureSitesForOwner(const std::wstring& owner) {
     if (owner.empty()) return;
-    vector<pair<uintptr_t, void*>> snapshot;
+    vector<CaptureSiteSnapshot> snapshot;
     {
         lock_guard<mutex> lock(g_captureMutex);
-        for (const auto& [target, site] : g_captureSites) {
+        for (auto& [target, site] : g_captureSites) {
             if (site.ownerId == owner) {
-                snapshot.emplace_back(target, site.stubCode);
+                site.retiring = true;
+                snapshot.push_back({ target, &site, site.stubCode });
             }
         }
     }
     if (snapshot.empty()) return;
-    for (const auto& [target, stub] : snapshot) {
-        void* addr = reinterpret_cast<void*>(target);
-        {
-            lock_guard<mutex> mhLock(Runtime::MinHookMutex());
-            const MH_STATUS status = MH_DisableHook(addr);
-            if (status == MH_OK || status == MH_ERROR_DISABLED) {
-                MH_RemoveHook(addr);
-            }
-        }
-        if (stub) g_captureRuntime.release(stub);
-    }
-    {
-        // 摘钩后清表；防御：若摘钩窗口内同 target 已被重新注册（新 stub），
-        // 只删 stub 仍匹配的旧站点。
-        lock_guard<mutex> lock(g_captureMutex);
-        for (const auto& [target, stub] : snapshot) {
-            const auto it = g_captureSites.find(target);
-            if (it != g_captureSites.end() && it->second.stubCode == stub) {
-                g_captureSites.erase(it);
-            }
-        }
-    }
-    Logger::Log("CleanupCaptureSitesForOwner: owner=%ls removed=%zu site(s)",
+    RetireCaptureSites(snapshot);
+    Logger::Log("CleanupCaptureSitesForOwner: owner=%ls retired=%zu site(s)",
         owner.c_str(), snapshot.size());
 }
 
@@ -2753,6 +2799,8 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
     g_bus.UnregisterOwner(ownerId);
     PatchRegistry::RevertAllFor(ownerId.c_str());
     RemovePluginHooks(ownerId.c_str());
+    // 隔离路径也必须撤销参数捕获站点；否则站点仍会向插件的 out 槽写入数据。
+    CleanupCaptureSitesForOwner(ownerId);
     RemovePluginOwnedRegistrations(ownerId);
     Logger::Log("Plugin quarantined by owner: %ls", ownerId.c_str());
 }

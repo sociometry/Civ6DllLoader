@@ -25,3 +25,12 @@ Outputs (typical):
 - `x64\Release\Civ6DllLoader.runtime.dll`
 
 Copy both into a Workshop mod under `Binaries\Win64\`.
+
+Runtime candidates carry static version metadata (RCDATA 105). Installation and
+updates read this resource without executing candidate DLL entry points or exports.
+Rebuild both shell and runtime after this change: older runtimes without the
+resource are skipped. Version numbers remain defined in `common/LoaderVersion.h`.
+
+Candidates still come from enabled mods and the loader's local scan locations.
+The metadata identifies the package format; it is not a publisher signature.
+Only distribute runtime DLLs from sources you trust.

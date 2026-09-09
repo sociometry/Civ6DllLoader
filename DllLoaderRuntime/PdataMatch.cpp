@@ -1035,7 +1035,7 @@ std::wstring CachePath() {
 }
 
 bool LoadCache(const std::wstring& path, uint64_t fingerprint, uint64_t oldFingerprint,
-    size_t expectedCount, std::vector<uint32_t>& outMap) {
+    size_t expectedCount, size_t newCount, std::vector<uint32_t>& outMap) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
@@ -1056,6 +1056,17 @@ bool LoadCache(const std::wstring& path, uint64_t fingerprint, uint64_t oldFinge
         if (sizeof(CacheHeader) + static_cast<uint64_t>(hdr.entryCount) * sizeof(uint32_t) > fileSize) break;
         outMap.resize(hdr.entryCount);
         std::memcpy(outMap.data(), buf.data() + sizeof(CacheHeader), outMap.size() * sizeof(uint32_t));
+        bool valid = true;
+        for (const uint32_t newIdx : outMap) {
+            if (newIdx != kUnmatched && static_cast<size_t>(newIdx) >= newCount) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            outMap.clear();
+            break;
+        }
         ok = true;
     } while (false);
     CloseHandle(file);
@@ -1222,7 +1233,8 @@ bool BuildNewTable(HMODULE gameCore) {
             mapping.size());
     } else {
         const std::wstring cachePath = CachePath();
-        if (!cachePath.empty() && LoadCache(cachePath, fingerprint, g_oldFingerprint, oldTable.size(), mapping)) {
+        if (!cachePath.empty() && LoadCache(cachePath, fingerprint, g_oldFingerprint,
+                oldTable.size(), newTable.size(), mapping)) {
             fromCache = true;
             Logger::Log("PdataMatch: cache hit (fingerprint=0x%016llX, entries=%zu)",
                 static_cast<unsigned long long>(fingerprint), mapping.size());

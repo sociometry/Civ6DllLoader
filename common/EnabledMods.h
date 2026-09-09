@@ -25,7 +25,8 @@ std::string ReadModId(const std::wstring& modRoot);
 std::wstring NormalizePath(const std::wstring& path);
 bool PathIsUnderRoot(const std::wstring& path, const std::wstring& root);
 
-// True if path belongs to an enabled mod (by ModId or enabled root prefix).
+// True if path belongs to an enabled mod root recorded by Mods.sqlite.
+// ModId 不单独构成授权条件，因为同一 ID 可能存在多个安装副本。
 bool AllowsPath(const Snapshot& snap, const std::wstring& path);
 
 }  // namespace EnabledMods

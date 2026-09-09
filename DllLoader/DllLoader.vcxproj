@@ -119,6 +119,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="..\common\LoaderProtocol.h" />
+    <ClInclude Include="..\common\LoaderVersion.h" />
+    <ClInclude Include="..\common\RuntimePackage.h" />
     <ClInclude Include="..\common\HookAPI.h" />
     <ClInclude Include="..\common\ModScan.h" />
     <ClInclude Include="..\common\EnabledMods.h" />
@@ -131,6 +133,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\common\ModScan.cpp" />
+    <ClCompile Include="..\common\RuntimePackage.cpp" />
     <ClCompile Include="..\common\EnabledMods.cpp" />
     <ClCompile Include="..\third_party\sqlite\sqlite3.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

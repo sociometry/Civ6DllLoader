@@ -3,6 +3,7 @@
 #include "../common/LoaderProtocol.h"
 #include "../common/ModScan.h"
 #include "../common/RestartGame.h"
+#include "../common/RuntimePackage.h"
 #include "../common/Logger.h"
 
 #include <algorithm>
@@ -29,25 +30,6 @@ bool BetterThan(const RuntimeCandidate& a, const RuntimeCandidate& b) {
     if (a.version != b.version) return a.version > b.version;
     // Stable tie-break: lexicographically smaller path wins.
     return a.path < b.path;
-}
-
-// Probe a candidate runtime module: LoadLibrary + GetLoaderVersion export + read version.
-bool ProbeRuntimeVersion(const std::wstring& path, uint32_t& outVersion) {
-    HMODULE mod = LoadModuleFromPath(path);
-    if (!mod) {
-        Logger::Log("Runtime probe failed: %ls (err=%lu)", path.c_str(), GetLastError());
-        return false;
-    }
-
-    auto getVersion = reinterpret_cast<GetLoaderVersionFn>(GetProcAddress(mod, "GetLoaderVersion"));
-    const bool ok = getVersion != nullptr;
-    if (ok) {
-        outVersion = getVersion();
-    } else {
-        Logger::Log("Runtime missing GetLoaderVersion export: %ls", path.c_str());
-    }
-    FreeLibrary(mod);
-    return ok;
 }
 
 // Full path of the running process executable (e.g. ...\CivilizationVI.exe).
@@ -139,7 +121,7 @@ bool InstallLoaderIfMissing(HMODULE shellModule) {
     ranked.reserve(paths.size());
     for (const auto& path : paths) {
         uint32_t version = 0;
-        if (!ProbeRuntimeVersion(path, version)) continue;
+        if (!RuntimePackage::ProbeVersion(path, version)) continue;
         Logger::Log("InstallLoaderIfMissing: candidate %ls version=0x%08X", path.c_str(), version);
         ranked.push_back(RuntimeCandidate{path, version});
     }
@@ -156,13 +138,11 @@ bool InstallLoaderIfMissing(HMODULE shellModule) {
     // d. Copy to exe-dir\version.tmp, atomic rename to version.dll, cleanup,
     //    then announce. Any failure below is silent + logged only.
     const std::wstring tmp = exeDir + L"\\version.tmp";
-    if (!CopyFileW(bestPath.c_str(), tmp.c_str(), FALSE)) {
-        Logger::Log("InstallLoaderIfMissing: CopyFileW failed for %ls (err=%lu)", bestPath.c_str(), GetLastError());
+    if (!RuntimePackage::StageCandidate(bestPath, tmp, ranked.front().version)) {
+        Logger::Log("InstallLoaderIfMissing: staging failed for %ls", bestPath.c_str());
         return false;
     }
-    if (!MoveFileExW(tmp.c_str(), versionDll.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        Logger::Log("InstallLoaderIfMissing: MoveFileExW failed (err=%lu); removing tmp", GetLastError());
-        DeleteFileW(tmp.c_str());
+    if (!RuntimePackage::PublishStaged(tmp, versionDll)) {
         return false;
     }
     // Best-effort stale-backup cleanup; failure is ignored.

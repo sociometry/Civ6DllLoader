@@ -236,8 +236,8 @@ bool AllowsPath(const Snapshot& snap, const std::wstring& path) {
         }
     }
 
-    const std::string id = ReadModId(modRoot);
-    if (!id.empty() && snap.modIds.count(id)) return true;
+    // ModId 只能作为数据库元数据，不能单独授权路径：同一个 ModId 可以有多个
+    // 安装副本，授权必须绑定到 Mods.sqlite 返回的精确 mod root。
     return false;
 }
 

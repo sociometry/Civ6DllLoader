@@ -3,6 +3,7 @@
 #include "../common/LoaderProtocol.h"
 #include "../common/ModScan.h"
 #include "../common/RestartGame.h"
+#include "../common/RuntimePackage.h"
 #include "../common/Logger.h"
 
 #include <algorithm>
@@ -71,24 +72,6 @@ bool BetterThan(const RuntimeCandidate& a, const RuntimeCandidate& b) {
     return a.path < b.path;
 }
 
-// 探测候选版本：以 DONT_RESOLVE_DLL_REFERENCES 映射，避免执行候选 DLL 的 DllMain。
-bool ProbeVersion(const std::wstring& path, uint32_t& outVersion) {
-    HMODULE mod = LoadLibraryExW(path.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
-    if (!mod) {
-        Logger::Log("LoaderUpdate: probe LoadLibraryExW failed: %ls err=%lu", path.c_str(), GetLastError());
-        return false;
-    }
-    auto getVersion = reinterpret_cast<uint32_t(__cdecl*)(void)>(GetProcAddress(mod, "GetLoaderVersion"));
-    const bool ok = getVersion != nullptr;
-    if (ok) {
-        outVersion = getVersion();
-    } else {
-        Logger::Log("LoaderUpdate: candidate missing GetLoaderVersion export: %ls", path.c_str());
-    }
-    FreeLibrary(mod);
-    return ok;
-}
-
 }  // namespace
 
 void CheckAndApplyUpdate() {
@@ -130,7 +113,7 @@ void CheckAndApplyUpdate() {
     size_t probed = 0;
     for (const auto& p : pool) {
         uint32_t v = 0;
-        if (!ProbeVersion(p, v)) {
+        if (!RuntimePackage::ProbeVersion(p, v)) {
             continue;
         }
         ++probed;
@@ -149,27 +132,12 @@ void CheckAndApplyUpdate() {
         return;
     }
 
-    // e. 更新舞蹈
-    // 1) 残留清理：version_Old.dll 已在顶部清理过；此处防御性再删一次（不存在视为已干净）
-    if (!DeleteFileW(oldPath.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
-        Logger::Log("LoaderUpdate: delete version_Old.dll failed err=%lu, abort update", GetLastError());
+    // e. 完成临时文件复制和静态校验后才改动当前安装；发布失败由共享流程恢复备份。
+    if (!RuntimePackage::StageCandidate(best.path, tmpPath, best.version)) {
+        Logger::Log("LoaderUpdate: staging failed; current installation unchanged");
         return;
     }
-    // 2) 自身 → version_Old.dll（已加载 DLL 可改名，Windows 语义）
-    if (!MoveFileW(selfPath.c_str(), oldPath.c_str())) {
-        Logger::Log("LoaderUpdate: move self -> version_Old.dll failed err=%lu, abort update", GetLastError());
-        return;
-    }
-    Logger::Log("LoaderUpdate: moved self to version_Old.dll");
-    // 3) 当选候选 → version.tmp（失败时 _Old 已存在，下次启动薄壳安装器自愈）
-    if (!CopyFileW(best.path.c_str(), tmpPath.c_str(), FALSE)) {
-        Logger::Log("LoaderUpdate: copy candidate -> version.tmp failed err=%lu, abort update (shell self-heals next launch)", GetLastError());
-        return;
-    }
-    // 4) 原子改名 version.tmp → version.dll（防截断 DLL 崩溃循环）
-    if (!MoveFileExW(tmpPath.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        Logger::Log("LoaderUpdate: move version.tmp -> version.dll failed err=%lu, abort update", GetLastError());
-        DeleteFileW(tmpPath.c_str());
+    if (!RuntimePackage::PublishStaged(tmpPath, dllPath, oldPath)) {
         return;
     }
     Logger::Log("LoaderUpdate: update applied new version=0x%08X (restart to take effect)", best.version);

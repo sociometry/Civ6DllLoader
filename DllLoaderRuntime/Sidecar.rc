@@ -1,6 +1,18 @@
+#pragma code_page(65001)
 // Sidecar.rc — 打包压缩 sidecar（XPRESS_HUFF）为 RCDATA 资源，id=102
 // 与 PdataMatch::kSidecarResourceId 对应；Civ6DllLoader.symdb.bin.xp = [uint32 size][XPRESS_HUFF]
 102 RCDATA "Civ6DllLoader.symdb.bin.xp"
 // FrontEnd UI 注入资源（UiInject.cpp 读取；103=lua / 104=xml）
 103 RCDATA "Resources\\Civ6DllLoader_FrontEndUI.lua"
 104 RCDATA "Resources\\Civ6DllLoader_FrontEndUI.xml"
+
+// 安装与更新只读取本资源，不执行候选的 DllMain/TLS/导出。
+#include "../common/LoaderVersion.h"
+CIV6_DLL_LOADER_VERSION_RESOURCE_ID RCDATA
+BEGIN
+    CIV6_DLL_LOADER_VERSION_MAGIC,
+    CIV6_DLL_LOADER_VERSION_FORMAT,
+    CIV6_DLL_LOADER_VERSION_MAJOR,
+    CIV6_DLL_LOADER_VERSION_MINOR,
+    CIV6_DLL_LOADER_VERSION_PATCH
+END
