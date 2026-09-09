@@ -165,12 +165,11 @@ def main():
 
     slot_table = []
     for s in vt_syms:
-        vt_rva = int(s["rva"], 16)
         for sl in s.get("slots", []):
             off = int(sl["offset"])
             frva = int(sl["funcRva"], 16)
-            slot_table.append((off, frva, vt_rva + off))
-    slot_blob = struct.pack("<{}I".format(len(slot_table) * 3),
+            slot_table.append((off, frva))
+    slot_blob = struct.pack("<{}I".format(len(slot_table) * 2),
                            *[v for t in slot_table for v in t])
 
     HDR = 48
@@ -181,7 +180,7 @@ def main():
     aob_off = heap_off + len(heap_bytes)
 
     out = bytearray()
-    out += b"C6SD" + struct.pack("<I", 3) + struct.pack("<I", sizeimg)
+    out += b"C6SD" + struct.pack("<I", 2) + struct.pack("<I", sizeimg)
     out += struct.pack("<I", len(pdata_rows)) + struct.pack("<I", len(symbols))
     out += struct.pack("<I", pd_off) + struct.pack("<I", tg_off)
     out += struct.pack("<I", heap_off) + struct.pack("<I", len(heap_bytes))
