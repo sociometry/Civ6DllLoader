@@ -60,7 +60,9 @@ namespace hks {
 	extern hks_lua_objlenType objlen;
 	typedef void(__cdecl* hks_lua_gettableType)(lua_State*, int);
 	extern hks_lua_gettableType gettable;
-	typedef void(__cdecl* hksi_lua_cpcallType)(lua_State*, int, luaFunc, int);
+	// ?hksi_lua_cpcall@@YAHPEAUlua_State@@P6AH0@ZPEAX@Z
+	// int __cdecl hksi_lua_cpcall(lua_State*, luaFunc, void*)
+	typedef int(__cdecl* hksi_lua_cpcallType)(lua_State*, luaFunc, void*);
 	extern hksi_lua_cpcallType cpcall;
 	typedef int(__cdecl* RefType)(lua_State*, int);
 	extern RefType ref;

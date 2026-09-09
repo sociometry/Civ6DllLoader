@@ -23,5 +23,5 @@ typedef uint32_t(__cdecl* GetLoaderVersionFn)(void);
 }
 #endif
 
-// v2 运行时版本号（安装器与自更新比较用）
-constexpr uint32_t kLoaderRuntimeVersion = CIV6_DLL_LOADER_MAKE_VERSION(2, 0, 0);
+// 预发布 1.0.0 运行时版本号（安装器与自更新比较用）
+constexpr uint32_t kLoaderRuntimeVersion = CIV6_DLL_LOADER_MAKE_VERSION(1, 0, 0);

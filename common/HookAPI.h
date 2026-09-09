@@ -8,7 +8,7 @@
 // Bump ONLY on breaking changes (reorder/remove/change existing fields or PushLuaMethods contract).
 // Appending new fields at the end must NOT bump this - old plugins rely on structSize.
 #ifndef CIV6_HOOK_API_VERSION
-#define CIV6_HOOK_API_VERSION 2u
+#define CIV6_HOOK_API_VERSION 1u
 #endif
 
 // Opaque Localization::String storage size for stack buffers (bytes). Prefer LocCreate/LocDestroy.
@@ -189,6 +189,13 @@ typedef struct HookImageInfo {
 // Matches hks::LUA_GLOBAL - plugins can use this with LuaSetField.
 enum { kHookApiLuaGlobal = -10002 };
 
+// LuaCPcall: negative values are loader errors (Lua stack unchanged).
+// Zero is success; positive values are the engine's Lua error status.
+enum {
+    kHookApiLuaCallUnavailable = -1,
+    kHookApiLuaCallInvalidArgument = -2
+};
+
 // RegisterPushMethodsTarget sigType
 enum {
     kHookApiPushNoManager = 0,
@@ -235,7 +242,11 @@ typedef struct HookAPI {
     void (*LuaCheckTable)(void*, int);
     unsigned long long (*LuaObjLen)(void*, int);
     void (*LuaGetTable)(void*, int);
-    void (*LuaCPcall)(void*, int, void*, int);
+    // Correct protected C call: callback receives L; userdata is passed to the engine
+    // as a full-width pointer. Returns 0 on success, the engine's positive Lua status
+    // on error, or kHookApiLuaCall* for invalid arguments / missing imports.
+    // Call on the thread owning L; L and callback must be non-null; userdata may be null.
+    int (*LuaCPcall)(void* L, LuaMethodFunc callback, void* userdata);
     int (*LuaRef)(void*, int);
     int (*LuaPcall)(void*, int, int, int);
     void (*LuaPushValue)(void*, int);

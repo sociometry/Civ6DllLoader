@@ -2063,9 +2063,13 @@ void LuaGetTableImpl(void* L, int index) {
     HKS_GUARD_VOID(hks::gettable, reinterpret_cast<hks::lua_State*>(L), index);
 }
 
-void LuaCPcallImpl(void* L, int a, void* func, int b) {
-    HKS_GUARD_VOID(hks::cpcall, reinterpret_cast<hks::lua_State*>(L), a,
-        reinterpret_cast<hks::luaFunc>(func), b);
+int LuaCPcallImpl(void* L, LuaMethodFunc callback, void* userdata) {
+    if (!L || !callback) {
+        return kHookApiLuaCallInvalidArgument;
+    }
+    HKS_GUARD_RET(hks::cpcall, kHookApiLuaCallUnavailable,
+        reinterpret_cast<hks::lua_State*>(L),
+        reinterpret_cast<hks::luaFunc>(callback), userdata);
 }
 
 int LuaRefImpl(void* L, int index) {
