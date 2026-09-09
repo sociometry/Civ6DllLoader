@@ -71,11 +71,11 @@ bool BetterThan(const RuntimeCandidate& a, const RuntimeCandidate& b) {
     return a.path < b.path;
 }
 
-// 探测候选版本：LoadLibraryW → GetProcAddress("GetLoaderVersion") → 读 uint32_t。失败跳过。
+// 探测候选版本：以 DONT_RESOLVE_DLL_REFERENCES 映射，避免执行候选 DLL 的 DllMain。
 bool ProbeVersion(const std::wstring& path, uint32_t& outVersion) {
-    HMODULE mod = LoadLibraryW(path.c_str());
+    HMODULE mod = LoadLibraryExW(path.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
     if (!mod) {
-        Logger::Log("LoaderUpdate: probe LoadLibraryW failed: %ls err=%lu", path.c_str(), GetLastError());
+        Logger::Log("LoaderUpdate: probe LoadLibraryExW failed: %ls err=%lu", path.c_str(), GetLastError());
         return false;
     }
     auto getVersion = reinterpret_cast<uint32_t(__cdecl*)(void)>(GetProcAddress(mod, "GetLoaderVersion"));

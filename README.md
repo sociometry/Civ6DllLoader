@@ -22,6 +22,6 @@ Open `DllLoader.sln` in Visual Studio (x64 | Release).
 Outputs (typical):
 
 - `x64\Release\GameCore_XP2_Shell_FinalRelease.dll`
-- `DllLoaderRuntime\x64\Release\Civ6DllLoader.runtime.dll`
+- `x64\Release\Civ6DllLoader.runtime.dll`
 
 Copy both into a Workshop mod under `Binaries\Win64\`.
