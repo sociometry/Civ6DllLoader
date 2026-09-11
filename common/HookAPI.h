@@ -22,15 +22,15 @@
 // 槽位布局 = 引擎 ms_pkScriptSystemArgs_vtbl（18 槽，exe IDA @0x140FC0588 逐槽反编译验证）。
 // 本类是"指针直通"包装：ScriptSystemArgs* 直接就是引擎 args 对象指针（单指针
 // 布局，static_assert 锁死），成员函数按槽位调用其 vtable。
-// 用法：RegisterGameEvent 注册的 pushArgsFn 回调第一个参数即本类型：
+// 用法：在引擎 args 对象指针上调用 Push*/Get* 成员填充/读取参数：
 //
-//   void MyPushArgs(ScriptSystemArgs* args, const void* payload) {
+//   void MyPush(ScriptSystemArgs* args) {
 //       args->PushInt(42);
 //       args->PushString("hello", 5);
 //   }
 //
-// 生命周期：args 仅在回调执行期间存活（runtime 侧 CreateArgs/DestroyArgs 管理），
-// 不要在回调外缓存。回调整体在 runtime 的 SEH 保护内执行。
+// 生命周期：args 仅在所属回调执行期间存活，不要在回调外缓存。回调整体在
+// runtime 的 SEH 保护内执行。
 class ScriptSystemArgs {
 public:
     // ---- Push：追加参数（返回新参数的索引）----
@@ -92,7 +92,7 @@ private:
 // 引擎官方 Events.Combat 的 combatResult 同机制：88 字节堆对象 + 引擎真 vtable。
 // 构造/析构经 HookAPI 新增的 AllocTypedVariantMap/FreeTypedVariantMap；键哈希用
 // api->MakeHash("字段名")；SetXxx 全部虚槽直调（零额外 API 表面积）。
-// 用法（pushArgsFn 回调内）：
+// 用法（Lua 路径内）：
 //   GameEventTable t(api);                    // api = OnLoad 收到的 HookAPI*
 //   t.SetInt   (api->MakeHash("playerId"), 42);
 //   t.SetString(api->MakeHash("name"), "Caesar");
@@ -148,10 +148,15 @@ typedef struct LuaMethodInfo {
 } LuaMethodInfo;
 
 typedef void (*MessageHandlerFn)(const char* topic, const void* data, size_t len);
-// GameEvents 参数打包回调：把 payload 解析成 Lua 参数塞进 args。
-// args 即 ScriptSystemArgs（见上方类定义），直接调 Push* 成员。
-// payload 由 TriggerGameEvent 传入、pushArgsFn 同步解析，仅调用期间有效；为 null = 无参触发。
-typedef void (*GameEventPushArgsFn)(ScriptSystemArgs* args, const void* payload);
+
+// Lua 侧参数打包回调（RegisterGameEvent 用）：插件往 Lua 栈压**任意个任意类型**的参数，
+// 返回压入个数（0 = 无参调用）。用法与 Lua C 函数一致：
+//   标量：LuaPushInteger/… 逐个压，return 5 → Call(42, "smoke", 1.5, true, nil)
+//   表：  LuaCreateTable + LuaSetField 填字段，return 1 → Call(info)（字符串键/嵌套/数组）
+//   混合：随意组合。
+// runtime 负责其余全部机制：活跃 state 获取、锁协议、GameEvents[name].Call、栈清理。
+// 仅游戏线程调用；L 为当前活跃游戏 Lua 状态。
+typedef int (*GameEventPushFn)(void* L, const void* payload);
 typedef void (*ScriptGlobalsFn)(void* L);
 
 // GameCore 生命周期回调（Global 插件延迟挂钩的标准姿势）。
@@ -353,15 +358,14 @@ typedef struct HookAPI {
 
     // GameEvents：纯登记 + 插件端手动触发。name 为 GameEvent 名（如 "MyCustomEvent"），
     // 最长 95 个字节（不含结尾 NUL）；超长名称直接返回 false，不会截断或占用槽位。
-    // RegisterGameEvent：只登记名字与参数打包回调（owner 生命周期保留），不挂任何信号环、无自动广播。
-    //   pushArgsFn 可为 null = 无参事件；非 null 时在每次 TriggerGameEvent 触发时被调：
-    //   pushArgsFn(args, payload) —— args 用 ScriptSystemArgs 包装后 Push 参数（见 C++ 区）。
-    //   返回 false = 注册失败（未就绪/无空槽等）。同名重复注册幂等返回 true。
-    bool (*RegisterGameEvent)(const char* name, GameEventPushArgsFn pushArgsFn);
-    // TriggerGameEvent：手动触发一次（必须先注册——回查注册记录拿 pushArgsFn，未注册返回 false），
-    //   payload 传给注册时的 pushArgsFn（payload 同步解析，仅在本调用期间有效；pushArgsFn 为 null = 无参触发）。
-    //   pushArgsFn、引擎 CreateArgs/CallHook/DestroyArgs 的 SEH/C++ 异常由 Loader 截获并返回 false；
-    //   args 创建成功后 Loader 总会尝试 DestroyArgs。回调异常时不要继续使用 args。
+    // RegisterGameEvent：登记 Lua 侧构造参数事件（任意类型/个数，字符串键表/嵌套/数组）。
+    //   pushFn 往 Lua 栈压参数并返回个数（0 = 无参调用），runtime 负责活跃 state 获取、
+    //   锁协议、GameEvents[name].Call、栈清理（见 C++ 区 GameEventPushFn 说明）。
+    //   返回 false = 注册失败（未就绪/无空槽/无 owner 等）。同名重复注册幂等返回 true。
+    bool (*RegisterGameEvent)(const char* name, GameEventPushFn pushFn);
+    // TriggerGameEvent：手动触发一次（必须先注册——回查注册记录拿 pushFn，未注册返回 false），
+    //   payload 传给注册时的 pushFn（payload 同步解析，仅在本调用期间有效；pushFn 为 null = 无参调用）。
+    //   插件回调与 Lua 调用的 SEH/C++ 异常由 Loader 截获并返回 false。
     //   必须在游戏线程调用——Lua 状态非线程安全。
     bool (*TriggerGameEvent)(const char* name, const void* payload);
 
@@ -371,6 +375,34 @@ typedef struct HookAPI {
     //        PushTable 后所有权归引擎，禁止 Free）。
     void* (*AllocTypedVariantMap)(void);
     void  (*FreeTypedVariantMap)(void* engineObj);
+
+    // 官方 ScriptSystem::PushDataVariantMap 直调（vtable 槽21，0x140FC06C0）：
+    // 把 GameEventTable（TypedVariantKeyedContainer）压到 lua_State 栈顶，官方 ToLua 转换
+    // （嵌套子表完整；键走 VariantManager::FindKey 反查——官方字段名→字符串键、
+    // 未注册的自定义名→CRC32 数字键，见 exe sub_140DB5590）。
+    // useKeyLookup=false 恒数字键。仅游戏线程、L 有效、tableObj 为未 Push 的
+    // GameEventTable::raw() 时调用；GameCore 未就绪时无操作返回。
+    void (*PushDataVariantMap)(void* L, const void* tableObj, bool useKeyLookup);
+
+    // GameCore::EngineUtility 全局对象指针（ms_pkCurrentGame 槽 +0x18，与 scriptSystem +0x20
+    // 同族；IDA 实证 www.ms_pkEngineUtility）——锁协议用：
+    //   had = eu->vtable[6](eu)  HasGameCoreLock（+0x30）
+    //   if (had) eu->vtable[7](eu)  ReleaseGameCoreLock（+0x38）
+    //   ... Lua 工作 ...
+    //   if (had) eu->vtable[8](eu)  GetGameCoreLock（+0x40）
+    // 与官方 Utility::CallHook 完全同款三步。GameCore 未就绪返回 nullptr。
+    void* (*GetEngineUtility)(void);
+
+    // 当前活跃游戏 Lua 状态——**官方 GameCore::ScriptSystem::CallHook 同款**：
+    // 每次实时读 exe 全局 LuaSystem::LuaScriptSystem::ms_apSingletonInstance（RVA 0x2D08F88）
+    // 的 +0x10 字段（引擎在对局/脚本切换时更新它）。
+    // 【真机教训】不要缓存阶段 C 的 L：Civ6 多 lua_State 引擎，启动 state 与每局对局 state
+    // 分离（全局表共享、API 栈不共享），旧 state 失效后 GetField 触发 hks 致命错误（80000003）。
+    // 仅游戏线程调用；无对局/未就绪返回 nullptr。
+    void* (*GetActiveLuaState)(void);
+
+    // Lua nil 入栈（hks ?hksi_lua_pushnil 导出）。参数打包回调里构造 nil 参数用。
+    void (*LuaPushNil)(void* L);
 } HookAPI;
 
 // True if this runtime can serve a plugin built against the current pre-release header.

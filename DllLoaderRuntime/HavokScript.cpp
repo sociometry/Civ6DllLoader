@@ -16,6 +16,7 @@ namespace hks {
 	hksi_lua_tobooleanType toboolean;
 	hksi_lua_pushnumberType pushnumber;
 	hksi_lua_pushintegerType pushinteger;
+	hksi_lua_pushnilType pushnil;
 	hksi_luaL_errorType error;
 	hksi_lua_pushfstringType pushfstring;
 	CheckLStringType checklstring;
@@ -99,6 +100,7 @@ namespace hks {
 		RESOLVE_IMPORT(ref, "?luaL_ref@@YAHPEAUlua_State@@H@Z");
 		RESOLVE_IMPORT(pcall, "?hksi_lua_pcall@@YAHPEAUlua_State@@HHH@Z");
 		RESOLVE_IMPORT(pushvalue, "?hksi_lua_pushvalue@@YAXPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(pushnil, "?hksi_lua_pushnil@@YAXPEAUlua_State@@@Z");
 		RESOLVE_IMPORT(rawgeti, "?hksi_lua_rawgeti@@YAXPEAUlua_State@@HH@Z");
 		RESOLVE_IMPORT(unref, "?hksi_luaL_unref@@YAXPEAUlua_State@@HH@Z");
 		RESOLVE_IMPORT(settable, "?SetTable@LuaState@LuaPlus@@QEAAXH@Z");

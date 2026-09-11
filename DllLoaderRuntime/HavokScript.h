@@ -38,6 +38,8 @@ namespace hks {
 	extern hksi_lua_pushnumberType pushnumber;
 	typedef void(__cdecl* hksi_lua_pushintegerType)(lua_State*, int);
 	extern hksi_lua_pushintegerType pushinteger;
+	typedef void(__cdecl* hksi_lua_pushnilType)(lua_State*);
+	extern hksi_lua_pushnilType pushnil;
 	typedef void(__cdecl* hksi_luaL_errorType)(lua_State*, char const*, ...);
 	extern hksi_luaL_errorType error;
 	typedef char const* (__cdecl* hksi_lua_pushfstringType)(lua_State*, char const*, ...);

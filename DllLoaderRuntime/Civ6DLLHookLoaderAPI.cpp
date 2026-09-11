@@ -1038,20 +1038,12 @@ static void CleanupCaptureSitesForOwner(const std::wstring& owner) {
 
 // ================= GameEvents 桥接（RegisterGameEvent / TriggerGameEvent） =================
 // GameEvents = 纯登记 + 插件端手动触发（不再挂游戏信号环，无每回合自动广播）：
-//  - 登记：RegisterGameEvent(name, pushArgsFn)——只在注册表记下名字与参数打包回调（owner 生命周期保留）。
-//  - 触发：TriggerGameEvent(name, payload)——插件主动触发 → GameEventInvoke → CallHook 桥到 Lua。
-//  - 播放：CallHook（GameCore::Lua::Utility::CallHook）+ scriptSystem 的 CreateArgs/DestroyArgs
-//        每次实时解析（见 GetGameEventScriptSystem / GameEventResolve），跨 GameCore 代安全。
-//  - pushArgsFn 同步解析 payload（仅调用期间有效），为 null = 无参事件。
+//  - 登记：RegisterGameEvent(name, pushFn)——只在注册表记下名字与 Lua 参数打包回调（owner 生命周期保留）。
+//  - 触发：TriggerGameEvent(name, payload)——插件主动触发 → GameEventInvokeLua → 内化到 Lua。
+//  - 播放：内化路径（活跃 state 实时取 + 锁协议 + GameEvents[name].Call + 栈清理），
+//        引擎桥旧路径（args 容器 + CallHook 桥）已删除，统一到 Lua 路径。
 
 namespace {
-
-using GameEventCallHookFn = bool(__fastcall*)(void* scriptSystem, const char* name,
-                                              void* args, bool* flag);
-
-// CallHook：demangled（symdb 唯一、已验证）。
-static const char kGameEventCallHookSymbol[] =
-    "GameCore::Lua::Utility::CallHook";
 
 // ---- GameEvent table 参数（Data::TypedVariantMap）符号 ----
 // mangled 直用（symdb 去重后重载组的 demangled 只映射第一个重载，SetVariant 的
@@ -1087,11 +1079,15 @@ static const char kGameEventTableSetChildSymbol[] =
 // ms_pkCurrentGame → ms_pkScriptSystem 全局槽间距（当前版 0x14bfbaa88 vs
 // 0x14bfbaa68、旧版 0x180b88a88 vs 0x180b88a68，间距恒 0x20，双版本验证）。
 constexpr size_t   kGameEventScriptSystemDelta = 0x20;
-constexpr uint32_t kScriptSystemVtCreateArgs   = 8;     // IScriptSystem1 vtable 槽
-constexpr uint32_t kScriptSystemVtDestroyArgs  = 9;
+constexpr uint32_t kScriptSystemVtPushDataVariantMap = 21; // ScriptSystem vtable 槽：0x140FC06C0（exe），实函数 0x1401625B0 → sub_1404DA2D0 → FindKey 反查 ToLua
+// exe: ScriptSystem::CallHook 内的单例读取序列（mov rax,cs:singleton; mov rcx,[rax+10h]; jmp）
+// ——AOB 自锚定，避免硬编码 RVA 的版本脆性。
+constexpr const char* kLuaSingletonPattern =
+    "48 8B 05 ?? ?? ?? ?? 48 8B 48 10 E9";
+void* g_activeLuaStateHit = nullptr;   // AOB 命中缓存（Contains 校验，跨代自动重扫）
 constexpr size_t   kGameEventNameMax           = 96;    // 事件名副本容量（注册表）
 // 注：IScriptSystemArgs1 的 18 槽 vtable（Push/Get 族）已封装为公共头文件类
-// ScriptSystemArgs（common/HookAPI.h），插件在 pushArgsFn 回调内直调，不经 API 表。
+// ScriptSystemArgs（common/HookAPI.h），按需在类内直调，不经 API 表。
 
 // ms_pkCurrentGame 定位 pattern（GameSignals::Subscribe 开头 mov rdi, cs:ms_pkCurrentGame
 // 序列；读命中+3 的 disp32，目标槽 = 命中+7+disp32）。GetCurrentGameSlot 用它解析
@@ -1102,12 +1098,6 @@ constexpr char kGameEventCurrentGamePattern[] =
 // 全部指向 ms_pkScriptSystem，读命中+3 的 disp32，目标槽 = 命中+7+disp32）。
 constexpr char kGameEventScriptSystemPattern[] =
     "48 8B 35 ?? ?? ?? ?? 48 8B DA 48 8B CE 48 8B 06 FF 50 40";
-
-// 一次性解析并缓存 GameCore 侧函数指针；重载后旧指针失效，Contains 校验失败即重解。
-struct GameEventSymbols {
-    void* callHook = nullptr;
-};
-static GameEventSymbols g_gameEventSymbols;
 
 // GameEventTable（Data::TypedVariantMap）ctor/dtor 解析缓存（与 GameEventSymbols 同
 // 策略：Contains 校验失败即重解）。
@@ -1127,9 +1117,9 @@ static void* g_gameEventContainerHit = nullptr;
 
 constexpr int kMaxRegisteredGameEvents = 32;
 
-// 每个注册的 GameEvent 一条记录：名字 + owner + 参数打包回调。槽位判空用 name[0]。
+// 每个注册的 GameEvent 一条记录：名字 + owner + Lua 参数打包回调。槽位判空用 name[0]。
 struct RegisteredGameEvent {
-    GameEventPushArgsFn pushArgsFn = nullptr;  // 参数打包回调（插件提供，可为 null = 无参事件）
+    GameEventPushFn luaPushFn = nullptr;        // Lua 路径：压参数并返回个数
     std::wstring ownerId;                 // 注册者插件 owner（卸载/隔离按 owner 清理）
     char name[kGameEventNameMax] = {};    // 名字副本（对象末尾，长期存活；name[0]==0 即空槽）
 };
@@ -1155,12 +1145,6 @@ static int32_t GameEventReadInt32Safe(const void* addr) {
     }
     return value;
 }
-
-// scriptSystem 虚函数（ida-34472 字节级验证）：
-//   vftable[8]（0x40）= CreateArgs() → IScriptSystemArgs1*
-//   vftable[9]（0x48）= DestroyArgs(args)
-using GameEventCreateArgsFn = void*(__fastcall*)(void* scriptSystem);
-using GameEventDestroyArgsFn = void(__fastcall*)(void* scriptSystem, void* args);
 
 // 按名解析并缓存（版本矫正后的当前映像地址）；失败打日志并返回 nullptr。
 // 线程假设：调用点（Trigger / Register）都在游戏线程（文档要求），缓存读写无需加锁。
@@ -1210,155 +1194,86 @@ static void* GetGameEventScriptSystem() {
     return GameEventReadPtrSafe(static_cast<char*>(hit) + 7 + disp, 0);
 }
 
-// 官方所有 CallHook 调用点一律传 CreateArgs 创建的真实 args 对象（无 null 先例），
-// exe 侧 vftable[96] 会解引用 args 读参数——传 nullptr 必崩。
-// 统一调用路径：CreateArgs → [pushArgsFn(args, payload) 插件塞参数] → CallHook → DestroyArgs。
-// pushArgsFn 为空 = 无参事件（空 args 对象）。每个跨模块调用都单独捕获 SEH/C++ 异常，
-// 且只要 args 创建成功，就在离开调用路径前尝试 DestroyArgs。
-static __declspec(noinline) void* GameEventCreateArgsSeh(
-        void* scriptSystem, GameEventCreateArgsFn createArgs) {
-    __try {
-        return createArgs(scriptSystem);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
+// 官方 ScriptSystem::PushDataVariantMap 直调（vtable 槽21）：把 TypedVariantMap 压到
+// Lua 栈顶（官方 ToLua：嵌套子表完整，FindKey 反查决定键形态）。插件在 Lua 回调内
+// 构造 GameEventTable → 本函数压栈 → GameEvents[name].Call，绕开 args/CallHook 桥。
+void PushDataVariantMapImpl(void* L, const void* tableObj, bool useKeyLookup) {
+    if (!L || !tableObj) return;
+    void* scriptSystem = GetGameEventScriptSystem();
+    if (!scriptSystem) {
+        Logger::Log("PushDataVariantMap: no scriptSystem");
+        return;
     }
-}
-
-static void* GameEventCreateArgsSafe(void* scriptSystem,
-                                     GameEventCreateArgsFn createArgs) noexcept {
-    if (!scriptSystem || !createArgs) return nullptr;
-    try {
-        return GameEventCreateArgsSeh(scriptSystem, createArgs);
-    } catch (...) {
-        return nullptr;
-    }
-}
-
-static __declspec(noinline) bool GameEventPushArgsSeh(
-        GameEventPushArgsFn pushArgsFn, ScriptSystemArgs* args, const void* payload) {
-    __try {
-        pushArgsFn(args, payload);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool GameEventPushArgsSafe(GameEventPushArgsFn pushArgsFn,
-                                   ScriptSystemArgs* args, const void* payload) noexcept {
-    if (!pushArgsFn || !args) return true;
-    try {
-        return GameEventPushArgsSeh(pushArgsFn, args, payload);
-    } catch (...) {
-        return false;
-    }
-}
-
-static __declspec(noinline) bool GameEventCallHookSeh(
-        GameEventCallHookFn callHook, void* scriptSystem, const char* name,
-        void* args, bool* flag) {
-    __try {
-        return callHook(scriptSystem, name, args, flag) != 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool GameEventCallHookSafe(GameEventCallHookFn callHook, void* scriptSystem,
-                                  const char* name, void* args, bool* flag) noexcept {
-    if (!callHook || !scriptSystem || !name || !args || !flag) return false;
-    try {
-        return GameEventCallHookSeh(callHook, scriptSystem, name, args, flag);
-    } catch (...) {
-        return false;
-    }
-}
-
-static __declspec(noinline) bool GameEventDestroyArgsSeh(
-        void* scriptSystem, GameEventDestroyArgsFn destroyArgs, void* args) {
-    __try {
-        destroyArgs(scriptSystem, args);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool GameEventDestroyArgsSafe(void* scriptSystem,
-                                     GameEventDestroyArgsFn destroyArgs,
-                                     void* args) noexcept {
-    if (!scriptSystem || !destroyArgs || !args) return false;
-    try {
-        return GameEventDestroyArgsSeh(scriptSystem, destroyArgs, args);
-    } catch (...) {
-        return false;
-    }
-}
-
-static bool GameEventInvokeSeh(const char* name, GameEventPushArgsFn pushArgsFn,
-                               const void* payload, void* scriptSystem,
-                               GameEventCallHookFn callHook) {
-    bool ok = false;
-    void* argsRaw = nullptr;
-    GameEventDestroyArgsFn destroyArgs = nullptr;
-    bool argsCreated = false;
     __try {
         void** vt = *reinterpret_cast<void***>(scriptSystem);
-        auto createArgs = reinterpret_cast<GameEventCreateArgsFn>(vt[kScriptSystemVtCreateArgs]);
-        destroyArgs = reinterpret_cast<GameEventDestroyArgsFn>(vt[kScriptSystemVtDestroyArgs]);
-        ScriptSystemArgs* args = static_cast<ScriptSystemArgs*>(
-            GameEventCreateArgsSafe(scriptSystem, createArgs));
-        bool flag = false;
-        if (args) {
-            argsCreated = true;
-            // ScriptSystemArgs 是指针直通包装；先记录创建返回值，
-            // 即使后续读取包装对象失败，也仍能尝试交给 DestroyArgs。
-            argsRaw = args;
-            argsRaw = args->raw();
-            if (GameEventPushArgsSafe(pushArgsFn, args, payload)) {
-                ok = GameEventCallHookSafe(callHook, scriptSystem, name,
-                                            argsRaw, &flag);
-            } else {
-                Logger::Log("GameEvent: pushArgs callback failed name=%s", name);
-            }
-        } else {
-            Logger::Log("GameEvent: Invoke createArgs-failed name=%s ss=%p", name, scriptSystem);
-        }
+        auto fn = reinterpret_cast<void(__fastcall*)(void*, void*, const void*, bool)>(
+            vt[kScriptSystemVtPushDataVariantMap]);
+        fn(scriptSystem, L, tableObj, useKeyLookup);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::Log("GameEvent: Invoke exception name=%s", name);
-        ok = false;
+        Logger::Log("PushDataVariantMap: exception");
     }
-    if (argsCreated && !GameEventDestroyArgsSafe(scriptSystem, destroyArgs, argsRaw)) {
-        Logger::Log("GameEvent: DestroyArgs failed name=%s", name);
-        ok = false;
-    }
-    return ok;
 }
 
-static bool GameEventInvoke(const char* name, GameEventPushArgsFn pushArgsFn,
-                            const std::wstring& owner, const void* payload) {
-    if (!name || !*name) {
-        Logger::Log("GameEvent: Invoke bad-name");
-        return false;
+// GameCore::EngineUtility 全局（ms_pkCurrentGame 槽 +0x18，与 scriptSystem +0x20 同族）。
+// 锁协议（官方 Utility::CallHook 同款）：插件在持锁上下文做 Lua 工作前调用。
+void* GetEngineUtilityImpl() {
+    void* currentGameSlot = GetCurrentGameSlot();
+    if (!currentGameSlot) return nullptr;
+    return GameEventReadPtrSafe(static_cast<const char*>(currentGameSlot) + 0x18, 0);
+}
+
+// 当前活跃游戏 Lua 状态——官方 GameCore::ScriptSystem::CallHook 同款（IDA 实证）：
+//   mov rax, cs:?ms_apSingletonInstance@LuaScriptSystem@LuaSystem@@2PEAV12@EA   ; exe RVA 0x2D08F88
+//   mov rcx, [rax+10h]                                                          ; 活跃 lua_State
+// 每次实时读（引擎在对局/脚本切换时更新 +0x10），不缓存。
+void* GetActiveLuaStateImpl() {
+    // 定位 exe 的 ScriptSystem::CallHook 内的全局读取序列（IDA 实证）：
+    //   48 8B 05 ?? ?? ?? ??   mov rax, cs:ms_apSingletonInstance
+    //   48 8B 48 10            mov rcx, [rax+10h]      ← 活跃 lua_State
+    //   E9 ?? ?? ?? ??         jmp GameEventLibrary::CallHook
+    // AOB 自锚定（不依赖硬编码 RVA，游戏版本更新时该序列由编译器稳定生成）；
+    // 命中地址按镜像缓存（Contains 校验，跨代/重载自动重扫）。
+    static const HookImageId kCandidates[] = { kHookImageExeDx11, kHookImageExeDx12 };
+    for (HookImageId image : kCandidates) {
+        if (!ImageAddress::IsLoaded(image)) continue;
+        // 缓存命中（地址仍属该镜像）直接用
+        void* slot = nullptr;
+        if (g_activeLuaStateHit && ImageAddress::Contains(image, g_activeLuaStateHit)) {
+            const int32_t disp = GameEventReadInt32Safe(
+                static_cast<const char*>(g_activeLuaStateHit) + 3);
+            if (disp != 0) {
+                slot = static_cast<char*>(g_activeLuaStateHit) + 7 + disp;
+            }
+        }
+        if (!slot) {
+            void* hit = ResolveByPatternImpl(image, kLuaSingletonPattern, kSectionText);
+            if (hit) {
+                g_activeLuaStateHit = hit;
+                const int32_t disp = GameEventReadInt32Safe(static_cast<const char*>(hit) + 3);
+                if (disp != 0) slot = static_cast<char*>(hit) + 7 + disp;
+            }
+        }
+        if (!slot) continue;
+        void* singleton = GameEventReadPtrSafe(slot, 0);
+        if (!singleton) continue;
+        void* L = GameEventReadPtrSafe(static_cast<const char*>(singleton) + 0x10, 0);
+        // 【诊断】一次性打印命中 RVA（预期 slot RVA=0x2D08F88），验证 AOB 锚点正确性
+        static bool s_logged = false;
+        if (!s_logged && L) {
+            s_logged = true;
+            HookImageInfo info{ sizeof(HookImageInfo) };
+            if (ImageAddress::GetInfo(image, &info) && info.base) {
+                Logger::Log("GetActiveLuaState: image=%u hitRva=0x%llX slotRva=0x%llX L=%p",
+                    static_cast<unsigned>(image),
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(g_activeLuaStateHit) - info.base),
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(slot) - info.base), L);
+            }
+        }
+        if (L) return L;
     }
-    auto callbackGuard = TryEnterPluginCallback(owner);
-    if (!callbackGuard) {
-        Logger::Log("GameEvent: Invoke rejected for inactive owner=%ls name=%s",
-            owner.c_str(), name);
-        return false;
-    }
-    void* scriptSystem = GetGameEventScriptSystem();  // 每次实时读，跨 GameCore 代安全
-    if (!scriptSystem) {
-        Logger::Log("GameEvent: Invoke no-scriptSystem name=%s", name);
-        return false;
-    }
-    auto callHook = GameEventResolve<GameEventCallHookFn>(
-        &g_gameEventSymbols.callHook, kGameEventCallHookSymbol, "CallHook");
-    if (!callHook) {
-        Logger::Log("GameEvent: Invoke bad-callHook name=%s", name);
-        return false;
-    }
-    return GameEventInvokeSeh(name, pushArgsFn, payload, scriptSystem, callHook);
+    return nullptr;
 }
 
 // 插件卸载/隔离时清理其注册的 GameEvent：清槽位（name[0]='\0' + 字段清空 + ownerId.clear）。
@@ -1368,7 +1283,6 @@ static void CleanupGameEventsForOwner(const std::wstring& owner) {
     for (auto& ev : g_gameEvents) {
         if (ev.name[0] == '\0' || ev.ownerId != owner) continue;
         ev.name[0] = '\0';
-        ev.pushArgsFn = nullptr;
         ev.ownerId.clear();
         ++cleaned;
     }
@@ -1379,34 +1293,153 @@ static void CleanupGameEventsForOwner(const std::wstring& owner) {
 
 }  // namespace
 
-// 手动触发一次：查找注册记录（区分“未注册”与“已注册但无回调”），再通过 GameEventInvoke 派发。
+// Lua 表路径触发（内化）：官方 CallHook 同款机制全收进 runtime——
+//   活跃 state 实时取 → 锁协议三步 → GameEvents[name].Call(table) → 栈清理。
+// 插件 pushFn 只负责往栈顶空表塞字段（字符串键/嵌套/数组）。
+// 栈清理兜底：独立 noinline SEH（/EHsc 下 __try 函数内不能带析构的 C++ 对象）。
+// 关键：在 Lua 序列的 __try **之外**调用——即使插件 pushFn 崩溃，栈也能恢复到基线，
+// 避免反复失败累积栈残留（远程引擎桥用 argsCreated 标志做等价兜底）。
+static __declspec(noinline) void GameEventPopToBaseSeh(void* L, int base) {
+    __try {
+        auto* s = reinterpret_cast<hks::lua_State*>(L);
+        const int top = hks::gettop(s);
+        if (top > base) hks::pop(s, top - base);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// 插件参数回调的独立 SEH：让日志能分辨"插件回调崩"与"引擎/Lua 崩"（对齐远程粒度）。
+static __declspec(noinline) bool GameEventPushArgsSeh(GameEventPushFn pushFn, void* L,
+                                                      const void* payload, int* outNargs) {
+    __try {
+        *outNargs = pushFn(L, payload);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Lua 序列段（含插件回调）：只做 Lua 操作，栈清理交给调用者（保证崩溃路径也执行）。
+static bool GameEventInvokeLuaSeh(const char* name, GameEventPushFn pushFn,
+                                  const void* payload, void* L, int base) {
+    bool ok = false;
+    __try {
+        auto* s = reinterpret_cast<hks::lua_State*>(L);
+        hks::getfield(s, hks::LUA_GLOBAL, "GameEvents");
+        hks::getfield(s, -1, name);
+        hks::getfield(s, -1, "Call");
+        int nargs = 0;
+        if (pushFn && !GameEventPushArgsSeh(pushFn, L, payload, &nargs)) {
+            Logger::Log("GameEvent: InvokeLua pushFn failed name=%s", name);
+            ok = false;   // 参数不完整，不继续调用
+        } else {
+            const int argc = (nargs < 0) ? 0 : nargs;
+            ok = hks::pcall(s, argc, 0, 0) == 0; // Call(arg1, arg2, ...)
+        }
+        (void)base;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("GameEvent: InvokeLua exception name=%s", name);
+        ok = false;
+    }
+    return ok;
+}
+
+// 内层主体：无 C++ 异常语义（SEH 段 + 资源兜底）。
+static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
+                                   const void* payload) noexcept {
+    if (!name || !*name) return false;
+    void* L = GetActiveLuaStateImpl();
+    if (!L) {
+        Logger::Log("GameEvent: InvokeLua no-active-state name=%s", name);
+        return false;
+    }
+    if (!hks::getfield || !hks::setfield || !hks::createtable || !hks::pcall ||
+        !hks::gettop || !hks::pop) {
+        Logger::Log("GameEvent: InvokeLua hks-imports-missing name=%s", name);
+        return false;
+    }
+
+    // 记录栈基线（清理兜底用）
+    int base = 0;
+    __try {
+        base = hks::gettop(reinterpret_cast<hks::lua_State*>(L));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("GameEvent: InvokeLua gettop failed name=%s", name);
+        return false;
+    }
+
+    // 锁协议（官方 Utility::CallHook 同款）：持锁则先释放，Lua 工作完成后恢复。
+    void* eu = GetEngineUtilityImpl();
+    bool had = false;
+    if (eu) {
+        __try {
+            void** vt = *reinterpret_cast<void***>(eu);
+            had = reinterpret_cast<bool(__fastcall*)(void*)>(vt[6])(eu);  // HasGameCoreLock
+            if (had) reinterpret_cast<void(__fastcall*)(void*)>(vt[7])(eu); // Release
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            had = false;
+            eu = nullptr;
+        }
+    }
+
+    const bool ok = GameEventInvokeLuaSeh(name, pushFn, payload, L, base);
+
+    // ★ 栈清理在 __try 之外——崩溃路径同样执行（资源兜底）
+    GameEventPopToBaseSeh(L, base);
+
+    if (eu && had) {
+        __try {
+            void** vt = *reinterpret_cast<void***>(eu);
+            reinterpret_cast<void(__fastcall*)(void*)>(vt[8])(eu);       // GetGameCoreLock
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    return ok;
+}
+
+// 外层：C++ 异常兜底（插件回调 throw / 标准库异常），与远程 Safe 层同款。
+static bool GameEventInvokeLua(const char* name, GameEventPushFn pushFn,
+                               const void* payload) noexcept {
+    try {
+        return GameEventInvokeLuaImpl(name, pushFn, payload);
+    } catch (...) {
+        Logger::Log("GameEvent: InvokeLua cxx-exception name=%s", name);
+        return false;
+    }
+}
+
+// 手动触发一次：查找注册记录，仅 Lua 路径（内化）。未注册或 luaPushFn 为 null → false。
+// 查到记录后先取 owner 在途守卫（TryEnterPluginCallback）——插件卸载/隔离期间拒绝触发，
+// 避免在途调用踩到已回滚的注册（与远程对引擎桥路径的加固同款）。
 bool TriggerGameEventImpl(const char* name, const void* payload) {
     if (!name || !*name) return false;
-    // 找注册记录：区分“未注册”（false）与“已注册但 pushArgsFn 为 null”（无参事件，合法）。
-    bool found = false;
-    GameEventPushArgsFn pushArgsFn = nullptr;
+    GameEventPushFn luaPushFn = nullptr;
     std::wstring owner;
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
         for (const auto& ev : g_gameEvents) {
             if (ev.name[0] && strcmp(ev.name, name) == 0) {
-                found = true;
-                pushArgsFn = ev.pushArgsFn;
+                luaPushFn = ev.luaPushFn;
                 owner = ev.ownerId;
                 break;
             }
         }
     }
-    if (!found) {
-        Logger::Log("TriggerGameEvent: \"%s\" not registered", name);
+    if (!luaPushFn) {
+        Logger::Log("TriggerGameEvent: \"%s\" not registered (or non-Lua path)", name);
         return false;
     }
-    return GameEventInvoke(name, pushArgsFn, owner, payload);
+    auto callbackGuard = TryEnterPluginCallback(owner);
+    if (!callbackGuard) {
+        Logger::Log("TriggerGameEvent: rejected for inactive owner=%ls name=%s",
+            owner.c_str(), name);
+        return false;
+    }
+    return GameEventInvokeLua(name, luaPushFn, payload);
 }
 
-// 注册 GameEvent：入口校验 → lifecycle 锁 → owner 校验 → 同名幂等 → 找空槽 → 填槽位。返回 true。
-// 纯登记：只记名字与参数打包回调，不挂任何信号环、无延迟队列。
-bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
+// 注册 Lua 路径事件：owner/幂等/空槽登记（触发时走 GameEventInvokeLua 内化路径）。
+bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
     if (!name || !*name) return false;
     const size_t nameLength = strlen(name);
     if (nameLength >= kGameEventNameMax) {
@@ -1416,21 +1449,16 @@ bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
     }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
 
-    // owner 校验：以 pushArgsFn 指针判归属（插件导出函数必在插件模块内）；
-    // pushArgsFn 为 null 时退用 name 指针；两者都无法定位归属（如栈上临时名字）时拒绝。
-    const void* ownerProbe = reinterpret_cast<const void*>(pushArgsFn);
+    const void* ownerProbe = reinterpret_cast<const void*>(pushFn);
     if (!ownerProbe) ownerProbe = name;
     auto owner = RequirePluginOwner(ownerProbe, "RegisterGameEvent");
     if (!owner) {
         Logger::Log("RegisterGameEvent: no plugin owner");
         return false;
     }
-
-    // 同名幂等：name[0] 非空且 strcmp 相等 → 已注册，直接成功（首次注册的 pushArgsFn 生效）
     for (const auto& ev : g_gameEvents) {
-        if (ev.name[0] && strcmp(ev.name, name) == 0) return true;
+        if (ev.name[0] && strcmp(ev.name, name) == 0) return true;   // 同名幂等
     }
-    // 找空槽：name[0] 为空 = 空槽
     RegisteredGameEvent* slot = nullptr;
     for (auto& ev : g_gameEvents) {
         if (!ev.name[0]) { slot = &ev; break; }
@@ -1439,14 +1467,11 @@ bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
         Logger::Log("RegisterGameEvent: no free slot (max %d)", kMaxRegisteredGameEvents);
         return false;
     }
-
-    // 填槽位：pushArgsFn / ownerId / name
-    slot->pushArgsFn = pushArgsFn;
+    slot->luaPushFn = pushFn;
     slot->ownerId = *owner;
     memcpy(slot->name, name, nameLength);
     slot->name[nameLength] = '\0';
-    Logger::Log("RegisterGameEvent: registered \"%s\" pushArgs=%p", name,
-        reinterpret_cast<void*>(pushArgsFn));
+    Logger::Log("GameEvent: registered Lua-event \"%s\" pushFn=%p", name, pushFn);
     return true;
 }
 
@@ -2398,6 +2423,10 @@ double LuaCheckNumberImpl(void* L, int index) {
     HKS_GUARD_RET(hks::checknumber, 0.0, L, index);
 }
 
+void LuaPushNilImpl(void* L) {
+    HKS_GUARD_VOID(hks::pushnil, reinterpret_cast<hks::lua_State*>(L));
+}
+
 void LuaSetFieldImpl(void* L, int stackOffset, const char* name) {
     if (!ValidateLuaCString(name, "LuaSetField")) return;
     HKS_GUARD_VOID(hks::setfield, L, stackOffset, name);
@@ -2926,6 +2955,10 @@ static HookAPI g_hookApi = {
 
     &AllocTypedVariantMapImpl,
     &FreeTypedVariantMapImpl,
+    &PushDataVariantMapImpl,
+    &GetEngineUtilityImpl,
+    &GetActiveLuaStateImpl,
+    &LuaPushNilImpl,
 };
 
 typedef void (*OnLoadFunc)(HookAPI*);
@@ -3206,7 +3239,7 @@ static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
 
     const size_t targetConfigsRemoved = g_pluginPushTargetConfigs.erase(owner);
 
-    // GameEvent 槽位：清空该 owner 注册的事件表（name/pushArgsFn/ownerId）。
+    // GameEvent 槽位：清空该 owner 注册的事件表（name/luaPushFn/ownerId）。
     // Quarantine/Unload 都经本函数，无需在各自路径重复接线。
     CleanupGameEventsForOwner(owner);
 
@@ -3653,7 +3686,7 @@ void LoaderCore::ResetForReload() {
     // 按代际清掉剩余的 GameCore 域插件钩（Global 插件的钩 + 各类漏网）。
     RemoveGameCoreGenerationHooks(teardownGeneration);
     // GameCore 重载后 Global 插件注册的 GameEvent 槽位跨代保留：Register/Trigger 与
-    // GameEventInvoke 每次实时解析 CallHook / scriptSystem（见 GetGameEventScriptSystem /
-    // GameEventResolve），无需在此重挂任何信号环。
+    // Lua 路径内化（GameEventInvokeLua）每次实时取活跃 state / scriptSystem（见
+    // GetGameEventScriptSystem / GetActiveLuaStateImpl），无需在此重挂任何信号环。
     Logger::Log("ResetForReload: teardown callbacks fired, GameCore plugins unloaded, shared hooks reset, generation hooks cleared");
 }
