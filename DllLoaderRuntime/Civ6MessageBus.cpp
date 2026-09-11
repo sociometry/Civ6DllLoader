@@ -58,25 +58,28 @@ void InvokeHandler(const Civ6MessageBus::MessageHandler& handler, const char* to
 
 }  // namespace
 
-void Civ6MessageBus::RegisterHandler(const std::string& name, MessageHandler handler,
-                                     const std::wstring& owner) {
+bool Civ6MessageBus::RegisterHandler(const std::string& name, MessageHandler handler,
+                                     const std::wstring& owner,
+                                     const std::function<bool()>& canRegister) {
     auto replacement = std::make_shared<HandlerEntry>();
     replacement->owner = owner;
     replacement->handler = std::move(handler);
     std::vector<HandlerPtr> replaced;
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        if (canRegister && !canRegister()) return false;
         const auto existing = handlers_.find(name);
         if (existing != handlers_.end()) {
             if (existing->second->owner != owner) {
                 Logger::Log("Message handler name conflict rejected: %s", name.c_str());
-                return;
+                return false;
             }
             replaced.push_back(existing->second);
         }
         handlers_[name] = std::move(replacement);
     }
     DisableAndDrain(replaced);
+    return true;
 }
 
 void Civ6MessageBus::UnregisterHandler(const std::string& name) {

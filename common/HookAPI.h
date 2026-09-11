@@ -5,8 +5,8 @@
 #include <stddef.h>
 
 // Plugin <-> Runtime HookAPI ABI generation.
-// Bump ONLY on breaking changes (reorder/remove/change existing fields or PushLuaMethods contract).
-// Appending new fields at the end must NOT bump this - old plugins rely on structSize.
+// This pre-release ABI is defined by the current field order; plugins must be rebuilt when it changes.
+// Keep the generation at 1 for the unpublished 1.0.0 line.
 #ifndef CIV6_HOOK_API_VERSION
 #define CIV6_HOOK_API_VERSION 1u
 #endif
@@ -202,22 +202,57 @@ enum {
     kHookApiPushWithManager = 1
 };
 
+typedef enum HookApiPushMethodsResult {
+    kHookApiPushMethodsFailed = 0,
+    kHookApiPushMethodsDeferred = 1,
+    kHookApiPushMethodsInstalled = 2
+} HookApiPushMethodsResult;
+
 typedef struct HookAPI {
     uint32_t apiVersion;   // CIV6_HOOK_API_VERSION (generation; not bumped for appends)
     uint32_t structSize;   // sizeof(HookAPI) of the *runtime*; plugins compare against their sizeof
 
     bool (*InstallHook)(void* targetFunc, void* detour, void** original);
     void (*BroadcastMessage)(const char* topic, const void* data, size_t len);
-    void (*RegisterMessageHandler)(const char* pluginName, MessageHandlerFn handler);
+    // handler 必须位于 Loader 跟踪的插件模块中，以其所属插件作为注册 owner。
+    // 地址固定为该插件的 DLL 文件名（去掉最后的扩展名，UTF-8、区分大小写），
+    // 不接受自定义地址；同插件重复注册替换旧回调。
+    // 空回调、未跟踪/已停用/已隔离的插件、保留名 "Loader" 或其它插件已占用的同名地址返回 false。
+    // OnLoad 返回后，导出的 OnMessage 在同一地址自动登记并替换显式回调。
+    // 预发布插件须用当前头文件重新编译。
+    bool (*RegisterMessageHandler)(MessageHandlerFn handler);
     void (*SendMessageTo)(const char* pluginName, const char* topic, const void* data, size_t len);
 
     bool (*IsImageLoaded)(HookImageId image);
     bool (*GetImageInfo)(HookImageId image, HookImageInfo* outInfo);
     void* (*ResolveByRva)(HookImageId image, uintptr_t rva, size_t span);
     void* (*ResolveByName)(HookImageId image, const char* name);
-    void* (*PushLuaMethods)(const char* name, const LuaMethodInfo* methods, uint32_t count);
+    // ---- Image resolution extensions ----
+    // 不修正 + 段限定：原始 RVA 直接解析（镜像相对或段相对），不走 pdata 矫正。
+    void* (*ResolveByRvaEx)(HookImageId image, uintptr_t rva, size_t span, HookImageSection section);
+    // AOB 特征搜索：pattern 形如 "48 8B ?? ?? 74 ?? E8"（?? 通配符），在指定段搜首个命中。
+    // 每字节两字符：?? 整字节通配，4? / ?F 分别固定高/低半字节；十六进制字母大小写均可。
+    // 字节间可用空格、Tab、逗号分隔或直接相连；格式错误或未命中返回 nullptr。
+    void* (*ResolveByPattern)(HookImageId image, const char* pattern, HookImageSection section);
+    // 注册全局变量捕获：hook providerFunction，运行时用机器码生成 stub 捕获其第 paramIndex 个
+    // 参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。同一 providerFunction
+    // 只 hook 一次，后续注册的 out 追加到列表，触发时统一赋值。返回 false = 注册失败（providerFunction 解析失败等）。
+    // out 槽须位于注册插件的模块内；卸载/隔离只移除该插件的槽，保留其它插件的共享订阅。
+    // 最后一个订阅移除后才摘钩；GameCore 重载会清除全部订阅，须在下一次 Ready 中重新注册。
+    bool (*RegisterGlobalCapture)(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out);
+    // 按 vtable 符号名（demangled/mangled）解析第 index 个虚函数槽位（0 起）：
+    // 定位 vtable 地址（版本一致恒等，跨版本走槽位结构匹配），读 [vtable + index*8] 的
+    // 槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。
+    void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
 
-    unsigned int (*GetCurTurn)(void);
+    // Failed：本次没有新增登记/方法，先前已接受的登记保留。
+    // Deferred：已接受登记，GameCore 就绪时自动尝试安装；Installed：本次已安装。
+    // 同 owner + target + exposedName 的相同定义重复调用幂等；同 target 的同名
+    // 不同定义（包括不同 owner）整批拒绝。函数和 internalName/exposedName 均须非空。
+    // 参数由 Loader 复制，登记保留到插件停用；Global 插件跨 GameCore 重载自动重装。
+    // 延迟安装失败会记日志并保留登记，可用相同参数重试。原 PushMethods 由 Loader
+    // 自动调用，本接口不再返回其 trampoline；预发布插件须按当前头文件重新编译。
+    HookApiPushMethodsResult (*PushLuaMethods)(const char* name, const LuaMethodInfo* methods, uint32_t count);
 
     void (*RegisterScriptGlobals)(ScriptGlobalsFn fn);
     void (*RegisterScriptGlobalsForUI)(ScriptGlobalsFn fn);
@@ -268,12 +303,14 @@ typedef struct HookAPI {
     void (*LuaPushBoolean)(void* L, bool value);
     void (*LuaPushLightUserData)(void* L, void* ptr);
 
-    void* (*LocalizationLookup)(void* outLocString, const char* key);
-
-    // ---- Append-only extensions (do not bump CIV6_HOOK_API_VERSION) ----
+    // ---- Utility and Lua convenience extensions ----
     void (*Log)(const char* format, ...);
     void (*LuaPushCFunctionField)(void* L, int tableIndex, const char* fieldName, void* fn, const char* internalName);
     void (*LuaNewGlobalTable)(void* L, const char* globalName, int narr, int nrec);
+
+    unsigned int (*GetCurTurn)(void);
+
+    void* (*LocalizationLookup)(void* outLocString, const char* key);
 
     uint32_t (*LocStringBytes)(void);
     void* (*LocCreate)(void);
@@ -287,6 +324,10 @@ typedef struct HookAPI {
     const char* (*GetCivilizationDescription)(void* player);
     uint32_t (*MakeHash)(const char* str);
 
+    // 注册插件自己的 PushMethods 目标配置。pushMethodsSymbol 为空时使用 name + "::PushMethods"；
+    // 非空时该完整符号名会同时用于首次解析和 GameCore 重载后的重装。
+    // 配置按调用插件 owner 隔离，不能覆盖 Loader 内置目标或其他插件配置；同 owner 重复配置
+    // 必须完全一致，已有该目标登记后也不能修改配置。name 指针必须来自调用插件模块。
     int (*RegisterPushMethodsTarget)(const char* name, int sigType, const char* pushMethodsSymbol);
 
     // v2: 原始字节补丁（单层存档，见 patch registry）。由运行时在初始化时填表。
@@ -310,25 +351,8 @@ typedef struct HookAPI {
     void (*RegisterGameCoreReady)(GameCoreReadyFn fn, void* context);
     void (*RegisterGameCoreTeardown)(GameCoreTeardownFn fn, void* context);
 
-    // ---- Append-only extensions (do not bump CIV6_HOOK_API_VERSION) ----
-    // 不修正 + 段限定：原始 RVA 直接解析（镜像相对或段相对），不走 pdata 矫正。
-    void* (*ResolveByRvaEx)(HookImageId image, uintptr_t rva, size_t span, HookImageSection section);
-    // AOB 特征搜索：pattern 形如 "48 8B ?? ?? 74 ?? E8"（?? 通配符），在指定段搜首个命中。
-    // 每字节两字符：?? 整字节通配，4? / ?F 分别固定高/低半字节；十六进制字母大小写均可。
-    // 字节间可用空格、Tab、逗号分隔或直接相连；格式错误或未命中返回 nullptr。
-    void* (*ResolveByPattern)(HookImageId image, const char* pattern, HookImageSection section);
-    // 注册全局变量捕获：hook providerFunction，运行时用机器码生成 stub 捕获其第 paramIndex 个
-    // 参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。同一 providerFunction
-    // 只 hook 一次，后续注册的 out 追加到列表，触发时统一赋值。返回 false = 注册失败（providerFunction 解析失败等）。
-    // out 槽须位于注册插件的模块内；卸载/隔离只移除该插件的槽，保留其它插件的共享订阅。
-    // 最后一个订阅移除后才摘钩；GameCore 重载会清除全部订阅，须在下一次 Ready 中重新注册。
-    bool (*RegisterGlobalCapture)(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out);
-    // 按 vtable 符号名（demangled/mangled）解析第 index 个虚函数槽位（0 起）：
-    // 定位 vtable 地址（版本一致恒等，跨版本走槽位结构匹配），读 [vtable + index*8] 的
-    // 槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。
-    void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
-
-    // GameEvents：纯登记 + 插件端手动触发。name 为 GameEvent 名（如 "MyCustomEvent"）。
+    // GameEvents：纯登记 + 插件端手动触发。name 为 GameEvent 名（如 "MyCustomEvent"），
+    // 最长 95 个字节（不含结尾 NUL）；超长名称直接返回 false，不会截断或占用槽位。
     // RegisterGameEvent：只登记名字与参数打包回调（owner 生命周期保留），不挂任何信号环、无自动广播。
     //   pushArgsFn 可为 null = 无参事件；非 null 时在每次 TriggerGameEvent 触发时被调：
     //   pushArgsFn(args, payload) —— args 用 ScriptSystemArgs 包装后 Push 参数（见 C++ 区）。
@@ -336,6 +360,8 @@ typedef struct HookAPI {
     bool (*RegisterGameEvent)(const char* name, GameEventPushArgsFn pushArgsFn);
     // TriggerGameEvent：手动触发一次（必须先注册——回查注册记录拿 pushArgsFn，未注册返回 false），
     //   payload 传给注册时的 pushArgsFn（payload 同步解析，仅在本调用期间有效；pushArgsFn 为 null = 无参触发）。
+    //   pushArgsFn、引擎 CreateArgs/CallHook/DestroyArgs 的 SEH/C++ 异常由 Loader 截获并返回 false；
+    //   args 创建成功后 Loader 总会尝试 DestroyArgs。回调异常时不要继续使用 args。
     //   必须在游戏线程调用——Lua 状态非线程安全。
     bool (*TriggerGameEvent)(const char* name, const void* payload);
 
@@ -347,9 +373,8 @@ typedef struct HookAPI {
     void  (*FreeTypedVariantMap)(void* engineObj);
 } HookAPI;
 
-// True if this runtime can serve a plugin built against the current header.
-// - apiVersion must match the ABI generation (breaking-change counter).
-// - structSize must be at least this plugin's sizeof(HookAPI) (runtime may be newer/larger).
+// True if this runtime can serve a plugin built against the current pre-release header.
+// Plugins must be rebuilt after a field reorder; apiVersion remains 1 for the unpublished line.
 static inline int HookAPI_IsCompatible(const HookAPI* api) {
     if (!api) return 0;
     if (api->apiVersion != CIV6_HOOK_API_VERSION) return 0;

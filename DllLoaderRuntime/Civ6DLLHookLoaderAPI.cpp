@@ -63,6 +63,83 @@ static vector<PluginEntry> g_plugins;
 // PatchRegistry 的 CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
 static std::recursive_mutex g_pluginLifecycleMutex;
 
+// 脚本全局 / GameEvent 的插件回调在快照锁外执行。按 owner 记录在途调用，
+// 卸载先将插件切到 Deactivating/Quarantined，再等待计数归零，避免 OnUnload
+// 释放插件状态后仍有旧快照进入插件代码。
+struct PluginCallbackState {
+    std::atomic<uint32_t> activeCalls{ 0 };
+    std::mutex drainMutex;
+    std::condition_variable drainCv;
+};
+static std::unordered_map<std::wstring, std::shared_ptr<PluginCallbackState>>
+    g_pluginCallbackStates;
+
+class PluginCallbackGuard {
+public:
+    PluginCallbackGuard() = default;
+    explicit PluginCallbackGuard(std::shared_ptr<PluginCallbackState> state)
+        : state_(std::move(state)) {}
+    PluginCallbackGuard(const PluginCallbackGuard&) = delete;
+    PluginCallbackGuard& operator=(const PluginCallbackGuard&) = delete;
+    PluginCallbackGuard(PluginCallbackGuard&& other) noexcept
+        : state_(std::move(other.state_)) {}
+    PluginCallbackGuard& operator=(PluginCallbackGuard&& other) noexcept {
+        if (this != &other) {
+            Release();
+            state_ = std::move(other.state_);
+        }
+        return *this;
+    }
+    ~PluginCallbackGuard() { Release(); }
+
+    explicit operator bool() const { return state_ != nullptr; }
+
+private:
+    void Release() {
+        if (!state_) return;
+        if (state_->activeCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            lock_guard<mutex> lock(state_->drainMutex);
+            state_->drainCv.notify_all();
+        }
+        state_.reset();
+    }
+
+    std::shared_ptr<PluginCallbackState> state_;
+};
+
+static PluginCallbackGuard TryEnterPluginCallback(const std::wstring& owner) {
+    if (owner.empty()) return {};
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
+        [&owner](const PluginEntry& entry) {
+            return entry.ownerId == owner &&
+                (entry.state == PluginState::Loading ||
+                 entry.state == PluginState::Active);
+        });
+    if (plugin == g_plugins.end()) return {};
+
+    auto& state = g_pluginCallbackStates[owner];
+    if (!state) state = std::make_shared<PluginCallbackState>();
+    state->activeCalls.fetch_add(1, std::memory_order_acq_rel);
+    // 表项必须继续持有计数状态；守卫只复制 shared_ptr，不能把表项移空。
+    return PluginCallbackGuard(state);
+}
+
+static void WaitForPluginCallbacks(const std::wstring& owner) {
+    if (owner.empty()) return;
+    std::shared_ptr<PluginCallbackState> state;
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        const auto it = g_pluginCallbackStates.find(owner);
+        if (it == g_pluginCallbackStates.end()) return;
+        state = it->second;
+    }
+    unique_lock<mutex> drainLock(state->drainMutex);
+    state->drainCv.wait(drainLock, [&state] {
+        return state->activeCalls.load(std::memory_order_acquire) == 0;
+    });
+}
+
 // OnLoad/OnUnload 的快速 owner 上下文。异步调用不依赖它，而由回调/调用方地址反查
 // 所属插件模块，避免错误归为 Loader 导致插件停用后钩子仍生效。
 static thread_local std::wstring g_activePluginOwner;
@@ -118,16 +195,28 @@ static LoaderCore::PluginCategory CategoryForPath(const std::wstring& path) {
 static uintptr_t g_gameCoreTeardownAddress;
 static uint32_t g_gameCoreTeardownSizeOfImage;
 
-static unordered_map<string, PushMethodSigType> g_MethodSignatureTable = {
-    {"GameCore::Cache::Lua::IQuestsManager", PushMethodSigType::WithManager},
-    {"GameCore::Lua::IQuestsManager", PushMethodSigType::NoManager},
+struct PushTargetConfig {
+    PushMethodSigType signature = PushMethodSigType::NoManager;
+    std::string symbolName;
 };
+
+// Loader 内置目标只读；插件自定义目标保存在自己的 owner 命名空间，
+// 防止一个插件覆盖另一个插件的签名或符号。
+static const unordered_map<string, PushTargetConfig> g_defaultPushTargetConfigs = {
+    {"GameCore::Cache::Lua::IQuestsManager",
+        { PushMethodSigType::WithManager, "GameCore::Cache::Lua::IQuestsManager::PushMethods" }},
+    {"GameCore::Lua::IQuestsManager",
+        { PushMethodSigType::NoManager, "GameCore::Lua::IQuestsManager::PushMethods" }},
+};
+static unordered_map<std::wstring, unordered_map<string, PushTargetConfig>>
+    g_pluginPushTargetConfigs;
 
 struct PushRegistration {
     std::string targetName;
     PushMethodSigType signature = PushMethodSigType::NoManager;
     std::vector<StoredLuaMethod> methods;
     std::wstring owner;
+    std::string symbolName;
 };
 static std::vector<PushRegistration> g_pushRegistrations;
 
@@ -296,12 +385,52 @@ void BroadcastMessageImpl(const char* topic, const void* data, size_t len) {
     g_bus.Broadcast(topic, data, len);
 }
 
-void RegisterMessageHandlerImpl(const char* pluginName, MessageHandlerFn handler) {
-    if (!pluginName || !*pluginName || !handler) return;
-    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(handler),
-                                    "RegisterMessageHandler");
-    if (!owner) return;
-    g_bus.RegisterHandler(pluginName, handler, *owner);
+// 显式注册与 OnMessage 自动注册共用：消息地址只能来自 Loader 跟踪的插件名。
+// 调用时不得持 lifecycle 锁；替换旧回调可能等待正在使用 HookAPI 的其它线程。
+static bool RegisterPluginMessageHandler(const std::wstring& owner, MessageHandlerFn handler) {
+    if (!handler) return false;
+    std::string handlerName;
+    {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
+            [&owner](const PluginEntry& entry) { return entry.ownerId == owner; });
+        if (plugin == g_plugins.end() ||
+            (plugin->state != PluginState::Loading && plugin->state != PluginState::Active)) {
+            Logger::Log("RegisterMessageHandler rejected: plugin is not loading/active");
+            return false;
+        }
+        const auto callbackOwner = ResolvePluginOwnerForAddress(reinterpret_cast<const void*>(handler));
+        if (!callbackOwner || *callbackOwner != owner) {
+            Logger::Log("RegisterMessageHandler rejected: callback does not belong to plugin");
+            return false;
+        }
+        handlerName = ModScan::WideToNarrow(plugin->name);
+        if (handlerName.empty() || handlerName == "Loader") {
+            Logger::Log("RegisterMessageHandler rejected: empty or reserved plugin name");
+            return false;
+        }
+    }
+    // 总线锁 -> lifecycle 锁。若停用先发生则拒绝；若发布先发生，随后的
+    // UnregisterOwner 必然能清除此登记，避免校验后停用又把 handler 注册回来。
+    return g_bus.RegisterHandler(handlerName, handler, owner, [&owner] {
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        const bool active = std::any_of(g_plugins.begin(), g_plugins.end(),
+            [&owner](const PluginEntry& entry) {
+                return entry.ownerId == owner &&
+                    (entry.state == PluginState::Loading || entry.state == PluginState::Active);
+            });
+        if (!active) Logger::Log("RegisterMessageHandler rejected: plugin stopped before registration");
+        return active;
+    });
+}
+
+bool RegisterMessageHandlerImpl(MessageHandlerFn handler) {
+    if (!handler) return false;
+    // 与其它回调 API 一样按 handler 所属模块确定 owner；返回地址会因尾调用
+    // 优化落在 Loader/引擎内，不能用来可靠识别插件。
+    const auto owner = RequirePluginOwner(reinterpret_cast<const void*>(handler),
+        "RegisterMessageHandler");
+    return owner && RegisterPluginMessageHandler(*owner, handler);
 }
 
 void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len) {
@@ -1084,11 +1213,138 @@ static void* GetGameEventScriptSystem() {
 // 官方所有 CallHook 调用点一律传 CreateArgs 创建的真实 args 对象（无 null 先例），
 // exe 侧 vftable[96] 会解引用 args 读参数——传 nullptr 必崩。
 // 统一调用路径：CreateArgs → [pushArgsFn(args, payload) 插件塞参数] → CallHook → DestroyArgs。
-// pushArgsFn 为空 = 无参事件（空 args 对象）。插件回调崩溃由外层 SEH 兜底（args 可能泄漏，可接受）。
+// pushArgsFn 为空 = 无参事件（空 args 对象）。每个跨模块调用都单独捕获 SEH/C++ 异常，
+// 且只要 args 创建成功，就在离开调用路径前尝试 DestroyArgs。
+static __declspec(noinline) void* GameEventCreateArgsSeh(
+        void* scriptSystem, GameEventCreateArgsFn createArgs) {
+    __try {
+        return createArgs(scriptSystem);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+static void* GameEventCreateArgsSafe(void* scriptSystem,
+                                     GameEventCreateArgsFn createArgs) noexcept {
+    if (!scriptSystem || !createArgs) return nullptr;
+    try {
+        return GameEventCreateArgsSeh(scriptSystem, createArgs);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static __declspec(noinline) bool GameEventPushArgsSeh(
+        GameEventPushArgsFn pushArgsFn, ScriptSystemArgs* args, const void* payload) {
+    __try {
+        pushArgsFn(args, payload);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool GameEventPushArgsSafe(GameEventPushArgsFn pushArgsFn,
+                                   ScriptSystemArgs* args, const void* payload) noexcept {
+    if (!pushArgsFn || !args) return true;
+    try {
+        return GameEventPushArgsSeh(pushArgsFn, args, payload);
+    } catch (...) {
+        return false;
+    }
+}
+
+static __declspec(noinline) bool GameEventCallHookSeh(
+        GameEventCallHookFn callHook, void* scriptSystem, const char* name,
+        void* args, bool* flag) {
+    __try {
+        return callHook(scriptSystem, name, args, flag) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool GameEventCallHookSafe(GameEventCallHookFn callHook, void* scriptSystem,
+                                  const char* name, void* args, bool* flag) noexcept {
+    if (!callHook || !scriptSystem || !name || !args || !flag) return false;
+    try {
+        return GameEventCallHookSeh(callHook, scriptSystem, name, args, flag);
+    } catch (...) {
+        return false;
+    }
+}
+
+static __declspec(noinline) bool GameEventDestroyArgsSeh(
+        void* scriptSystem, GameEventDestroyArgsFn destroyArgs, void* args) {
+    __try {
+        destroyArgs(scriptSystem, args);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool GameEventDestroyArgsSafe(void* scriptSystem,
+                                     GameEventDestroyArgsFn destroyArgs,
+                                     void* args) noexcept {
+    if (!scriptSystem || !destroyArgs || !args) return false;
+    try {
+        return GameEventDestroyArgsSeh(scriptSystem, destroyArgs, args);
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool GameEventInvokeSeh(const char* name, GameEventPushArgsFn pushArgsFn,
+                               const void* payload, void* scriptSystem,
+                               GameEventCallHookFn callHook) {
+    bool ok = false;
+    void* argsRaw = nullptr;
+    GameEventDestroyArgsFn destroyArgs = nullptr;
+    bool argsCreated = false;
+    __try {
+        void** vt = *reinterpret_cast<void***>(scriptSystem);
+        auto createArgs = reinterpret_cast<GameEventCreateArgsFn>(vt[kScriptSystemVtCreateArgs]);
+        destroyArgs = reinterpret_cast<GameEventDestroyArgsFn>(vt[kScriptSystemVtDestroyArgs]);
+        ScriptSystemArgs* args = static_cast<ScriptSystemArgs*>(
+            GameEventCreateArgsSafe(scriptSystem, createArgs));
+        bool flag = false;
+        if (args) {
+            argsCreated = true;
+            // ScriptSystemArgs 是指针直通包装；先记录创建返回值，
+            // 即使后续读取包装对象失败，也仍能尝试交给 DestroyArgs。
+            argsRaw = args;
+            argsRaw = args->raw();
+            if (GameEventPushArgsSafe(pushArgsFn, args, payload)) {
+                ok = GameEventCallHookSafe(callHook, scriptSystem, name,
+                                            argsRaw, &flag);
+            } else {
+                Logger::Log("GameEvent: pushArgs callback failed name=%s", name);
+            }
+        } else {
+            Logger::Log("GameEvent: Invoke createArgs-failed name=%s ss=%p", name, scriptSystem);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("GameEvent: Invoke exception name=%s", name);
+        ok = false;
+    }
+    if (argsCreated && !GameEventDestroyArgsSafe(scriptSystem, destroyArgs, argsRaw)) {
+        Logger::Log("GameEvent: DestroyArgs failed name=%s", name);
+        ok = false;
+    }
+    return ok;
+}
+
 static bool GameEventInvoke(const char* name, GameEventPushArgsFn pushArgsFn,
-                            const void* payload) {
+                            const std::wstring& owner, const void* payload) {
     if (!name || !*name) {
         Logger::Log("GameEvent: Invoke bad-name");
+        return false;
+    }
+    auto callbackGuard = TryEnterPluginCallback(owner);
+    if (!callbackGuard) {
+        Logger::Log("GameEvent: Invoke rejected for inactive owner=%ls name=%s",
+            owner.c_str(), name);
         return false;
     }
     void* scriptSystem = GetGameEventScriptSystem();  // 每次实时读，跨 GameCore 代安全
@@ -1102,28 +1358,7 @@ static bool GameEventInvoke(const char* name, GameEventPushArgsFn pushArgsFn,
         Logger::Log("GameEvent: Invoke bad-callHook name=%s", name);
         return false;
     }
-    bool ok = false;
-    __try {
-        void** vt = *reinterpret_cast<void***>(scriptSystem);
-        auto createArgs = reinterpret_cast<GameEventCreateArgsFn>(vt[kScriptSystemVtCreateArgs]);
-        auto destroyArgs = reinterpret_cast<GameEventDestroyArgsFn>(vt[kScriptSystemVtDestroyArgs]);
-        ScriptSystemArgs* args = static_cast<ScriptSystemArgs*>(createArgs(scriptSystem));
-        bool flag = false;
-        if (args) {
-            if (pushArgsFn) {
-                pushArgsFn(args, payload);   // 插件把 payload 塞进 args
-            }
-            ok = reinterpret_cast<GameEventCallHookFn>(callHook)(
-                     scriptSystem, name, args->raw(), &flag) != 0;
-        } else {
-            Logger::Log("GameEvent: Invoke createArgs-failed name=%s ss=%p", name, scriptSystem);
-        }
-        destroyArgs(scriptSystem, args->raw());
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::Log("GameEvent: Invoke exception name=%s", name);
-        ok = false;
-    }
-    return ok;
+    return GameEventInvokeSeh(name, pushArgsFn, payload, scriptSystem, callHook);
 }
 
 // 插件卸载/隔离时清理其注册的 GameEvent：清槽位（name[0]='\0' + 字段清空 + ownerId.clear）。
@@ -1150,12 +1385,14 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
     // 找注册记录：区分“未注册”（false）与“已注册但 pushArgsFn 为 null”（无参事件，合法）。
     bool found = false;
     GameEventPushArgsFn pushArgsFn = nullptr;
+    std::wstring owner;
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
         for (const auto& ev : g_gameEvents) {
             if (ev.name[0] && strcmp(ev.name, name) == 0) {
                 found = true;
                 pushArgsFn = ev.pushArgsFn;
+                owner = ev.ownerId;
                 break;
             }
         }
@@ -1164,13 +1401,19 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
         Logger::Log("TriggerGameEvent: \"%s\" not registered", name);
         return false;
     }
-    return GameEventInvoke(name, pushArgsFn, payload);
+    return GameEventInvoke(name, pushArgsFn, owner, payload);
 }
 
 // 注册 GameEvent：入口校验 → lifecycle 锁 → owner 校验 → 同名幂等 → 找空槽 → 填槽位。返回 true。
 // 纯登记：只记名字与参数打包回调，不挂任何信号环、无延迟队列。
 bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
     if (!name || !*name) return false;
+    const size_t nameLength = strlen(name);
+    if (nameLength >= kGameEventNameMax) {
+        Logger::Log("RegisterGameEvent: name too long (%zu bytes, max %zu)",
+            nameLength, kGameEventNameMax - 1);
+        return false;
+    }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
 
     // owner 校验：以 pushArgsFn 指针判归属（插件导出函数必在插件模块内）；
@@ -1200,13 +1443,8 @@ bool RegisterGameEventImpl(const char* name, GameEventPushArgsFn pushArgsFn) {
     // 填槽位：pushArgsFn / ownerId / name
     slot->pushArgsFn = pushArgsFn;
     slot->ownerId = *owner;
-    {
-        const size_t len = strlen(name);
-        const size_t cap = kGameEventNameMax - 1;
-        const size_t copyLen = len < cap ? len : cap;
-        memcpy(slot->name, name, copyLen);
-        slot->name[copyLen] = '\0';
-    }
+    memcpy(slot->name, name, nameLength);
+    slot->name[nameLength] = '\0';
     Logger::Log("RegisterGameEvent: registered \"%s\" pushArgs=%p", name,
         reinterpret_cast<void*>(pushArgsFn));
     return true;
@@ -1280,73 +1518,128 @@ void* ResolveCurrentGameCoreByName(const char* name) {
 using PushMethodsNoFunc = void(__fastcall*)(hks::lua_State* L, int stackOffset);
 using PushMethodsWithFunc = void(__fastcall*)(void*, hks::lua_State* L, int stackOffset);
 
-static vector<StoredLuaMethod> CopyLuaMethods(const LuaMethodInfo* methods, uint32_t count) {
-    vector<StoredLuaMethod> out;
-    if (!methods || count == 0) return out;
-    out.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        StoredLuaMethod m;
-        m.luaMethodFunc = methods[i].luaMethodFunc;
-        m.internalName = methods[i].internalName ? methods[i].internalName : "";
-        m.exposedName = methods[i].exposedName ? methods[i].exposedName : "";
-        out.push_back(std::move(m));
-    }
-    return out;
+static bool SameLuaMethod(const StoredLuaMethod& a, const StoredLuaMethod& b) {
+    return a.owner == b.owner && a.luaMethodFunc == b.luaMethodFunc &&
+        a.internalName == b.internalName && a.exposedName == b.exposedName;
 }
 
-void* PushLuaMethodsImpl(const char* name, const LuaMethodInfo* methods, uint32_t count) {
-    if (!name || !*name || !methods || count == 0) return nullptr;
+// 对候选副本合并；调用方成功后才 swap 到正式表，冲突不会留下半批方法。
+static bool MergeLuaMethod(vector<StoredLuaMethod>& candidate, const StoredLuaMethod& method) {
+    if (!method.luaMethodFunc || method.internalName.empty() ||
+            method.exposedName.empty() || method.owner.empty()) return false;
+    const auto existing = std::find_if(candidate.begin(), candidate.end(),
+        [&method](const StoredLuaMethod& item) {
+            return item.exposedName == method.exposedName;
+        });
+    if (existing != candidate.end()) return SameLuaMethod(*existing, method);
+    candidate.push_back(method);
+    return true;
+}
+
+static bool MergeLuaMethods(vector<StoredLuaMethod>& candidate,
+                             const vector<StoredLuaMethod>& methods) {
+    for (const auto& method : methods) {
+        if (!MergeLuaMethod(candidate, method)) return false;
+    }
+    return true;
+}
+
+HookApiPushMethodsResult PushLuaMethodsImpl(
+        const char* name, const LuaMethodInfo* methods, uint32_t count) {
+    if (!name || !*name || !methods || count == 0) return kHookApiPushMethodsFailed;
+    // owner 校验、候选合并和安装提交共用生命周期锁，停用不能插入中间。
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     auto owner = RequirePluginOwner(
         reinterpret_cast<const void*>(methods[0].luaMethodFunc), "PushLuaMethods");
-    if (!owner) return nullptr;
+    if (!owner) return kHookApiPushMethodsFailed;
+    const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
+        [&owner](const PluginEntry& entry) {
+            return entry.ownerId == *owner &&
+                (entry.state == PluginState::Loading || entry.state == PluginState::Active);
+        });
+    if (plugin == g_plugins.end()) return kHookApiPushMethodsFailed;
+
+    const std::string targetName(name);
+    PushTargetConfig config;
+    const auto ownerConfigs = g_pluginPushTargetConfigs.find(*owner);
+    if (ownerConfigs != g_pluginPushTargetConfigs.end()) {
+        const auto configured = ownerConfigs->second.find(targetName);
+        if (configured != ownerConfigs->second.end()) config = configured->second;
+    }
+    if (config.symbolName.empty()) {
+        const auto builtIn = g_defaultPushTargetConfigs.find(targetName);
+        if (builtIn != g_defaultPushTargetConfigs.end()) config = builtIn->second;
+    }
+    if (config.symbolName.empty()) {
+        Logger::Log("PushLuaMethods: unknown target %s", name);
+        return kHookApiPushMethodsFailed;
+    }
+
+    // 每个 owner/target 仅有一份登记；请求可以是重复、重排或部分重叠的批次。
+    size_t registrationIndex = g_pushRegistrations.size();
+    PushRegistration candidate{ targetName, config.signature, {}, *owner, config.symbolName };
+    for (size_t i = 0; i < g_pushRegistrations.size(); ++i) {
+        const auto& registration = g_pushRegistrations[i];
+        if (registration.owner == *owner && registration.targetName == targetName) {
+            if (registration.signature != candidate.signature ||
+                    registration.symbolName != candidate.symbolName) {
+                return kHookApiPushMethodsFailed;
+            }
+            candidate = registration;
+            registrationIndex = i;
+            break;
+        }
+    }
     for (uint32_t i = 0; i < count; ++i) {
         auto methodOwner = RequirePluginOwner(
             reinterpret_cast<const void*>(methods[i].luaMethodFunc), "PushLuaMethods");
-        if (!methodOwner || *methodOwner != *owner) {
-            Logger::Log("PushLuaMethods rejected: mixed or unowned callback modules");
-            return nullptr;
+        if (!methodOwner || *methodOwner != *owner || !methods[i].internalName ||
+                !methods[i].exposedName || !MergeLuaMethod(candidate.methods, StoredLuaMethod{
+                    methods[i].luaMethodFunc, methods[i].internalName, methods[i].exposedName, *owner })) {
+            Logger::Log("PushLuaMethods rejected: invalid or conflicting method for %s", name);
+            return kHookApiPushMethodsFailed;
+        }
+    }
+    // 同一个 Lua 表的字段不允许被另一个 owner 的登记隐式覆盖，延迟阶段也校验。
+    for (const auto& registration : g_pushRegistrations) {
+        if (registration.targetName != targetName || registration.owner == *owner) continue;
+        for (const auto& method : candidate.methods) {
+            if (std::any_of(registration.methods.begin(), registration.methods.end(),
+                    [&method](const StoredLuaMethod& existing) {
+                        return existing.exposedName == method.exposedName;
+                    })) {
+                Logger::Log("PushLuaMethods rejected: field %s of %s belongs to another owner",
+                    method.exposedName.c_str(), name);
+                return kHookApiPushMethodsFailed;
+            }
         }
     }
 
-    // M2: g_MethodSignatureTable 与 RegisterPushMethodsTargetImpl 的写入跨线程共享，
-    // 读写都在生命周期锁内（后面 InstallPushMethods* 递归重入）。
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    const std::string targetName(name);
-    auto sigIt = g_MethodSignatureTable.find(targetName);
-    if (sigIt == g_MethodSignatureTable.end()) {
-        Logger::Log("PushLuaMethods: unknown target %s", name);
-        return nullptr;
-    }
-    auto stored = CopyLuaMethods(methods, count);
-    for (auto& method : stored) method.owner = *owner;
-    g_pushRegistrations.push_back(
-        PushRegistration{ targetName, sigIt->second, stored, *owner });
-
-    if (!g_gameCorePhaseReady) {
-        Logger::Log("PushLuaMethods: deferred until GameCore phase is ready: %s",
-                    targetName.c_str());
-        return nullptr;
-    }
-
-    std::string symbolName = targetName + "::PushMethods";
-    if (sigIt->second == PushMethodSigType::NoManager) {
-        auto target = reinterpret_cast<PushMethodsNoFunc>(
-            ResolveCurrentGameCoreByName(symbolName.c_str()));
+    // 安装前完成登记容器分配；成功后的发布只移动/交换已构造的数据。
+    const bool isNew = registrationIndex == g_pushRegistrations.size();
+    if (isNew) g_pushRegistrations.reserve(g_pushRegistrations.size() + 1);
+    if (g_gameCorePhaseReady) {
+        const std::string& symbolName = candidate.symbolName;
+        void* target = ResolveCurrentGameCoreByName(symbolName.c_str());
         if (!target) {
-            Logger::Log("PushLuaMethods: deferred until GameCore is ready: %s",
-                        symbolName.c_str());
-            return nullptr;
+            Logger::Log("PushLuaMethods: resolve failed: %s", symbolName.c_str());
+            return kHookApiPushMethodsFailed;
         }
-        return InstallPushMethodsNoManager(target, stored, *owner);
+        void* base = candidate.signature == PushMethodSigType::NoManager
+            ? InstallPushMethodsNoManager(target, candidate.methods, *owner)
+            : InstallPushMethodsWithManager(target, candidate.methods, *owner);
+        if (!base) {
+            Logger::Log("PushLuaMethods: install failed: %s", symbolName.c_str());
+            return kHookApiPushMethodsFailed;
+        }
     }
-    auto target = reinterpret_cast<PushMethodsWithFunc>(
-        ResolveCurrentGameCoreByName(symbolName.c_str()));
-    if (!target) {
-        Logger::Log("PushLuaMethods: deferred until GameCore is ready: %s",
-                    symbolName.c_str());
-        return nullptr;
+
+    if (isNew) {
+        g_pushRegistrations.push_back(std::move(candidate));
+    } else {
+        g_pushRegistrations[registrationIndex].methods.swap(candidate.methods);
     }
-    return InstallPushMethodsWithManager(target, stored, *owner);
+    return g_gameCorePhaseReady ? kHookApiPushMethodsInstalled : kHookApiPushMethodsDeferred;
 }
 
 // 版本锁定偏移：当前回合 dword 位于 CurrentTurnStorage 解引用对象 +0xC0。
@@ -1411,7 +1704,13 @@ void __cdecl Hook_RegisterScriptData(hks::lua_State* L) {
     size_t i = 0;
     for (const auto& entry : snapshot) {
         Logger::Log("RegisterScriptData: registrar[%zu] begin", i);
-        CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
+        auto callbackGuard = TryEnterPluginCallback(entry.owner);
+        if (callbackGuard) {
+            CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
+        } else {
+            Logger::Log("RegisterScriptData: registrar[%zu] skipped for inactive owner=%ls",
+                i, entry.owner.c_str());
+        }
         Logger::Log("RegisterScriptData: registrar[%zu] end", i);
         ++i;
     }
@@ -1428,7 +1727,10 @@ void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State
     SharedDetourActivity activity;
     const auto snapshot = SnapshotScriptGlobals(g_scriptGlobalsUI);
     for (const auto& entry : snapshot) {
-        CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
+        auto callbackGuard = TryEnterPluginCallback(entry.owner);
+        if (callbackGuard) {
+            CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
+        }
     }
     if (g_origRegisterScriptDataForUI) {
         g_origRegisterScriptDataForUI(unused, L);
@@ -1899,7 +2201,7 @@ static bool RecoverStalePushHookLocked(void* target, MH_STATUS status) {
 
 void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods,
                                   const std::wstring& owner) {
-    if (owner.empty() || std::any_of(methods.begin(), methods.end(),
+    if (!target || methods.empty() || owner.empty() || std::any_of(methods.begin(), methods.end(),
             [&owner](const StoredLuaMethod& method) {
                 return method.owner != owner;
             })) {
@@ -1915,9 +2217,14 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
     }
 
     auto& state = g_noManagerSlots[slot];
+    auto merged = state.methods;
+    if (!MergeLuaMethods(merged, methods)) {
+        if (!state.base) state = NoManagerHookSlot{};
+        return nullptr;
+    }
     if (state.base) {
-        // 已 hook 同一 target：只追加方法，返回既有 trampoline。
-        state.methods.insert(state.methods.end(), methods.begin(), methods.end());
+        // 相同方法重复安装/重放不会重复注入；整批验证成功后才发布。
+        state.methods.swap(merged);
         return reinterpret_cast<void*>(state.base);
     }
 
@@ -1942,13 +2249,13 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
     g_hookRecords[target] = HookRecord{
         L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
     };
-    state.methods.insert(state.methods.end(), methods.begin(), methods.end());
+    state.methods.swap(merged);
     return reinterpret_cast<void*>(state.base);
 }
 
 void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMethod>& methods,
                                     const std::wstring& owner) {
-    if (owner.empty() || std::any_of(methods.begin(), methods.end(),
+    if (!target || methods.empty() || owner.empty() || std::any_of(methods.begin(), methods.end(),
             [&owner](const StoredLuaMethod& method) {
                 return method.owner != owner;
             })) {
@@ -1964,8 +2271,13 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
     }
 
     auto& state = g_withManagerSlots[slot];
+    auto merged = state.methods;
+    if (!MergeLuaMethods(merged, methods)) {
+        if (!state.base) state = WithManagerHookSlot{};
+        return nullptr;
+    }
     if (state.base) {
-        state.methods.insert(state.methods.end(), methods.begin(), methods.end());
+        state.methods.swap(merged);
         return reinterpret_cast<void*>(state.base);
     }
 
@@ -1988,15 +2300,22 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
     g_hookRecords[target] = HookRecord{
         L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
     };
-    state.methods.insert(state.methods.end(), methods.begin(), methods.end());
+    state.methods.swap(merged);
     return reinterpret_cast<void*>(state.base);
 }
 
 static void ReinstallPushRegistrations() {
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    if (!g_gameCorePhaseReady) return;
     size_t installed = 0;
     for (const auto& registration : g_pushRegistrations) {
-        const std::string symbolName = registration.targetName + "::PushMethods";
+        const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
+            [&registration](const PluginEntry& entry) {
+                return entry.ownerId == registration.owner &&
+                    (entry.state == PluginState::Loading || entry.state == PluginState::Active);
+            });
+        if (plugin == g_plugins.end()) continue;
+        const std::string& symbolName = registration.symbolName;
         void* target = ResolveCurrentGameCoreByName(symbolName.c_str());
         if (!target) {
             Logger::Log("ReinstallPushRegistrations: missing %s",
@@ -2008,7 +2327,12 @@ static void ReinstallPushRegistrations() {
                                           registration.owner)
             : InstallPushMethodsWithManager(target, registration.methods,
                                             registration.owner);
-        if (base) ++installed;
+        if (base) {
+            ++installed;
+        } else {
+            Logger::Log("ReinstallPushRegistrations: install failed, registration retained: %s owner=%ls",
+                symbolName.c_str(), registration.owner.c_str());
+        }
     }
     Logger::Log("ReinstallPushRegistrations: installed=%zu registered=%zu",
                 installed, g_pushRegistrations.size());
@@ -2025,106 +2349,148 @@ static void WarnHksImportMissing(const char* name) {
     }
 }
 
-// 有返回值包装：导入缺失 → 限次日志 + fallback。
-#define HKS_GUARD_RET(fnPtr, fallback, ...) \
+static bool ValidateLuaState(void* L, const char* apiName) {
+    if (L) return true;
+    Logger::Log("%s rejected: lua_State is null", apiName ? apiName : "Lua API");
+    return false;
+}
+
+static bool ValidateLuaCString(const char* value, const char* apiName) {
+    if (value) return true;
+    Logger::Log("%s rejected: string argument is null", apiName ? apiName : "Lua API");
+    return false;
+}
+
+// 有返回值包装：状态指针无效/导入缺失 → 日志 + fallback。
+#define HKS_GUARD_RET(fnPtr, fallback, L, ...) \
     do { \
+        if (!ValidateLuaState((L), #fnPtr)) return (fallback); \
         if (!(fnPtr)) { WarnHksImportMissing(#fnPtr); return (fallback); } \
-        return (fnPtr)(__VA_ARGS__); \
+        return (fnPtr)(reinterpret_cast<hks::lua_State*>(L), __VA_ARGS__); \
     } while (0)
 
-// void 包装：导入缺失 → 限次日志 + 直接返回。
-#define HKS_GUARD_VOID(fnPtr, ...) \
+// void 包装：状态指针无效/导入缺失 → 日志 + 直接返回。
+#define HKS_GUARD_VOID(fnPtr, L, ...) \
     do { \
+        if (!ValidateLuaState((L), #fnPtr)) return; \
         if (!(fnPtr)) { WarnHksImportMissing(#fnPtr); return; } \
-        return (fnPtr)(__VA_ARGS__); \
+        return (fnPtr)(reinterpret_cast<hks::lua_State*>(L), __VA_ARGS__); \
+    } while (0)
+
+#define HKS_GUARD_RET0(fnPtr, fallback, L) \
+    do { \
+        if (!ValidateLuaState((L), #fnPtr)) return (fallback); \
+        if (!(fnPtr)) { WarnHksImportMissing(#fnPtr); return (fallback); } \
+        return (fnPtr)(reinterpret_cast<hks::lua_State*>(L)); \
     } while (0)
 
 void LuaPushNamedCClosureImpl(void* L, void* func, int a, const char* name, int b) {
-    HKS_GUARD_VOID(hks::pushnamedcclosure, reinterpret_cast<hks::lua_State*>(L),
+    if (!func || !ValidateLuaCString(name, "LuaPushNamedCClosure") || a < 0 || b < 0) return;
+    HKS_GUARD_VOID(hks::pushnamedcclosure, L,
         reinterpret_cast<hks::luaFunc>(func), a, name, b);
 }
 
 int LuaCheckIntegerImpl(void* L, int index) {
-    HKS_GUARD_RET(hks::checkinteger, 0, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::checkinteger, 0, L, index);
 }
 
 double LuaCheckNumberImpl(void* L, int index) {
-    HKS_GUARD_RET(hks::checknumber, 0.0, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::checknumber, 0.0, L, index);
 }
 
 void LuaSetFieldImpl(void* L, int stackOffset, const char* name) {
-    HKS_GUARD_VOID(hks::setfield, reinterpret_cast<hks::lua_State*>(L), stackOffset, name);
+    if (!ValidateLuaCString(name, "LuaSetField")) return;
+    HKS_GUARD_VOID(hks::setfield, L, stackOffset, name);
 }
 
 int LuaGetTopImpl(void* L) {
-    HKS_GUARD_RET(hks::gettop, 0, reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET0(hks::gettop, 0, L);
 }
 
 int LuaDoStringImpl(void* L, const char* str) {
-    HKS_GUARD_RET(hks::dostring, 0, reinterpret_cast<hks::lua_State*>(L), str);
+    if (!ValidateLuaCString(str, "LuaDoString")) return 0;
+    HKS_GUARD_RET(hks::dostring, 0, L, str);
 }
 
 int LuaToBooleanImpl(void* L, int index) {
-    HKS_GUARD_RET(hks::toboolean, 0, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::toboolean, 0, L, index);
 }
 
 void LuaPushNumberImpl(void* L, double num) {
-    HKS_GUARD_VOID(hks::pushnumber, reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_VOID(hks::pushnumber, L, num);
 }
 
 void LuaPushIntegerImpl(void* L, int num) {
     // G12: 语义对齐——API 承诺压整数，用 hksi_lua_pushinteger 压整数标记值
     // （此前走 pushnumber 是历史遗留，hks 开启 IntLiterals 时两者字节码可区分）。
-    HKS_GUARD_VOID(hks::pushinteger, reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_VOID(hks::pushinteger, L, num);
+}
+
+static bool FormatLuaString(char* buffer, size_t capacity, const char* format, va_list args,
+                            const char* apiName) {
+    if (!ValidateLuaCString(format, apiName)) return false;
+    const int result = _vsnprintf_s(buffer, capacity, _TRUNCATE, format, args);
+    if (result < 0) {
+        Logger::Log("%s rejected: invalid or oversized format result", apiName);
+        return false;
+    }
+    return true;
 }
 
 void LuaErrorImpl(void* L, char const* str, ...) {
-    if (!hks::error) {
-        WarnHksImportMissing("hks::error");
+    if (!ValidateLuaState(L, "LuaError") || !hks::error) {
+        if (!hks::error) WarnHksImportMissing("hks::error");
         return;
     }
     char buffer[1024];
     va_list args;
     va_start(args, str);
-    vsnprintf(buffer, sizeof(buffer), str, args);
+    const bool formatted = FormatLuaString(buffer, sizeof(buffer), str, args, "LuaError");
     va_end(args);
+    if (!formatted) return;
     hks::error(reinterpret_cast<hks::lua_State*>(L), "%s", buffer);
 }
 
 char const* LuaPushFStringImpl(void* L, char const* str, ...) {
-    if (!hks::pushfstring) {
-        WarnHksImportMissing("hks::pushfstring");
+    if (!ValidateLuaState(L, "LuaPushFString") || !hks::pushfstring) {
+        if (!hks::pushfstring) WarnHksImportMissing("hks::pushfstring");
         return nullptr;
     }
     char buffer[1024];
     va_list args;
     va_start(args, str);
-    vsnprintf(buffer, sizeof(buffer), str, args);
+    const bool formatted = FormatLuaString(buffer, sizeof(buffer), str, args, "LuaPushFString");
     va_end(args);
+    if (!formatted) return nullptr;
     return hks::pushfstring(reinterpret_cast<hks::lua_State*>(L), "%s", buffer);
 }
 
 char const* LuaCheckLStringImpl(void* L, int index, unsigned __int64* a) {
-    HKS_GUARD_RET(hks::checklstring, nullptr, reinterpret_cast<hks::lua_State*>(L), index, a);
+    if (!a) return nullptr;
+    HKS_GUARD_RET(hks::checklstring, nullptr, L, index, a);
 }
 
 void* LuaToUserDataImpl(void* L, int index) {
-    HKS_GUARD_RET(hks::touserdata, nullptr, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::touserdata, nullptr, L, index);
 }
 
 void LuaGetFieldImpl(void* L, int a, char const* b) {
-    HKS_GUARD_VOID(hks::getfield, reinterpret_cast<hks::lua_State*>(L), a, b);
+    if (!ValidateLuaCString(b, "LuaGetField")) return;
+    HKS_GUARD_VOID(hks::getfield, L, a, b);
 }
 
 void LuaPopImpl(void* L, int a) {
-    HKS_GUARD_VOID(hks::pop, reinterpret_cast<hks::lua_State*>(L), a);
+    if (a < 0) return;
+    HKS_GUARD_VOID(hks::pop, L, a);
 }
 
 void LuaCreateTableImpl(void* L, int a, int b) {
-    HKS_GUARD_VOID(hks::createtable, reinterpret_cast<hks::lua_State*>(L), a, b);
+    if (a < 0 || b < 0) return;
+    HKS_GUARD_VOID(hks::createtable, L, a, b);
 }
 
 void* LuaToCFunctionImpl(void* L, int index) {
+    if (!ValidateLuaState(L, "LuaToCFunction")) return nullptr;
     if (!hks::tocfunction) {
         WarnHksImportMissing("hks::tocfunction");
         return nullptr;
@@ -2133,15 +2499,15 @@ void* LuaToCFunctionImpl(void* L, int index) {
 }
 
 void LuaCheckTableImpl(void* L, int index) {
-    HKS_GUARD_VOID(hks::checktable, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_VOID(hks::checktable, L, index);
 }
 
 unsigned long long LuaObjLenImpl(void* L, int index) {
-    HKS_GUARD_RET(hks::objlen, 0, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::objlen, 0, L, index);
 }
 
 void LuaGetTableImpl(void* L, int index) {
-    HKS_GUARD_VOID(hks::gettable, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_VOID(hks::gettable, L, index);
 }
 
 int LuaCPcallImpl(void* L, LuaMethodFunc callback, void* userdata) {
@@ -2149,87 +2515,92 @@ int LuaCPcallImpl(void* L, LuaMethodFunc callback, void* userdata) {
         return kHookApiLuaCallInvalidArgument;
     }
     HKS_GUARD_RET(hks::cpcall, kHookApiLuaCallUnavailable,
-        reinterpret_cast<hks::lua_State*>(L),
+        L,
         reinterpret_cast<hks::luaFunc>(callback), userdata);
 }
 
 int LuaRefImpl(void* L, int index) {
-    HKS_GUARD_RET(hks::ref, 0, reinterpret_cast<hks::lua_State*>(L), index);
+    HKS_GUARD_RET(hks::ref, 0, L, index);
 }
 
 int LuaPcallImpl(void* L, int a, int b, int c) {
-    HKS_GUARD_RET(hks::pcall, 0, reinterpret_cast<hks::lua_State*>(L), a, b, c);
+    if (a < 0 || b < -1) return 0;
+    HKS_GUARD_RET(hks::pcall, 0, L, a, b, c);
 }
 
 void LuaPushValueImpl(void* L, int value) {
-    HKS_GUARD_VOID(hks::pushvalue, reinterpret_cast<hks::lua_State*>(L), value);
+    HKS_GUARD_VOID(hks::pushvalue, L, value);
 }
 
 void LuaRawGetIImpl(void* L, int a, int b) {
-    HKS_GUARD_VOID(hks::rawgeti, reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_VOID(hks::rawgeti, L, a, b);
 }
 
 void LuaUnrefImpl(void* L, int a, int b) {
-    HKS_GUARD_VOID(hks::unref, reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_VOID(hks::unref, L, a, b);
 }
 
 void LuaSetTableImpl(void* L, int t) {
-    HKS_GUARD_VOID(hks::settable, reinterpret_cast<hks::lua_State*>(L), t);
+    HKS_GUARD_VOID(hks::settable, L, t);
 }
 
 int LuaIsNumberImpl(void* L, int num) {
-    HKS_GUARD_RET(hks::isnumber, 0, reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::isnumber, 0, L, num);
 }
 
 double LuaToNumberImpl(void* L, int num) {
-    HKS_GUARD_RET(hks::tonumber, 0.0, reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::tonumber, 0.0, L, num);
 }
 
 int LuaIsUserDataImpl(void* L, int num) {
-    HKS_GUARD_RET(hks::isuserdata, 0, reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::isuserdata, 0, L, num);
 }
 
 int LuaOpenDebugImpl(void* L) {
-    HKS_GUARD_RET(hks::luaopen_debug, 0, reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET0(hks::luaopen_debug, 0, L);
 }
 
 int LuaToIntegerImpl(void* L, int num) {
-    HKS_GUARD_RET(hks::tointeger, 0, reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::tointeger, 0, L, num);
 }
 
 int LuaTypeImpl(void* L, int num) {
-    HKS_GUARD_RET(hks::type, 0, reinterpret_cast<hks::lua_State*>(L), num);
+    HKS_GUARD_RET(hks::type, 0, L, num);
 }
 
 int LuaOptIntegerImpl(void* L, int a, int b) {
-    HKS_GUARD_RET(hks::optinteger, b, reinterpret_cast<hks::lua_State*>(L), a, b);
+    HKS_GUARD_RET(hks::optinteger, b, L, a, b);
 }
 
 int LuaSetHookImpl(void* L, void* a, int b, int c) {
-    HKS_GUARD_RET(hks::sethook, 0, reinterpret_cast<hks::lua_State*>(L), a, b, c);
+    if (c < 0) return 0;
+    HKS_GUARD_RET(hks::sethook, 0, L, a, b, c);
 }
 
 void* LuaGetHookImpl(void* L) {
-    HKS_GUARD_RET(hks::gethook, nullptr, reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET0(hks::gethook, nullptr, L);
 }
 
 int LuaGetHookMaskImpl(void* L) {
-    HKS_GUARD_RET(hks::gethookmask, 0, reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET0(hks::gethookmask, 0, L);
 }
 
 int LuaGetHookCountImpl(void* L) {
-    HKS_GUARD_RET(hks::gethookcount, 0, reinterpret_cast<hks::lua_State*>(L));
+    HKS_GUARD_RET0(hks::gethookcount, 0, L);
 }
 
 int LuaCheckPlayerIdImpl(void* L, int index) {
+    if (!ValidateLuaState(L, "LuaCheckPlayerId")) return -1;
     return hks::checkplayerid(reinterpret_cast<hks::lua_State*>(L), index);
 }
 
 void LuaPushBooleanImpl(void* L, bool value) {
+    if (!ValidateLuaState(L, "LuaPushBoolean")) return;
     hks::pushboolean(reinterpret_cast<hks::lua_State*>(L), value);
 }
 
 void LuaPushLightUserDataImpl(void* L, void* ptr) {
+    if (!ValidateLuaState(L, "LuaPushLightUserData")) return;
     hks::pushlightuserdata(reinterpret_cast<hks::lua_State*>(L), ptr);
 }
 
@@ -2259,7 +2630,8 @@ void LogImpl(const char* format, ...) {
 }
 
 void LuaPushCFunctionFieldImpl(void* L, int tableIndex, const char* fieldName, void* fn, const char* internalName) {
-    if (!L || !fieldName || !fn) return;
+    if (!ValidateLuaState(L, "LuaPushCFunctionField") ||
+        !ValidateLuaCString(fieldName, "LuaPushCFunctionField") || !fn) return;
     if (!hks::pushnamedcclosure || !hks::setfield) {
         WarnHksImportMissing("hks::pushnamedcclosure/setfield");
         return;
@@ -2277,7 +2649,8 @@ void LuaPushCFunctionFieldImpl(void* L, int tableIndex, const char* fieldName, v
 }
 
 void LuaNewGlobalTableImpl(void* L, const char* globalName, int narr, int nrec) {
-    if (!L || !globalName) return;
+    if (!ValidateLuaState(L, "LuaNewGlobalTable") ||
+        !ValidateLuaCString(globalName, "LuaNewGlobalTable") || narr < 0 || nrec < 0) return;
     if (!hks::createtable || !hks::setfield || !hks::getfield) {
         WarnHksImportMissing("hks::createtable/setfield/getfield");
         return;
@@ -2398,16 +2771,43 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
         Logger::Log("RegisterPushMethodsTarget: bad sigType %d for %s", sigType, name);
         return 0;
     }
-    // M2: 表写入与 PushLuaMethodsImpl 的读取跨线程共享，持锁修改。
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    g_MethodSignatureTable[name] = (sigType == kHookApiPushWithManager)
-        ? PushMethodSigType::WithManager
-        : PushMethodSigType::NoManager;
+    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(name),
+                                    "RegisterPushMethodsTarget");
+    if (!owner) return 0;
 
-    std::string sym = pushMethodsSymbol && *pushMethodsSymbol
+    PushTargetConfig config{
+        sigType == kHookApiPushWithManager
+        ? PushMethodSigType::WithManager
+        : PushMethodSigType::NoManager,
+        pushMethodsSymbol && *pushMethodsSymbol
         ? pushMethodsSymbol
-        : (std::string(name) + "::PushMethods");
-    Logger::Log("RegisterPushMethodsTarget: %s sig=%d sym=%s", name, sigType, sym.c_str());
+        : (std::string(name) + "::PushMethods")
+    };
+
+    auto& ownerConfigs = g_pluginPushTargetConfigs[*owner];
+    const auto existing = ownerConfigs.find(name);
+    if (existing != ownerConfigs.end()) {
+        if (existing->second.signature != config.signature ||
+                existing->second.symbolName != config.symbolName) {
+            Logger::Log("RegisterPushMethodsTarget: conflicting redefinition owner=%ls target=%s",
+                owner->c_str(), name);
+            return 0;
+        }
+        return 1;
+    }
+    const bool hasRegistration = std::any_of(g_pushRegistrations.begin(),
+        g_pushRegistrations.end(), [&owner, name](const PushRegistration& registration) {
+            return registration.owner == *owner && registration.targetName == name;
+        });
+    if (hasRegistration) {
+        Logger::Log("RegisterPushMethodsTarget: cannot change config after registration owner=%ls target=%s",
+            owner->c_str(), name);
+        return 0;
+    }
+    ownerConfigs.emplace(name, config);
+    Logger::Log("RegisterPushMethodsTarget: owner=%ls target=%s sig=%d sym=%s",
+        owner->c_str(), name, sigType, config.symbolName.c_str());
     return 1;
 }
 
@@ -2441,9 +2841,12 @@ static HookAPI g_hookApi = {
     &GetImageInfoImpl,
     &ResolveByRvaImpl,
     &ResolveByNameImpl,
-    &PushLuaMethodsImpl,
+    &ResolveByRvaExImpl,
+    &ResolveByPatternImpl,
+    &RegisterGlobalCaptureImpl,
+    &ResolveByVTableImpl,
 
-    &GetCurTurnImpl,
+    &PushLuaMethodsImpl,
 
     &RegisterScriptGlobalsImpl,
     &RegisterScriptGlobalsForUIImpl,
@@ -2490,11 +2893,13 @@ static HookAPI g_hookApi = {
     &LuaPushBooleanImpl,
     &LuaPushLightUserDataImpl,
 
-    &LocalizationLookupImpl,
-
     &LogImpl,
     &LuaPushCFunctionFieldImpl,
     &LuaNewGlobalTableImpl,
+
+    &GetCurTurnImpl,
+
+    &LocalizationLookupImpl,
 
     &LocStringBytesImpl,
     &LocCreateImpl,
@@ -2515,11 +2920,6 @@ static HookAPI g_hookApi = {
 
     &RegisterGameCoreReadyImpl,
     &RegisterGameCoreTeardownImpl,
-
-    &ResolveByRvaExImpl,
-    &ResolveByPatternImpl,
-    &RegisterGlobalCaptureImpl,
-    &ResolveByVTableImpl,
 
     &RegisterGameEventImpl,
     &TriggerGameEventImpl,
@@ -2687,12 +3087,9 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     auto onMessage = (OnMessageFunc)GetProcAddress(hPlugin, "OnMessage");
     lifecycleLock.unlock();
     if (onMessage) {
-        // Register under filename stem so SendMessageTo("Example1", ...) works.
-        string handlerName = pluginFileName;
-        const size_t dot = handlerName.find_last_of('.');
-        if (dot != string::npos) handlerName = handlerName.substr(0, dot);
-        g_bus.RegisterHandler(handlerName, onMessage, ownerId);
-        Logger::Log("Auto-registered OnMessage for %s", handlerName.c_str());
+        const bool registered = RegisterPluginMessageHandler(ownerId, onMessage);
+        Logger::Log("OnMessage auto-registration %s for %s",
+            registered ? "succeeded" : "rejected", pluginFileName.c_str());
     }
     lifecycleLock.lock();
     const auto activate = std::find_if(g_plugins.begin(), g_plugins.end(),
@@ -2807,12 +3204,14 @@ static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
     const size_t registrationsRemoved =
         registrationsBefore - g_pushRegistrations.size();
 
+    const size_t targetConfigsRemoved = g_pluginPushTargetConfigs.erase(owner);
+
     // GameEvent 槽位：清空该 owner 注册的事件表（name/pushArgsFn/ownerId）。
     // Quarantine/Unload 都经本函数，无需在各自路径重复接线。
     CleanupGameEventsForOwner(owner);
 
-    Logger::Log("RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu registrations=%zu",
-        owner.c_str(), globals, globalsUi, methods, registrationsRemoved);
+    Logger::Log("RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu registrations=%zu targetConfigs=%zu",
+        owner.c_str(), globals, globalsUi, methods, registrationsRemoved, targetConfigsRemoved);
 }
 
 // 崩溃隔离（与 OnLoad 崩溃同构）：标记隔离 + 回滚该 owner 的全部注册
@@ -2832,6 +3231,7 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
     // 先禁用并排空所有外部入口；等待期间不得持 lifecycle 锁。
     RemoveGameCoreCallbacksFor(ownerId);
     g_bus.UnregisterOwner(ownerId);
+    WaitForPluginCallbacks(ownerId);
     PatchRegistry::RevertAllFor(ownerId.c_str());
     RemovePluginHooks(ownerId.c_str());
     // 隔离路径也必须撤销参数捕获站点；否则站点仍会向插件的 out 槽写入数据。
@@ -2864,6 +3264,9 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
     lifecycleLock.unlock();
     RemoveGameCoreCallbacksFor(entry.ownerId);
     g_bus.UnregisterOwner(entry.ownerId);
+    // 脚本全局/GameEvent 入口使用快照并在锁外执行；先排空 owner 的在途调用，
+    // 再进入 OnUnload，避免插件状态被释放后旧回调继续访问。
+    WaitForPluginCallbacks(entry.ownerId);
     auto onUnload = (OnUnloadFunc)GetProcAddress(entry.handle, "OnUnload");
     SetActivePluginContext(entry.ownerId, entry.handle);
     if (onUnload) CallOnUnloadSafe(onUnload, nullptr);
@@ -2885,8 +3288,8 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
         });
     if (tracked != g_plugins.end()) g_plugins.erase(tracked);
     // 不 FreeLibrary：游戏线程可能仍在该插件的 detour/回调内执行（MH_DisableHook
-    // 不等待在飞调用，RegisterScriptData 等回调也没有引用计数），此刻卸下映像会把
-    // 正在执行的代码变成 UAF。改为驻留模块（hook 框架的标准做法）：映像保持映射
+    // 不等待所有类型的在飞调用），此刻卸下映像会把正在执行的代码变成 UAF。
+    // 改为驻留模块（hook 框架的标准做法）：映像保持映射
     // 但休眠——钩已摘、补丁已回滚、Lua 方法/回调/OnMessage 已注销，不会再被调用。
     // 代价是该插件重启用时静态状态跨周期保留，OnLoad 必须可重入（重新注册其
     // 钩子/回调）；这与全新加载路径对插件的要求一致。
