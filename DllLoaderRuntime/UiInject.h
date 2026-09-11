@@ -19,6 +19,7 @@ void RequestRefresh();
 
 // 在当前游戏/UI 线程处理刷新请求；非 UI 线程不得调用。
 // 尚未完成首次 LoadUI 时只保留请求，后续 LoadUI 会处理；已有 UI 时可立即重建。
+// 注入失败会尽量立即销毁已挂载 context；DestroyChild 失败时保留 root，等待下次刷新重试。
 void RefreshOnUiThread();
 
 }  // namespace UiInject

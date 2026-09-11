@@ -59,7 +59,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
 extern "C" {
     __declspec(dllexport) void* __cdecl DllCreateGameContext(void) {
         Logger::Init(L"Civ6DllLoader_Shell.log");
-        Logger::InstallGlobalExceptionHandler();
+        // The shell can fail to create a context and be unloaded without Destroy.
+        // Leave the process-wide exception filter under the host's ownership.
         Logger::Log("Shell DllCreateGameContext begin");
 
         // Load real GameCore here (not in DllMain/CreateThread) so unload/reload
@@ -105,7 +106,6 @@ extern "C" {
             base_DllDestroyGameContext = nullptr;
         }
         Logger::Log("Shell DllDestroyGameContext done");
-        Logger::RestoreGlobalExceptionHandler();
         Logger::Shutdown();
     }
 }

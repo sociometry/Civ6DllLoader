@@ -14,6 +14,7 @@ struct Snapshot {
 };
 
 // Read selected ModGroup from Mods.sqlite (Additional Content enable list).
+// 查询必须完整结束才返回 ok=true；失败返回错误和空集合，不暴露部分启用集。
 Snapshot Load();
 
 // Walk up from a file/dir path to the folder that contains a *.modinfo.

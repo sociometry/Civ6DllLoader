@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# build_sidecar.py - JSON + DLL -> sidecar bin (v2)
+# build_sidecar.py - JSON + DLL -> sidecar bin (v4)
 import argparse, json, os, struct, subprocess, sys, tempfile
 import pefile
 
@@ -66,7 +66,7 @@ def run_normhash(helper, records):
         os.unlink(inp)
 
 def main():
-    ap = argparse.ArgumentParser(description="JSON + DLL -> sidecar bin (v2)")
+    ap = argparse.ArgumentParser(description="JSON + DLL -> sidecar bin (v4, with PE timestamp)")
     ap.add_argument("--dll", default=DEFAULT_DLL)
     ap.add_argument("--json", default=os.path.join(HERE, "Civ6DllLoader.symdb.json"))
     ap.add_argument("--bin", default=os.path.join(HERE, "Civ6DllLoader.symdb.bin"))
@@ -85,6 +85,7 @@ def main():
 
     print("[2/5] DLL pdata ...")
     pe = pefile.PE(args.dll)
+    timestamp = pe.FILE_HEADER.TimeDateStamp
     pdata = parse_pdata(pe)
     pdata_begins = {b: (s, u, p) for (b, s, u, p) in pdata}
     print("      {} entries".format(len(pdata)))
@@ -172,7 +173,7 @@ def main():
     slot_blob = struct.pack("<{}I".format(len(slot_table) * 2),
                            *[v for t in slot_table for v in t])
 
-    HDR = 48
+    HDR = 52
     pd_off = HDR
     tg_off = pd_off + len(pdata_rows) * 16
     vt_off = tg_off + len(symbols) * 32
@@ -180,13 +181,14 @@ def main():
     aob_off = heap_off + len(heap_bytes)
 
     out = bytearray()
-    out += b"C6SD" + struct.pack("<I", 2) + struct.pack("<I", sizeimg)
+    out += b"C6SD" + struct.pack("<I", 4) + struct.pack("<I", sizeimg)
     out += struct.pack("<I", len(pdata_rows)) + struct.pack("<I", len(symbols))
     out += struct.pack("<I", pd_off) + struct.pack("<I", tg_off)
     out += struct.pack("<I", heap_off) + struct.pack("<I", len(heap_bytes))
     out += struct.pack("<I", vt_off)
     out += struct.pack("<I", aob_off) + struct.pack("<I", len(aob_blob))
-    assert len(out) == 48
+    out += struct.pack("<I", timestamp)
+    assert len(out) == 52
 
     for b, s, u in pdata_rows:
         out += struct.pack("<IIQ", b, s, u)
@@ -214,6 +216,7 @@ def main():
     with open(args.bin, "wb") as f:
         f.write(out)
     print("      bin: {} bytes".format(len(out)))
+    print("      timestamp: 0x{:08X}".format(timestamp))
     print("      layout: pd={} tg={} vt={} heap={} aob={}".format(
         pd_off, tg_off, vt_off, heap_off, aob_off))
     print("done.")

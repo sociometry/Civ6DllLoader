@@ -4,8 +4,10 @@
 // 把 old RVA（sidecar 签名表）矫正为 new RVA（当前加载的 GameCore 映像）。
 //
 // sidecar 二进制格式（Civ6DllLoader.symdb.bin，小端，pack(1)）：
-//   Header(40B)  : "C6SD" + version=1 + baseSizeOfImage + pdataCount + targetCount
+//   Header(52B)  : "C6SD" + version=4 + baseSizeOfImage + baseTimeDateStamp
+//                  + pdataCount + targetCount
 //                  + pdataOffset + targetOffset + heapOffset + heapSize + vtableOffset(0=无)
+//                  + aobOffset + aobSize
 //   pdata 签名表  : pdataCount x 16B = begin_rva + size + unwind_hash（按 begin_rva 递增）
 //   符号表        : targetCount x 32B = demangledNameOffset + mangledNameOffset + old_rva
 //                  + kind(0=Function,1=vtable) + vtableSlotCount + reserved
@@ -43,8 +45,8 @@ namespace {
 // ---- sidecar（Civ6DllLoader.symdb.bin）----
 
 constexpr char kSidecarMagic[4] = { 'C', '6', 'S', 'D' };
-constexpr uint32_t kSidecarVersion = 1;      // 最低支持版本
-constexpr uint32_t kSidecarVersionMax = 2;  // 最高支持版本（v2 新增函数体 AOB 表；v3 槽位格式与运行时不兼容）
+constexpr uint32_t kSidecarVersion = 4;      // v4：增加 PE TimeDateStamp；槽位仍为 8 字节
+constexpr uint32_t kSidecarVersionMax = 4;
 constexpr uint32_t kSidecarResourceId = 102;  // RCDATA 资源 id（旧资源 101 已随旧符号库退役，勿复用）
 constexpr wchar_t kSidecarFileName[] = L"Civ6DllLoader.symdb.bin";
 
@@ -62,7 +64,7 @@ constexpr wchar_t kCacheDirName[] = L"Civ6DllLoader";
 constexpr wchar_t kCacheFileName[] = L"pdata_cache.bin";
 
 #pragma pack(push, 1)
-struct SidecarHeader {           // 40 字节
+struct SidecarHeader {           // 52 字节
     char magic[4];
     uint32_t version;
     uint32_t baseSizeOfImage;
@@ -73,6 +75,9 @@ struct SidecarHeader {           // 40 字节
     uint32_t heapOffset;
     uint32_t heapSize;
     uint32_t vtableOffset;       // 0 = 无
+    uint32_t aobOffset;
+    uint32_t aobSize;
+    uint32_t baseTimeDateStamp;  // source GameCore PE FileHeader.TimeDateStamp
 };
 struct PdataSig {                // pdata 签名表条目（sidecar 里 16 字节；运行时 new 表 20 字节）
     uint32_t begin_rva;
@@ -104,7 +109,7 @@ struct CacheHeader {             // pdata_cache.bin 头，28 字节
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SidecarHeader) == 40, "SidecarHeader must be 40 bytes");
+static_assert(sizeof(SidecarHeader) == 52, "SidecarHeader must be 52 bytes");
 static_assert(sizeof(PdataSig) == 20, "PdataSig must be 20 bytes");
 static_assert(sizeof(SymbolEntry) == 32, "SymbolEntry must be 32 bytes");
 static_assert(sizeof(VtableSlot) == 8, "VtableSlot must be 8 bytes");
@@ -146,6 +151,7 @@ std::vector<uint8_t> g_aobData;                    // 函数体 AOB 表原始数
 std::unordered_map<uint32_t, AobInfo> g_aobByRva;  // old_rva -> AOB 信息
 uint64_t g_oldFingerprint = 0;                 // old pdata 表指纹（sidecar 内容）
 uint32_t g_baseSizeOfImage = 0;
+uint32_t g_baseTimeDateStamp = 0;
 bool g_loaded = false;
 bool g_identical = false;  // 版本一致（恒等映射）：跳过一切 pdata 匹配，RVA 恒等解析
 std::unordered_map<uint32_t, uint32_t> g_leafMap;  // 叶子符号 old_rva -> new_rva（跨版本 AOB 匹配结果）
@@ -224,19 +230,15 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
         Logger::Log("PdataMatch: %s unsupported version %u", sourceTag, hdr.version);
         return false;
     }
-    uint32_t aobOffset = 0;
-    uint32_t aobSize = 0;
-    if (hdr.version >= 2) {
-        if (size < 48) {
-            Logger::Log("PdataMatch: %s v2 header too small (%zu bytes)", sourceTag, size);
-            return false;
-        }
-        std::memcpy(&aobOffset, data + 40, 4);
-        std::memcpy(&aobSize, data + 44, 4);
-        if (static_cast<uint64_t>(aobOffset) + aobSize > size) {
-            Logger::Log("PdataMatch: %s AOB table out of range (off=%u size=%u)", sourceTag, aobOffset, aobSize);
-            return false;
-        }
+    if (size < sizeof(SidecarHeader)) {
+        Logger::Log("PdataMatch: %s v4 header too small (%zu bytes)", sourceTag, size);
+        return false;
+    }
+    const uint32_t aobOffset = hdr.aobOffset;
+    uint32_t aobSize = hdr.aobSize;
+    if (static_cast<uint64_t>(aobOffset) + aobSize > size) {
+        Logger::Log("PdataMatch: %s AOB table out of range (off=%u size=%u)", sourceTag, aobOffset, aobSize);
+        return false;
     }
     if (hdr.pdataCount > kMaxPdataCount || hdr.targetCount > kMaxTargetCount ||
         hdr.heapSize > kMaxHeapBytes || hdr.vtableOffset > size) {
@@ -328,7 +330,7 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
             headHashByRva.emplace(sym.old_rva, sym.normHeadHash);
         }
 
-        // v2：Function 符号读函数体 AOB（bodySize + body + mask）
+        // v4：Function 符号读函数体 AOB（bodySize + body + mask）
         if (sym.kind == 0 && aobSize != 0) {
             if (aobCursor + 4 <= static_cast<uint64_t>(aobOffset) + aobSize) {
                 uint32_t bodySize = 0;
@@ -364,9 +366,11 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
     g_aobData = std::move(aobData);
     g_aobByRva = std::move(aobByRva);
     g_baseSizeOfImage = hdr.baseSizeOfImage;
+    g_baseTimeDateStamp = hdr.baseTimeDateStamp;
     g_loaded = true;
-    Logger::Log("PdataMatch: %s loaded pdata=%zu symbols=%zu vtable_symbols=%zu vtable_slots=%u base=0x%08X",
-        sourceTag, g_oldPdata.size(), g_symbols.size(), vtableSymbols, slotCursor, g_baseSizeOfImage);
+    Logger::Log("PdataMatch: %s loaded pdata=%zu symbols=%zu vtable_symbols=%zu vtable_slots=%u base=0x%08X timestamp=0x%08X",
+        sourceTag, g_oldPdata.size(), g_symbols.size(), vtableSymbols, slotCursor,
+        g_baseSizeOfImage, g_baseTimeDateStamp);
     return true;
 }
 
@@ -430,7 +434,7 @@ uint64_t ComputeTableFingerprint(const std::vector<PdataSig>& table) {
 
 // 解析 new GameCore 的 .pdata：RUNTIME_FUNCTION 数组 -> (begin_rva, size, unwind_hash) 签名表
 bool ParseNewPdata(HMODULE gameCore, std::vector<PdataSig>& outTable,
-    uint64_t& outFingerprint, uint32_t& outImageSize) {
+    uint64_t& outFingerprint, uint32_t& outImageSize, uint32_t& outTimeDateStamp) {
     if (!gameCore) return false;
     const uint8_t* base = reinterpret_cast<const uint8_t*>(gameCore);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
@@ -438,6 +442,7 @@ bool ParseNewPdata(HMODULE gameCore, std::vector<PdataSig>& outTable,
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     const uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
+    const uint32_t timeDateStamp = nt->FileHeader.TimeDateStamp;
     const IMAGE_DATA_DIRECTORY& exc = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (exc.VirtualAddress == 0 || exc.Size == 0) return false;
     if (static_cast<uint64_t>(exc.VirtualAddress) + exc.Size > imageSize) return false;
@@ -472,6 +477,7 @@ bool ParseNewPdata(HMODULE gameCore, std::vector<PdataSig>& outTable,
     outFingerprint = ComputeTableFingerprint(table);
     outTable = std::move(table);
     outImageSize = imageSize;
+    outTimeDateStamp = timeDateStamp;
     if (skipped != 0) {
         Logger::Log("PdataMatch: new pdata skipped %zu invalid entries", skipped);
     }
@@ -1163,6 +1169,7 @@ bool Init(HMODULE runtimeModule) {
         g_identical = false;
         g_leafMap.clear();
         g_baseSizeOfImage = 0;
+        g_baseTimeDateStamp = 0;
         g_loaded = false;
         g_newPdata.clear();
         g_map.clear();
@@ -1200,9 +1207,20 @@ bool BuildNewTable(HMODULE gameCore) {
     std::vector<PdataSig> newTable;
     uint64_t fingerprint = 0;
     uint32_t imageSize = 0;
-    if (!ParseNewPdata(gameCore, newTable, fingerprint, imageSize)) {
+    uint32_t timeDateStamp = 0;
+    if (!ParseNewPdata(gameCore, newTable, fingerprint, imageSize, timeDateStamp)) {
         Logger::Log("PdataMatch: BuildNewTable failed to parse new .pdata");
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (imageSize != g_baseSizeOfImage || timeDateStamp != g_baseTimeDateStamp) {
+            Logger::Log("PdataMatch: GameCore identity mismatch "
+                        "(sidecar size=0x%08X timestamp=0x%08X; "
+                        "loaded size=0x%08X timestamp=0x%08X)",
+                g_baseSizeOfImage, g_baseTimeDateStamp, imageSize, timeDateStamp);
+            return false;
+        }
     }
     Logger::Log("PdataMatch: new pdata entries=%zu fingerprint=0x%016llX",
         newTable.size(), static_cast<unsigned long long>(fingerprint));

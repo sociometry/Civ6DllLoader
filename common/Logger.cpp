@@ -8,15 +8,11 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
-#include <DbgHelp.h>
-#pragma comment(lib, "Dbghelp.lib")
 #pragma comment(lib, "Shell32.lib")
 
 static FILE* gLogFile = nullptr;
 static bool gUseDebugOutput = true;
 static std::wstring gLogPath;
-static LPTOP_LEVEL_EXCEPTION_FILTER gPreviousExceptionFilter = nullptr;
-static bool gExceptionFilterInstalled = false;
 
 // Kernel object kept for process lifetime so GameCore unload/reload still sees "already truncated".
 static HANDLE gLogSessionMarkers[4] = {};
@@ -143,43 +139,6 @@ void Logger::LogRaw(const char* msg) {
         fflush(gLogFile);
     }
     if (gUseDebugOutput) OutputDebugStringA(msg);
-}
-
-LONG WINAPI GlobalCrashHandler(EXCEPTION_POINTERS* ExceptionInfo) {
-    Logger::Log("Unhandled exception occurred! Code: 0x%08X", ExceptionInfo->ExceptionRecord->ExceptionCode);
-    Logger::Log("EIP/RIP: 0x%p", ExceptionInfo->ExceptionRecord->ExceptionAddress);
-
-    SYSTEMTIME time{};
-    GetLocalTime(&time);
-    wchar_t filename[MAX_PATH]{};
-    swprintf_s(filename, L"Civ6_Crash_%04d%02d%02d_%02d%02d%02d.dmp",
-        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
-
-    const std::wstring dumpPath = ResolveLogPath(filename);
-    HANDLE hFile = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        MINIDUMP_EXCEPTION_INFORMATION mdei = { GetCurrentThreadId(), ExceptionInfo, TRUE };
-        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, MiniDumpNormal, &mdei, NULL, NULL);
-        Logger::Log("Minidump written");
-        CloseHandle(hFile);
-    } else {
-        Logger::Log("Failed to create dump file: %d", GetLastError());
-    }
-
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-void Logger::InstallGlobalExceptionHandler() {
-    if (gExceptionFilterInstalled) return;
-    gPreviousExceptionFilter = SetUnhandledExceptionFilter(GlobalCrashHandler);
-    gExceptionFilterInstalled = true;
-}
-
-void Logger::RestoreGlobalExceptionHandler() {
-    if (!gExceptionFilterInstalled) return;
-    SetUnhandledExceptionFilter(gPreviousExceptionFilter);
-    gPreviousExceptionFilter = nullptr;
-    gExceptionFilterInstalled = false;
 }
 
 void Logger::LogCrash(const char* context) {

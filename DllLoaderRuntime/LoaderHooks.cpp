@@ -6,7 +6,7 @@
 //   - GameCore::UnloadDLL          @ RVA 0xF8E30  （阶段 B 收尾：卸 GameCore 前先卸插件）
 //   - AppLuaModdingLibrary::lEnableMod  @ RVA 0x4CCFE0（阶段 C：主菜单开关 Mod → RequestReconcile）
 //   - AppLuaModdingLibrary::lDisableMod @ RVA 0x4CCD50（阶段 C，同上）
-// 一切失败仅日志 + 静默降级（已装上的 hook 保持），由调用方 WorkerMain 记录降级。
+// 一切失败仅日志 + 静默降级；安装按事务处理，任一步失败都会回滚本次已装 hook。
 //
 // 地址换算统一走 ImageAddress；RVA 常量与入口特征码仍由本文件持有。
 // 符号/版本敏感点：RVA 相对 GetModuleHandleW(nullptr) 基址（ASLR）。
@@ -25,6 +25,7 @@
 #include <wchar.h>
 #include <string>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -298,7 +299,26 @@ bool LoaderHooks::InstallAll() {
     }
     Logger::Log("InstallAll: MinHook ready (status=%d)", static_cast<int>(st));
 
-    bool ok = true;
+    // 只记录本次 MH_CreateHook 成功的目标。失败回滚时先禁用再移除，
+    // 保证后续重试不会撞上半安装的残留记录，也不会留下指向本 DLL 的 detour。
+    std::vector<LPVOID> createdHooks;
+    createdHooks.reserve(4);
+    const auto rollback = [&](const char* failedStep) {
+        for (auto it = createdHooks.rbegin(); it != createdHooks.rend(); ++it) {
+            const MH_STATUS disableStatus = MH_DisableHook(*it);
+            if (disableStatus != MH_OK && disableStatus != MH_ERROR_DISABLED) {
+                Logger::Log("InstallAll: rollback disable failed target=%p status=%s",
+                    *it, MH_StatusToString(disableStatus));
+            }
+            const MH_STATUS removeStatus = MH_RemoveHook(*it);
+            if (removeStatus != MH_OK && removeStatus != MH_ERROR_NOT_CREATED) {
+                Logger::Log("InstallAll: rollback remove failed target=%p status=%s",
+                    *it, MH_StatusToString(removeStatus));
+            }
+        }
+        Logger::Log("InstallAll: %s; rolled back %zu hook(s)", failedStep, createdHooks.size());
+        return false;
+    };
 
     // ---- LoadDLL @ RVA 0xF8510 ----
     const uintptr_t loadDllAddr = reinterpret_cast<uintptr_t>(
@@ -306,19 +326,20 @@ bool LoaderHooks::InstallAll() {
     if (!loadDllAddr || !CheckLoadDllSignature(loadDllAddr)) {
         Logger::Log("LoadDLL signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(loadDllAddr), GetLastError());
-        ok = false;
-    } else if ((st = MH_CreateHook((LPVOID)loadDllAddr, &LoadDllDetour, (LPVOID*)&g_origLoadDLL))
-               != MH_OK) {
-        Logger::Log("LoadDLL MH_CreateHook failed: %s", MH_StatusToString(st));
-        ok = false;
-    } else if ((st = MH_EnableHook((LPVOID)loadDllAddr)) != MH_OK) {
-        Logger::Log("LoadDLL MH_EnableHook failed: %s", MH_StatusToString(st));
-        MH_RemoveHook((LPVOID)loadDllAddr);
-        ok = false;
-    } else {
-        Logger::Log("LoadDLL hook installed at 0x%llX",
-            static_cast<unsigned long long>(loadDllAddr));
+        return rollback("LoadDLL validation failed");
     }
+    if ((st = MH_CreateHook((LPVOID)loadDllAddr, &LoadDllDetour, (LPVOID*)&g_origLoadDLL))
+            != MH_OK) {
+        Logger::Log("LoadDLL MH_CreateHook failed: %s", MH_StatusToString(st));
+        return rollback("LoadDLL create failed");
+    }
+    createdHooks.push_back((LPVOID)loadDllAddr);
+    if ((st = MH_EnableHook((LPVOID)loadDllAddr)) != MH_OK) {
+        Logger::Log("LoadDLL MH_EnableHook failed: %s", MH_StatusToString(st));
+        return rollback("LoadDLL enable failed");
+    }
+    Logger::Log("LoadDLL hook installed at 0x%llX",
+        static_cast<unsigned long long>(loadDllAddr));
 
     // ---- lDisableMod @ RVA 0x4CCD50 ----
     const uintptr_t disableAddr = reinterpret_cast<uintptr_t>(
@@ -326,19 +347,20 @@ bool LoaderHooks::InstallAll() {
     if (!disableAddr || !CheckModToggleSignature(disableAddr)) {
         Logger::Log("lDisableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(disableAddr), GetLastError());
-        ok = false;
-    } else if ((st = MH_CreateHook((LPVOID)disableAddr, &DisableModDetour, (LPVOID*)&g_origDisableMod))
-               != MH_OK) {
-        Logger::Log("lDisableMod MH_CreateHook failed: %s", MH_StatusToString(st));
-        ok = false;
-    } else if ((st = MH_EnableHook((LPVOID)disableAddr)) != MH_OK) {
-        Logger::Log("lDisableMod MH_EnableHook failed: %s", MH_StatusToString(st));
-        MH_RemoveHook((LPVOID)disableAddr);
-        ok = false;
-    } else {
-        Logger::Log("lDisableMod hook installed at 0x%llX",
-            static_cast<unsigned long long>(disableAddr));
+        return rollback("lDisableMod validation failed");
     }
+    if ((st = MH_CreateHook((LPVOID)disableAddr, &DisableModDetour, (LPVOID*)&g_origDisableMod))
+            != MH_OK) {
+        Logger::Log("lDisableMod MH_CreateHook failed: %s", MH_StatusToString(st));
+        return rollback("lDisableMod create failed");
+    }
+    createdHooks.push_back((LPVOID)disableAddr);
+    if ((st = MH_EnableHook((LPVOID)disableAddr)) != MH_OK) {
+        Logger::Log("lDisableMod MH_EnableHook failed: %s", MH_StatusToString(st));
+        return rollback("lDisableMod enable failed");
+    }
+    Logger::Log("lDisableMod hook installed at 0x%llX",
+        static_cast<unsigned long long>(disableAddr));
 
     // ---- lEnableMod @ RVA 0x4CCFE0 ----
     const uintptr_t enableAddr = reinterpret_cast<uintptr_t>(
@@ -346,19 +368,20 @@ bool LoaderHooks::InstallAll() {
     if (!enableAddr || !CheckModToggleSignature(enableAddr)) {
         Logger::Log("lEnableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(enableAddr), GetLastError());
-        ok = false;
-    } else if ((st = MH_CreateHook((LPVOID)enableAddr, &EnableModDetour, (LPVOID*)&g_origEnableMod))
-               != MH_OK) {
-        Logger::Log("lEnableMod MH_CreateHook failed: %s", MH_StatusToString(st));
-        ok = false;
-    } else if ((st = MH_EnableHook((LPVOID)enableAddr)) != MH_OK) {
-        Logger::Log("lEnableMod MH_EnableHook failed: %s", MH_StatusToString(st));
-        MH_RemoveHook((LPVOID)enableAddr);
-        ok = false;
-    } else {
-        Logger::Log("lEnableMod hook installed at 0x%llX",
-            static_cast<unsigned long long>(enableAddr));
+        return rollback("lEnableMod validation failed");
     }
+    if ((st = MH_CreateHook((LPVOID)enableAddr, &EnableModDetour, (LPVOID*)&g_origEnableMod))
+            != MH_OK) {
+        Logger::Log("lEnableMod MH_CreateHook failed: %s", MH_StatusToString(st));
+        return rollback("lEnableMod create failed");
+    }
+    createdHooks.push_back((LPVOID)enableAddr);
+    if ((st = MH_EnableHook((LPVOID)enableAddr)) != MH_OK) {
+        Logger::Log("lEnableMod MH_EnableHook failed: %s", MH_StatusToString(st));
+        return rollback("lEnableMod enable failed");
+    }
+    Logger::Log("lEnableMod hook installed at 0x%llX",
+        static_cast<unsigned long long>(enableAddr));
 
     // ---- UnloadDLL @ RVA 0xF8E30 ----
     const uintptr_t unloadDllAddr = reinterpret_cast<uintptr_t>(
@@ -366,22 +389,21 @@ bool LoaderHooks::InstallAll() {
     if (!unloadDllAddr || !CheckUnloadDllSignature(unloadDllAddr)) {
         Logger::Log("UnloadDLL signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
             static_cast<unsigned long long>(unloadDllAddr), GetLastError());
-        ok = false;
-    } else if ((st = MH_CreateHook((LPVOID)unloadDllAddr, &UnloadDllDetour, (LPVOID*)&g_origUnloadDLL))
-               != MH_OK) {
+        return rollback("UnloadDLL validation failed");
+    }
+    if ((st = MH_CreateHook((LPVOID)unloadDllAddr, &UnloadDllDetour, (LPVOID*)&g_origUnloadDLL))
+            != MH_OK) {
         Logger::Log("UnloadDLL MH_CreateHook failed: %s", MH_StatusToString(st));
-        ok = false;
-    } else if ((st = MH_EnableHook((LPVOID)unloadDllAddr)) != MH_OK) {
+        return rollback("UnloadDLL create failed");
+    }
+    createdHooks.push_back((LPVOID)unloadDllAddr);
+    if ((st = MH_EnableHook((LPVOID)unloadDllAddr)) != MH_OK) {
         Logger::Log("UnloadDLL MH_EnableHook failed: %s", MH_StatusToString(st));
-        MH_RemoveHook((LPVOID)unloadDllAddr);
-        ok = false;
-    } else {
-        Logger::Log("UnloadDLL hook installed at 0x%llX",
-            static_cast<unsigned long long>(unloadDllAddr));
+        return rollback("UnloadDLL enable failed");
     }
+    Logger::Log("UnloadDLL hook installed at 0x%llX",
+        static_cast<unsigned long long>(unloadDllAddr));
 
-    if (!ok) {
-        Logger::Log("InstallAll: partial failure (already-installed hooks remain active)");
-    }
-    return ok;
+    Logger::Log("InstallAll: all core hooks installed (%zu)", createdHooks.size());
+    return true;
 }

@@ -13,7 +13,11 @@ class Civ6MessageBus {
 public:
     using MessageHandler = std::function<void(const char* topic, const void* data, size_t len)>;
 
-    // 注册消息处理器（同名覆盖）
+    // 覆盖/注销会停止旧 entry 的新调用，并等待其它线程的在途调用退出。
+    // 本线程回调栈上的调用（含嵌套祖先与递归）继续到自然返回，调用快照保活 entry。
+    // 回调内清理返回不代表自身调用链已经退出，不能立即释放该调用链仍依赖的外部状态。
+
+    // 注册消息处理器（同 owner 同名覆盖；不同 owner 的同名注册拒绝）
     void RegisterHandler(const std::string& name, MessageHandler handler,
                          const std::wstring& owner = {});
 
@@ -21,7 +25,7 @@ public:
     void UnregisterHandler(const std::string& name);
     void UnregisterOwner(const std::wstring& owner);
 
-    // Drop all handlers (call before unloading plugins).
+    // 注销全部处理器；排空语义与上面一致。
     void Clear();
 
     // 广播消息给所有处理器

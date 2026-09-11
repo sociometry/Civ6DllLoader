@@ -55,6 +55,7 @@ constexpr const wchar_t* kUiBaseName = L"Civ6DllLoader/Civ6DllLoader_FrontEndUI"
 
 // Mod 内 UI 文件的约定前缀：loader 从 ImportFiles 声明里发现并加载所有 FrontEndUI_*.xml
 constexpr const char* kModUiPrefix = "FrontEndUI_";
+constexpr size_t kMaxModinfoBytes = 256 * 1024;
 
 // exe 域 RVA（相对 GetModuleHandleW(nullptr) 基址）
 constexpr uintptr_t kRva_LoadUI       = 0x8AB40;   // MainMenuState::LoadUI
@@ -197,25 +198,56 @@ std::string TrimAscii(const std::string& s) {
     return s.substr(a, b - a);
 }
 
-// 读 mod 目录里的第一个 .modinfo 文件内容（UTF-8，去 BOM）。失败返回空。
+// 读 mod 目录里的唯一 .modinfo 文件内容（UTF-8，去 BOM）。
+// 多个描述文件会使 Mod 身份和文件清单产生歧义，直接拒绝；同时限制大小，
+// 避免启用 Mod 通过超大描述文件消耗 UI 线程内存和解析时间。
 std::string ReadModinfo(const std::filesystem::path& modDir) {
+    std::vector<std::filesystem::path> candidates;
     std::error_code ec;
     for (std::filesystem::directory_iterator it(modDir, ec), end; !ec && it != end; it.increment(ec)) {
         std::error_code fec;
         if (!it->is_regular_file(fec)) continue;
         if (_wcsicmp(it->path().extension().wstring().c_str(), L".modinfo") != 0) continue;
-        std::ifstream f(it->path(), std::ios::binary);
-        if (!f) return {};
-        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        if (content.size() >= 3 &&
-            static_cast<unsigned char>(content[0]) == 0xEF &&
-            static_cast<unsigned char>(content[1]) == 0xBB &&
-            static_cast<unsigned char>(content[2]) == 0xBF) {
-            content.erase(0, 3);
-        }
-        return content;
+        candidates.push_back(it->path());
     }
-    return {};
+    if (candidates.size() != 1) {
+        if (candidates.size() > 1) {
+            Logger::Log("UiInject: Mod 目录含多个 .modinfo，跳过（%ls）", modDir.wstring().c_str());
+        }
+        return {};
+    }
+
+    std::error_code sizeEc;
+    const uintmax_t size = std::filesystem::file_size(candidates.front(), sizeEc);
+    if (sizeEc || size > kMaxModinfoBytes) {
+        Logger::Log("UiInject: .modinfo 不可读或过大，跳过（%ls）", candidates.front().wstring().c_str());
+        return {};
+    }
+
+    std::ifstream f(candidates.front(), std::ios::binary);
+    if (!f) return {};
+    std::string content;
+    content.resize(static_cast<size_t>(size));
+    if (size != 0 && !f.read(content.data(), static_cast<std::streamsize>(size))) return {};
+    if (content.size() >= 2 &&
+        static_cast<unsigned char>(content[0]) == 0xFF &&
+        static_cast<unsigned char>(content[1]) == 0xFE) {
+        Logger::Log("UiInject: .modinfo 使用 UTF-16LE，跳过（%ls）", candidates.front().wstring().c_str());
+        return {};
+    }
+    if (content.size() >= 2 &&
+        static_cast<unsigned char>(content[0]) == 0xFE &&
+        static_cast<unsigned char>(content[1]) == 0xFF) {
+        Logger::Log("UiInject: .modinfo 使用 UTF-16BE，跳过（%ls）", candidates.front().wstring().c_str());
+        return {};
+    }
+    if (content.size() >= 3 &&
+        static_cast<unsigned char>(content[0]) == 0xEF &&
+        static_cast<unsigned char>(content[1]) == 0xBB &&
+        static_cast<unsigned char>(content[2]) == 0xBF) {
+        content.erase(0, 3);
+    }
+    return content;
 }
 
 // XML 的最小词法辅助：只识别这里需要的元素，避免把注释、<FileName> 等相似文本
@@ -237,159 +269,207 @@ size_t FindTagEnd(std::string_view text, size_t start) {
     return std::string_view::npos;
 }
 
-bool IsXmlNameBoundary(char ch) {
-    return ch == '>' || ch == '/' || std::isspace(static_cast<unsigned char>(ch)) != 0;
-}
-
-size_t FindOpeningTag(std::string_view text, std::string_view name, size_t from) {
-    const std::string needle = "<" + std::string(name);
-    size_t pos = from;
-    while ((pos = text.find(needle, pos)) != std::string_view::npos) {
-        const size_t after = pos + needle.size();
-        if (after < text.size() && IsXmlNameBoundary(text[after])) return pos;
-        pos = after;
+bool EqualsAsciiIgnoreCase(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) return false;
     }
-    return std::string_view::npos;
+    return true;
 }
 
-size_t FindClosingTag(std::string_view text, std::string_view name, size_t from) {
-    const std::string needle = "</" + std::string(name);
-    size_t pos = from;
-    while ((pos = text.find(needle, pos)) != std::string_view::npos) {
-        const size_t after = pos + needle.size();
-        if (after < text.size() && IsXmlNameBoundary(text[after])) return pos;
-        pos = after;
+struct ParsedXmlTag {
+    std::string_view name;
+    bool closing = false;
+    bool selfClosing = false;
+    bool hasCriteria = false;
+};
+
+bool ParseXmlTag(std::string_view text, size_t begin, size_t end, ParsedXmlTag& out) {
+    if (begin >= text.size() || end >= text.size() || text[begin] != '<' || text[end] != '>') {
+        return false;
     }
-    return std::string_view::npos;
-}
-
-std::string StripXmlComments(const std::string& text) {
-    std::string out;
-    out.reserve(text.size());
-    size_t pos = 0;
-    while (pos < text.size()) {
-        const size_t begin = text.find("<!--", pos);
-        if (begin == std::string::npos) {
-            out.append(text, pos, std::string::npos);
-            break;
-        }
-        out.append(text, pos, begin - pos);
-        const size_t end = text.find("-->", begin + 4);
-        if (end == std::string::npos) break;
-        pos = end + 3;
+    size_t pos = begin + 1;
+    if (pos < end && text[pos] == '/') {
+        out.closing = true;
+        ++pos;
     }
-    return out;
-}
-
-bool HasCriteriaAttribute(std::string_view tag) {
-    size_t pos = 0;
-    while ((pos = tag.find("criteria", pos)) != std::string_view::npos) {
-        const bool nameStart = pos == 0 || std::isspace(static_cast<unsigned char>(tag[pos - 1])) != 0;
-        size_t after = pos + 8;
-        while (nameStart && after < tag.size() &&
-               std::isspace(static_cast<unsigned char>(tag[after])) != 0) {
-            ++after;
-        }
-        if (nameStart && after < tag.size() && tag[after] == '=') return true;
-        pos += 8;
+    while (pos < end && std::isspace(static_cast<unsigned char>(text[pos])) != 0) ++pos;
+    const size_t nameBegin = pos;
+    while (pos < end && std::isspace(static_cast<unsigned char>(text[pos])) == 0 &&
+           text[pos] != '/') ++pos;
+    if (pos == nameBegin) return false;
+    out.name = text.substr(nameBegin, pos - nameBegin);
+    if (out.closing) {
+        while (pos < end && std::isspace(static_cast<unsigned char>(text[pos])) != 0) ++pos;
+        return pos == end;
     }
-    return false;
+
+    size_t attrPos = pos;
+    while (attrPos < end) {
+        while (attrPos < end && (std::isspace(static_cast<unsigned char>(text[attrPos])) != 0 ||
+                                 text[attrPos] == '/')) ++attrPos;
+        if (attrPos >= end) break;
+        const size_t attrBegin = attrPos;
+        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) == 0 &&
+               text[attrPos] != '=' && text[attrPos] != '/') ++attrPos;
+        if (attrPos == attrBegin) return false;
+        const std::string_view attr = text.substr(attrBegin, attrPos - attrBegin);
+        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) != 0) ++attrPos;
+        if (attrPos >= end || text[attrPos] != '=') return false;
+        ++attrPos;
+        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) != 0) ++attrPos;
+        if (attrPos >= end || (text[attrPos] != '\"' && text[attrPos] != '\'')) return false;
+        const char quote = text[attrPos++];
+        while (attrPos < end && text[attrPos] != quote) ++attrPos;
+        if (attrPos >= end) return false;
+        if (EqualsAsciiIgnoreCase(attr, "criteria")) out.hasCriteria = true;
+        ++attrPos;
+        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) != 0) ++attrPos;
+    }
+    size_t tail = end;
+    while (tail > begin && std::isspace(static_cast<unsigned char>(text[tail - 1])) != 0) --tail;
+    out.selfClosing = tail > begin && text[tail - 1] == '/';
+    return true;
 }
 
-bool IsSelfClosingTag(std::string_view tag) {
-    if (tag.empty()) return false;
-    size_t end = tag.size();
-    while (end > 0 && std::isspace(static_cast<unsigned char>(tag[end - 1])) != 0) --end;
-    return end > 0 && tag[end - 1] == '/';
-}
-
-// 只接受无 Criteria 的 FrontEndActions/ImportFiles。条件表达式由游戏求值，
-// loader 无法安全复现其语义；使用 loader 注入的 UI 应放在无条件 FrontEndActions 中。
-std::vector<std::wstring> ParseModinfoUiFiles(const std::string& text) {
-    std::vector<std::wstring> out;
-    const std::string clean = StripXmlComments(text);
-    size_t actionPos = 0;
-    while ((actionPos = FindOpeningTag(clean, "FrontEndActions", actionPos)) != std::string_view::npos) {
-        const size_t actionTagEnd = FindTagEnd(clean, actionPos);
-        if (actionTagEnd == std::string_view::npos) break;
-        const std::string_view actionTag(clean.data() + actionPos,
-                                         actionTagEnd - actionPos + 1);
-        if (IsSelfClosingTag(actionTag)) {
-            actionPos = actionTagEnd + 1;
+bool DecodeXmlEntities(const std::string& input, std::string& output) {
+    output.clear();
+    output.reserve(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] != '&') {
+            if (static_cast<unsigned char>(input[i]) < 0x20 && input[i] != '\t' &&
+                input[i] != '\n' && input[i] != '\r') return false;
+            output.push_back(input[i]);
             continue;
         }
-        const size_t actionEnd = FindClosingTag(clean, "FrontEndActions", actionTagEnd + 1);
-        if (actionEnd == std::string_view::npos) break;
-        const std::string_view action(clean.data() + actionTagEnd + 1,
-                                      actionEnd - actionTagEnd - 1);
+        const size_t semi = input.find(';', i + 1);
+        if (semi == std::string::npos || semi - i > 16) return false;
+        const std::string_view entity(input.data() + i + 1, semi - i - 1);
+        if (entity == "amp") output.push_back('&');
+        else if (entity == "lt") output.push_back('<');
+        else if (entity == "gt") output.push_back('>');
+        else if (entity == "quot") output.push_back('\"');
+        else if (entity == "apos") output.push_back('\'');
+        else return false;
+        i = semi;
+    }
+    return true;
+}
 
-        size_t importPos = 0;
-        while ((importPos = FindOpeningTag(action, "ImportFiles", importPos)) != std::string_view::npos) {
-            const size_t importTagEnd = FindTagEnd(action, importPos);
-            if (importTagEnd == std::string_view::npos) break;
-            const std::string_view importTag(action.data() + importPos,
-                                             importTagEnd - importPos + 1);
-            if (IsSelfClosingTag(importTag)) {
-                importPos = importTagEnd + 1;
-                continue;
+bool IsSafeUiFilePath(const std::string& file, std::string& baseName) {
+    if (file.empty() || file.front() == '/' || file.front() == '\\' || file.find(':') != std::string::npos) {
+        return false;
+    }
+    size_t slash = file.find_last_of("/\\");
+    const std::string fname = slash == std::string::npos ? file : file.substr(slash + 1);
+    if (fname.size() <= 11 || _strnicmp(fname.c_str(), kModUiPrefix, 11) != 0 ||
+        fname.size() < 4 || _stricmp(fname.c_str() + fname.size() - 4, ".xml") != 0) {
+        return false;
+    }
+    size_t begin = 0;
+    while (begin <= file.size()) {
+        const size_t end = file.find_first_of("/\\", begin);
+        const std::string_view component(file.data() + begin,
+                                         (end == std::string::npos ? file.size() : end) - begin);
+        if (component.empty() || component == "." || component == "..") return false;
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    baseName = file.substr(0, file.size() - 4);
+    return true;
+}
+
+struct XmlFrame {
+    std::string_view name;
+    bool importScope = false;
+    bool conditional = false;
+    bool captureFile = false;
+    std::string fileText;
+};
+
+// 只接受结构正确、无 Criteria 的 FrontEndActions/ImportFiles。
+// 文件路径必须是相对路径，且不能通过 . 或 .. 离开 Mod 的 VFS 范围。
+std::vector<std::wstring> ParseModinfoUiFiles(const std::string& text) {
+    std::vector<std::wstring> out;
+    std::vector<XmlFrame> stack;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        if (text[pos] != '<') {
+            const size_t next = text.find('<', pos);
+            const size_t end = next == std::string::npos ? text.size() : next;
+            if (!stack.empty() && stack.back().captureFile) {
+                stack.back().fileText.append(text, pos, end - pos);
             }
-            const size_t importEnd = FindClosingTag(action, "ImportFiles", importTagEnd + 1);
-            if (importEnd == std::string_view::npos) break;
-            const std::string_view block(action.data() + importTagEnd + 1,
-                                         importEnd - importTagEnd - 1);
-            const bool conditional = HasCriteriaAttribute(importTag) ||
-                FindOpeningTag(block, "Criteria", 0) != std::string_view::npos;
+            pos = end;
+            continue;
+        }
+        if (text.compare(pos, 4, "<!--") == 0) {
+            const size_t end = text.find("-->", pos + 4);
+            if (end == std::string::npos) return {};
+            pos = end + 3;
+            continue;
+        }
+        if (text.compare(pos, 9, "<![CDATA[") == 0) {
+            const size_t end = text.find("]]>", pos + 9);
+            if (end == std::string::npos) return {};
+            if (!stack.empty() && stack.back().captureFile) {
+                stack.back().fileText.append(text, pos + 9, end - pos - 9);
+            }
+            pos = end + 3;
+            continue;
+        }
+        if (text.compare(pos, 2, "<?") == 0 || text.compare(pos, 2, "<!") == 0) {
+            const size_t end = FindTagEnd(text, pos);
+            if (end == std::string_view::npos) return {};
+            pos = end + 1;
+            continue;
+        }
 
-            if (!conditional) {
-                size_t filePos = 0;
-                while ((filePos = FindOpeningTag(block, "File", filePos)) != std::string_view::npos) {
-                    const size_t fileTagEnd = FindTagEnd(block, filePos);
-                    if (fileTagEnd == std::string_view::npos) break;
-                    const std::string_view fileTag(block.data() + filePos,
-                                                   fileTagEnd - filePos + 1);
-                    if (IsSelfClosingTag(fileTag)) {
-                        filePos = fileTagEnd + 1;
-                        continue;
-                    }
-                    const size_t fileEnd = FindClosingTag(block, "File", fileTagEnd + 1);
-                    if (fileEnd == std::string_view::npos) break;
-                    const std::string file = TrimAscii(std::string(
-                        block.substr(fileTagEnd + 1, fileEnd - fileTagEnd - 1)));
-
-                    size_t slash = file.find_last_of('/');
-                    const size_t backslash = file.find_last_of('\\');
-                    if (backslash != std::string::npos &&
-                        (slash == std::string::npos || backslash > slash)) {
-                        slash = backslash;
-                    }
-                    const std::string fname = (slash == std::string::npos) ? file : file.substr(slash + 1);
-
-                    if (fname.size() > 11 &&
-                        _strnicmp(fname.c_str(), kModUiPrefix, 11) == 0 &&
-                        fname.size() >= 4 &&
-                        _stricmp(fname.c_str() + fname.size() - 4, ".xml") == 0) {
-                        const std::wstring wide = ModScan::NarrowToWide(
-                            file.substr(0, file.size() - 4));
-                        if (!wide.empty()) out.push_back(wide);
-                    }
-                    const size_t fileCloseEnd = FindTagEnd(block, fileEnd);
-                    if (fileCloseEnd == std::string_view::npos) break;
-                    filePos = fileCloseEnd + 1;
+        const size_t end = FindTagEnd(text, pos);
+        if (end == std::string_view::npos) return {};
+        ParsedXmlTag tag;
+        if (!ParseXmlTag(text, pos, end, tag)) return {};
+        if (tag.closing) {
+            if (stack.empty() || stack.back().name != tag.name) return {};
+            XmlFrame frame = std::move(stack.back());
+            stack.pop_back();
+            if (frame.captureFile && !stack.empty() && stack.back().importScope &&
+                !stack.back().conditional) {
+                std::string decoded;
+                const std::string trimmed = TrimAscii(frame.fileText);
+                if (!DecodeXmlEntities(trimmed, decoded)) return {};
+                std::string baseName;
+                if (IsSafeUiFilePath(decoded, baseName)) {
+                    const std::wstring wide = ModScan::NarrowToWide(baseName);
+                    if (wide.empty()) return {};
+                    out.push_back(wide);
                 }
             }
-            const size_t importCloseEnd = FindTagEnd(action, importEnd);
-            if (importCloseEnd == std::string_view::npos) break;
-            importPos = importCloseEnd + 1;
+        } else {
+            const bool parentIsFrontEndActions = !stack.empty() &&
+                stack.back().name == "FrontEndActions";
+            const bool parentIsImport = !stack.empty() && stack.back().importScope;
+            XmlFrame frame;
+            frame.name = tag.name;
+            frame.importScope = tag.name == "ImportFiles" && parentIsFrontEndActions;
+            frame.conditional = frame.importScope && tag.hasCriteria;
+            frame.captureFile = tag.name == "File" && parentIsImport && !stack.back().conditional;
+            if (tag.name == "Criteria") {
+                for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+                    if (it->importScope) { it->conditional = true; break; }
+                }
+            }
+            if (!tag.selfClosing) stack.push_back(std::move(frame));
         }
-        const size_t actionCloseEnd = FindTagEnd(clean, actionEnd);
-        if (actionCloseEnd == std::string_view::npos) break;
-        actionPos = actionCloseEnd + 1;
+        pos = end + 1;
     }
+    if (!stack.empty()) return {};
     return out;
 }
 
 // 遍历启用 Mod，解析各 .modinfo 的 FrontEndActions/ImportFiles，收集 FrontEndUI_*.xml base name。
-std::vector<std::wstring> FindModUiFiles(HMODULE anchor) {
+std::vector<std::wstring> FindModUiFiles() {
     std::vector<std::wstring> out;
     const EnabledMods::Snapshot snap = EnabledMods::Load();
     if (!snap.ok) {
@@ -398,21 +478,16 @@ std::vector<std::wstring> FindModUiFiles(HMODULE anchor) {
         return out;
     }
 
-    for (const auto& root : ModScan::CollectScanRoots(anchor)) {
+    // Mods.sqlite 已经给出实际启用的 modinfo 所在目录。直接遍历这些精确 root，
+    // 不再把扫描根下所有相似目录交给路径相交规则判断，避免多副本/嵌套目录混入。
+    for (const auto& enabledRoot : snap.enabledModRoots) {
         std::error_code ec;
-        if (!std::filesystem::is_directory(root, ec)) continue;
-        for (std::filesystem::directory_iterator it(root, ec), end;
-             !ec && it != end; it.increment(ec)) {
-            std::error_code de;
-            if (!it->is_directory(de)) continue;
-            const std::filesystem::path modDir = it->path();
-            if (!EnabledMods::AllowsPath(snap, modDir.wstring())) continue;
-
-            const std::string modinfo = ReadModinfo(modDir);
-            if (modinfo.empty()) continue;
-            const auto files = ParseModinfoUiFiles(modinfo);
-            out.insert(out.end(), files.begin(), files.end());
-        }
+        const std::filesystem::path modDir(enabledRoot);
+        if (!std::filesystem::is_directory(modDir, ec)) continue;
+        const std::string modinfo = ReadModinfo(modDir);
+        if (modinfo.empty()) continue;
+        const auto files = ParseModinfoUiFiles(modinfo);
+        out.insert(out.end(), files.begin(), files.end());
     }
 
     // 去重 + 大小写不敏感排序（稳定加载顺序）
@@ -442,25 +517,106 @@ struct UiApi {
     DestroyChildFn destroyChild = nullptr;
 };
 
+// ForgeUI 的这些调用都跨越游戏内部 ABI；把 SEH 边界放在不含 C++ 对象的
+// 小函数里，保证单个 context 失败时仍能回到调用方执行清理与重试。
+__declspec(noinline) void* CallAllocateContextSafe(AllocLuaContextFn fn, void* mgr) {
+    if (!fn) return nullptr;
+    __try {
+        return fn(mgr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("UiInject: AllocateControl 异常（已捕获）");
+        return nullptr;
+    }
+}
+
+__declspec(noinline) bool CallChangeParentSafe(ChangeParentFn fn, void* child, void* parent) {
+    if (!fn || !child || !parent) return false;
+    __try {
+        fn(child, parent);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("UiInject: ChangeParent 异常（已捕获）");
+        return false;
+    }
+}
+
+__declspec(noinline) bool CallDestroyChildSafe(DestroyChildFn fn, void* parent, void* child) {
+    if (!fn || !parent || !child) return false;
+    __try {
+        fn(parent, child);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("UiInject: DestroyChild 异常（已捕获），保留 context 等待重试");
+        return false;
+    }
+}
+
+__declspec(noinline) bool ReadPointerSafe(const void* address, void** value) {
+    if (!address || !value) return false;
+    __try {
+        *value = *reinterpret_cast<void* const*>(address);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+__declspec(noinline) bool CallLuaInitSafe(LuaInitFn fn, void* ctx, const wchar_t* baseName) {
+    if (!fn || !ctx || !baseName) return false;
+    __try {
+        fn(ctx, baseName);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("UiInject: LuaContext Initialize 异常（%ls，已捕获）", baseName);
+        return false;
+    }
+}
+
 // 创建 + 挂载 + 初始化一个 LuaContext（加载 baseName.xml + baseName.lua），挂到 parent 下。
 // Initialize 走虚表 +0x200（不硬编码地址），xml 的 context 节点由 ForgeUI 正确绑定。
-// 返回创建的 ctx（作为后续子 context 的 parent）；失败返回 nullptr。
-void* InjectSingleContext(const UiApi& api, void* mgr, void* parent, const wchar_t* baseName) {
-    void* ctx = api.alloc(mgr);
+// outAllocated 始终保留尚未确认销毁的 context，供 root 路径登记并在下一次刷新重试。
+void* InjectSingleContext(const UiApi& api, void* mgr, void* parent,
+                          const wchar_t* baseName, void** outAllocated) {
+    if (outAllocated) *outAllocated = nullptr;
+
+    void* ctx = CallAllocateContextSafe(api.alloc, mgr);
     if (!ctx) {
         Logger::Log("UiInject: AllocateControl 返回空（%ls）", baseName);
         return nullptr;
     }
-    api.changeParent(ctx, parent);
+    if (outAllocated) *outAllocated = ctx;
 
-    void* vt = *reinterpret_cast<void**>(ctx);
-    if (!Runtime::IsReadableSpan(vt, kVtInitSlot + sizeof(void*))) {
-        Logger::Log("UiInject: LuaContext 虚表不可读（%ls）", baseName);
+    if (!CallChangeParentSafe(api.changeParent, ctx, parent)) {
+        if (CallDestroyChildSafe(api.destroyChild, parent, ctx) && outAllocated) {
+            *outAllocated = nullptr;
+        }
+        Logger::Log("UiInject: ChangeParent 失败（%ls）", baseName);
         return nullptr;
     }
-    LuaInitFn init = *reinterpret_cast<LuaInitFn*>(
-        reinterpret_cast<uint8_t*>(vt) + kVtInitSlot);
-    init(ctx, baseName);
+
+    void* vt = nullptr;
+    if (!ReadPointerSafe(ctx, &vt)) {
+        Logger::Log("UiInject: LuaContext 虚表读取失败（%ls）", baseName);
+        if (CallDestroyChildSafe(api.destroyChild, parent, ctx) && outAllocated) {
+            *outAllocated = nullptr;
+        }
+        return nullptr;
+    }
+    if (!Runtime::IsReadableSpan(vt, kVtInitSlot + sizeof(void*))) {
+        Logger::Log("UiInject: LuaContext 虚表不可读（%ls）", baseName);
+        if (CallDestroyChildSafe(api.destroyChild, parent, ctx) && outAllocated) {
+            *outAllocated = nullptr;
+        }
+        return nullptr;
+    }
+    void* initAddress = nullptr;
+    if (!ReadPointerSafe(reinterpret_cast<uint8_t*>(vt) + kVtInitSlot, &initAddress) ||
+        !CallLuaInitSafe(reinterpret_cast<LuaInitFn>(initAddress), ctx, baseName)) {
+        if (CallDestroyChildSafe(api.destroyChild, parent, ctx) && outAllocated) {
+            *outAllocated = nullptr;
+        }
+        return nullptr;
+    }
     Logger::Log("UiInject: context 已加载 (%ls)", baseName);
     return ctx;
 }
@@ -525,39 +681,49 @@ void InjectFrontEndUi(void* state) {
         return;
     }
 
+    api.destroyChild = reinterpret_cast<DestroyChildFn>(
+        GetProcAddress(GetModuleHandleW(nullptr), kDestroyChildExport));
+    if (!api.destroyChild) {
+        const uintptr_t destroyAddr = ResolveChecked(kRva_DestroyChild, kSigDestroyChild,
+                                                     sizeof(kSigDestroyChild), "DestroyChild");
+        api.destroyChild = reinterpret_cast<DestroyChildFn>(destroyAddr);
+    }
+    if (!api.destroyChild) {
+        Logger::Log("UiInject: DestroyChild 不可用，跳过注入并保留刷新请求");
+        g_refreshRequested.store(true, std::memory_order_release);
+        return;
+    }
+
     if (!newFrontEnd && refresh && g_rootContext) {
-        api.destroyChild = reinterpret_cast<DestroyChildFn>(
-            GetProcAddress(GetModuleHandleW(nullptr), kDestroyChildExport));
-        if (!api.destroyChild) {
-            const uintptr_t destroyAddr = ResolveChecked(kRva_DestroyChild, kSigDestroyChild,
-                                                         sizeof(kSigDestroyChild), "DestroyChild");
-            api.destroyChild = reinterpret_cast<DestroyChildFn>(destroyAddr);
-        }
-        if (!api.destroyChild) {
-            Logger::Log("UiInject: DestroyChild 不可用，保留当前 UI，跳过刷新");
+        void* oldRoot = g_rootContext;
+        if (!CallDestroyChildSafe(api.destroyChild, frontEnd, oldRoot)) {
             g_refreshRequested.store(true, std::memory_order_release);
             return;
         }
-
-        void* oldRoot = g_rootContext;
         g_rootContext = nullptr;
-        api.destroyChild(frontEnd, oldRoot);
     }
 
     // 3) 注入根容器 context（lua 已留空），挂到 FrontEnd 下（其 Name = AdditionalFrontEndUI）
-    void* rootCtx = InjectSingleContext(api, mgr, frontEnd, kUiBaseName);
+    void* rootAllocated = nullptr;
+    void* rootCtx = InjectSingleContext(api, mgr, frontEnd, kUiBaseName, &rootAllocated);
     if (!rootCtx) {
+        // DestroyChild 失败时保留这个已挂载的 root，让下次刷新继续回收。
+        if (rootAllocated) g_rootContext = rootAllocated;
         g_refreshRequested.store(true, std::memory_order_release);
         return;
     }
     g_rootContext = rootCtx;
 
     // 4) 遍历启用 Mod 的 ImportFiles 声明，加载 FrontEndUI_*.xml，挂到根容器下
-    HMODULE anchor = LoaderCore::RuntimeModuleHandle();
-    const std::vector<std::wstring> modUis = FindModUiFiles(anchor);
+    const std::vector<std::wstring> modUis = FindModUiFiles();
     Logger::Log("UiInject: 发现 %zu 个 Mod UI", modUis.size());
     for (const auto& base : modUis) {
-        InjectSingleContext(api, mgr, rootCtx, base.c_str());
+        void* childAllocated = nullptr;
+        InjectSingleContext(api, mgr, rootCtx, base.c_str(), &childAllocated);
+        if (childAllocated) {
+            // 子 context 仍挂在 root 下；下一次刷新销毁 root 时会一并回收。
+            Logger::Log("UiInject: 子 context 回收延期至 root 销毁（%ls）", base.c_str());
+        }
     }
 }
 
@@ -569,8 +735,8 @@ void RunInjectionSafely(void* state) {
     __try {
         InjectFrontEndUi(state);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // 若异常发生在某个 Mod context 初始化之后，保留已登记的 root，
-        // 让下一次刷新先通过 DestroyChild 回收，避免重复挂载。
+        // 已登记的 root 会在下一次刷新通过 DestroyChild 回收；单个 context
+        // 的分配、挂载、初始化异常则由各自的安全调用负责清理或保留登记。
         g_refreshRequested.store(true, std::memory_order_release);
         Logger::Log("UiInject: 注入异常（已捕获），降级");
     }

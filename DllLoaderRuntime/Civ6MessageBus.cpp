@@ -7,7 +7,30 @@
 #include <vector>
 
 namespace {
-thread_local const void* g_currentHandlerEntry;
+struct HandlerCallFrame;
+thread_local const HandlerCallFrame* g_handlerCallStack = nullptr;
+
+// 栈上链表记录整个同步回调链，不分配内存；嵌套/递归返回后自动恢复。
+struct HandlerCallFrame {
+    const void* entry;
+    const HandlerCallFrame* previous;
+
+    explicit HandlerCallFrame(const void* handlerEntry) noexcept
+        : entry(handlerEntry), previous(g_handlerCallStack) {
+        g_handlerCallStack = this;
+    }
+    ~HandlerCallFrame() { g_handlerCallStack = previous; }
+    HandlerCallFrame(const HandlerCallFrame&) = delete;
+    HandlerCallFrame& operator=(const HandlerCallFrame&) = delete;
+};
+
+size_t ActiveCallsOnThisThread(const void* entry) {
+    size_t count = 0;
+    for (const auto* frame = g_handlerCallStack; frame; frame = frame->previous) {
+        if (frame->entry == entry) ++count;
+    }
+    return count;
+}
 
 // SEH thunk：__try 不能与带析构的局部对象同函数，独立成 noinline 函数。
 // 工程以 /EHsc 编译，catch(...) 捕不住访问违例等硬件异常——插件 OnMessage
@@ -126,15 +149,15 @@ void Civ6MessageBus::InvokeEntry(const HandlerPtr& entry, const char* topic,
     if (!entry || !entry->enabled.load(std::memory_order_acquire)) return;
     entry->activeCalls.fetch_add(1, std::memory_order_acq_rel);
     if (entry->enabled.load(std::memory_order_acquire)) {
-        const void* previous = g_currentHandlerEntry;
-        g_currentHandlerEntry = entry.get();
+        const HandlerCallFrame frame(entry.get());
         InvokeHandler(entry->handler, topic, data, len, name);
-        g_currentHandlerEntry = previous;
     }
-    if (entry->activeCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    {
         std::lock_guard<std::mutex> lock(entry->drainMutex);
-        entry->drainCv.notify_all();
+        entry->activeCalls.fetch_sub(1, std::memory_order_acq_rel);
     }
+    // 嵌套清理可能等的是“只剩本线程的 N 层”，因此每次退出都要通知。
+    entry->drainCv.notify_all();
 }
 
 void Civ6MessageBus::DisableAndDrain(const std::vector<HandlerPtr>& entries) {
@@ -142,10 +165,12 @@ void Civ6MessageBus::DisableAndDrain(const std::vector<HandlerPtr>& entries) {
         entry->enabled.store(false, std::memory_order_release);
     }
     for (const auto& entry : entries) {
-        if (entry.get() == g_currentHandlerEntry) continue;
+        // 本线程整条回调链（含重复递归帧）必须自然返回，不能同步等待自己；
+        // 其它线程的调用仍需排空。InvokeEntry 的 shared_ptr 快照保活旧 entry。
+        const size_t localCalls = ActiveCallsOnThisThread(entry.get());
         std::unique_lock<std::mutex> lock(entry->drainMutex);
-        entry->drainCv.wait(lock, [&entry] {
-            return entry->activeCalls.load(std::memory_order_acquire) == 0;
+        entry->drainCv.wait(lock, [&entry, localCalls] {
+            return entry->activeCalls.load(std::memory_order_acquire) <= localCalls;
         });
     }
 }

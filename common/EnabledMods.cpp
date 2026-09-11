@@ -194,7 +194,8 @@ Snapshot Load() {
         return snap;
     }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int stepRc = SQLITE_OK;
+    while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char* modId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         const char* pathUtf8 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         if (modId && *modId) {
@@ -214,9 +215,18 @@ Snapshot Load() {
         }
     }
 
+    // 只有 SQLITE_DONE 表示完整读取成功。中途失败时不能把部分启用集
+    // 当作有效快照；在 finalize/close 前保存错误，供扫描器走不可用分支。
+    if (stepRc != SQLITE_DONE) {
+        snap.error = "Mods.sqlite query failed (" + std::to_string(stepRc) + "): " +
+            sqlite3_errmsg(db);
+        snap.modIds.clear();
+        snap.enabledModRoots.clear();
+    }
+
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    snap.ok = true;
+    snap.ok = (stepRc == SQLITE_DONE);
     return snap;
 }
 
