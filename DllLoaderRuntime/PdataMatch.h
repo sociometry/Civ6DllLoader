@@ -2,25 +2,31 @@
 #include <cstdint>
 #include <Windows.h>
 
+#include "../common/HookAPI.h"   // HookImageId
+
 namespace PdataMatch {
-    // 加载 sidecar（先旁路文件 Civ6DllLoader.symdb.bin，再 RCDATA 资源），解析 old 签名表 + 符号表 + vtable 槽位。
+    // 加载 sidecar：多模块容器 v1（Header + ModuleDesc[]，每个模块独立 pdata/符号/槽位/堆/AOB；
+    // 单模块符号库也是它，moduleCount=1）。先读旁路文件 Civ6DllLoader.symdb.bin，再 RCDATA 资源 102。
+    // 压缩信封 "C6XC"(algo 1=LZMA1) 可解；裸 "C6SD" 直接透传。
     // 返回 false = sidecar 缺失/损坏（调用方应拒绝插件注入）。
     bool Init(HMODULE runtimeModule);
 
-    // 解析 new GameCore 的 .pdata + 算签名 + 版本指纹比对 + 磁盘缓存 + 全表序列对齐，产出 old->new 映射。
-    // 返回 false = 无法矫正（调用方应拒绝插件注入，但 GameCore 照常运行）。
-    bool BuildNewTable(HMODULE gameCore);
+    // 是否存在该映像的 sidecar 上下文（决定是否需要为它建档；没有就跳过）。
+    bool HasContext(uint32_t imageId);
+
+    // 解析目标映像的 .pdata + 算签名 + 身份判定 + 缓存 + 跨版本匹配，产出该模块 old->new 映射。
+    // imageId 取 HookImageId（1=ExeDx11, 2=ExeDx12, 5=GameCoreXP2）。
+    bool BuildNewTable(uint32_t imageId, HMODULE target);
 
     // 矫正 old_rva -> new_rva；无法矫正返回 0。
-    uintptr_t CorrectRva(uintptr_t oldRva);
+    uintptr_t CorrectRva(uint32_t imageId, uintptr_t oldRva);
 
     // 按名矫正（name 是 demangled 或 mangled 名）；无法矫正返回 0。
-    uintptr_t CorrectByName(const char* name);
+    uintptr_t CorrectByName(uint32_t imageId, const char* name);
 
     // 版本指纹（全表 (size,unwind_hash) 聚合 hash），供缓存键。
-    uint64_t Fingerprint();
+    uint64_t Fingerprint(uint32_t imageId);
 
     // 按 vtable 符号名（demangled/mangled）查矫正后的 vtable RVA 与槽位数。
-    // 返回 false = 符号不存在 / 非 vtable / 无法矫正。
-    bool CorrectVTableByName(const char* name, uint32_t& outRva, uint32_t& outSlotCount);
+    bool CorrectVTableByName(uint32_t imageId, const char* name, uint32_t& outRva, uint32_t& outSlotCount);
 }

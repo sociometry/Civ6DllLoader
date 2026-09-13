@@ -24,6 +24,7 @@
 #include "../common/Logger.h"
 #include "Runtime.h"
 #include "PdataMatch.h"
+#include "ImageAddress.h"
 #include "UiInject.h"
 
 namespace {
@@ -118,6 +119,35 @@ void LoaderCore::InitEarly() {
     Logger::Log("InitEarly: runtimeVersion=0x%08X", kLoaderRuntimeVersion);
     if (!PdataMatch::Init(g_runtimeModule)) {
         Logger::Log("InitEarly: PdataMatch::Init 失败（sidecar 缺失，继续）");
+    } else {
+        // 当前 exe（DX11/DX12）若有对应模块，先建档，供插件按旧 exe RVA 矫正。
+        // 缺模块 / 建档失败一律 fail-closed：该映像的 ResolveByRva/ResolveByName 返回 nullptr，
+        // 不回退原 RVA（原 RVA 在更新后本就是错的）——所以这三种情况必须留下醒目日志。
+        const HookImageId exeImage = ImageAddress::IdentifyExecutable();
+        Logger::Log("InitEarly: exe variant=%s (image=%u)",
+            exeImage == kHookImageExeDx11 ? "DX11" :
+                (exeImage == kHookImageExeDx12 ? "DX12" : "unknown"),
+            static_cast<unsigned>(exeImage));
+        if (exeImage == kHookImageInvalid) {
+            Logger::Log("InitEarly: [WARN] executable image not identified (DX11/DX12) - "
+                        "exe-domain RVA correction disabled");
+        } else if (!PdataMatch::HasContext(exeImage)) {
+            Logger::Log("InitEarly: [WARN] sidecar has no module for exe image=%u - old exe RVAs "
+                        "cannot be corrected (ResolveByRva/ResolveByName return nullptr)",
+                static_cast<unsigned>(exeImage));
+        } else {
+            HMODULE exeModule = GetModuleHandleW(nullptr);
+            if (exeModule && PdataMatch::BuildNewTable(exeImage, exeModule)) {
+                Logger::Log("InitEarly: PdataMatch exe table ready image=%u",
+                    static_cast<unsigned>(exeImage));
+            } else {
+                Logger::Log("InitEarly: [WARN] PdataMatch exe table build FAILED image=%u - "
+                            "old exe RVAs cannot be corrected this session; "
+                            "ResolveByRva/ResolveByName on this image will return nullptr "
+                            "(no raw-RVA fallback)",
+                    static_cast<unsigned>(exeImage));
+            }
+        }
     }
     if (!Runtime::InitMinHook()) {
         Logger::Log("InitEarly: Runtime::InitMinHook 失败（hook 功能不可用，继续）");

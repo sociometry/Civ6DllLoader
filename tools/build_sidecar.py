@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# build_sidecar.py - JSON + DLL -> sidecar bin (v4)
+# build_sidecar.py - JSON + DLL -> sidecar 容器 bin（v1，moduleCount=1）
 import argparse, json, os, struct, subprocess, sys, tempfile
 import pefile
 
@@ -66,8 +66,11 @@ def run_normhash(helper, records):
         os.unlink(inp)
 
 def main():
-    ap = argparse.ArgumentParser(description="JSON + DLL -> sidecar bin (v4, with PE timestamp)")
+    ap = argparse.ArgumentParser(
+        description="JSON + DLL -> sidecar 容器 bin (v1, moduleCount=1, with PE timestamp)")
     ap.add_argument("--dll", default=DEFAULT_DLL)
+    ap.add_argument("--image-id", type=int, default=5,
+                    help="模块身份：1=ExeDx11, 2=ExeDx12, 5=GameCoreXP2（默认 5）")
     ap.add_argument("--json", default=os.path.join(HERE, "Civ6DllLoader.symdb.json"))
     ap.add_argument("--bin", default=os.path.join(HERE, "Civ6DllLoader.symdb.bin"))
     ap.add_argument("--normhash", default=os.path.join(HERE, "normhash_helper.exe"))
@@ -77,6 +80,8 @@ def main():
     print("[1/5] JSON ...")
     with open(args.json, "r", encoding="utf-8") as f:
         j = json.load(f)
+    if int(j.get("version", 1)) != 1:
+        raise SystemExit("JSON version 必须是 1（实际 {}）".format(j.get("version")))
     sizeimg = int(j["baseSizeOfImage"], 16)
     symbols = j["symbols"]
     func_syms = [s for s in symbols if s["kind"] == "function"]
@@ -173,26 +178,15 @@ def main():
     slot_blob = struct.pack("<{}I".format(len(slot_table) * 2),
                            *[v for t in slot_table for v in t])
 
-    HDR = 52
-    pd_off = HDR
-    tg_off = pd_off + len(pdata_rows) * 16
-    vt_off = tg_off + len(symbols) * 32
-    heap_off = vt_off + len(slot_blob)
-    aob_off = heap_off + len(heap_bytes)
+    # 容器布局：Header(32B) + ModuleDesc(64B) + 各段（8B 对齐，offset 均为文件绝对偏移）
+    CTR_HDR, DESC = 32, 64
+    data_off = CTR_HDR + DESC
 
-    out = bytearray()
-    out += b"C6SD" + struct.pack("<I", 4) + struct.pack("<I", sizeimg)
-    out += struct.pack("<I", len(pdata_rows)) + struct.pack("<I", len(symbols))
-    out += struct.pack("<I", pd_off) + struct.pack("<I", tg_off)
-    out += struct.pack("<I", heap_off) + struct.pack("<I", len(heap_bytes))
-    out += struct.pack("<I", vt_off)
-    out += struct.pack("<I", aob_off) + struct.pack("<I", len(aob_blob))
-    out += struct.pack("<I", timestamp)
-    assert len(out) == 52
-
+    pdata_blob = bytearray()
     for b, s, u in pdata_rows:
-        out += struct.pack("<IIQ", b, s, u)
+        pdata_blob += struct.pack("<IIQ", b, s, u)
 
+    symbol_blob = bytearray()
     func_idx = 0
     for s in symbols:
         d = off_map.get(s.get("demangled", ""), 0)
@@ -203,22 +197,44 @@ def main():
             func_idx += 1
         else:
             kind, slot_cnt, nh = 1, s.get("slotCount", 0), 0
-        out += struct.pack("<II", d, m)
-        out += struct.pack("<I", rva)
-        out += struct.pack("<BBH", kind, slot_cnt, 0)
-        out += struct.pack("<Q", nh)
-        out += struct.pack("<II", 0, 0)
+        symbol_blob += struct.pack("<II", d, m)
+        symbol_blob += struct.pack("<I", rva)
+        # vtableSlotCount 为 16 位（<BHB>: kind, u16 count, u8 reserved）
+        assert slot_cnt <= 0xFFFF, "vtable slot count too large"
+        symbol_blob += struct.pack("<BHB", kind, slot_cnt, 0)
+        symbol_blob += struct.pack("<Q", nh)
+        symbol_blob += struct.pack("<II", 0, 0)
 
-    out += slot_blob
-    out += heap_bytes
-    out += aob_blob
+    blocks = bytearray()
+
+    def append_block(blk):
+        off = data_off + len(blocks)
+        blocks.extend(blk)
+        blocks.extend(bytes((8 - (len(blocks) % 8)) % 8))
+        return off
+
+    pd_off = append_block(bytes(pdata_blob))
+    sy_off = append_block(bytes(symbol_blob))
+    vt_off = append_block(bytes(slot_blob))
+    heap_off = append_block(bytes(heap_bytes))
+    aob_off = append_block(bytes(aob_blob))
+
+    out = bytearray()
+    out += b"C6SD" + struct.pack("<IIIIIII", 1, 1, CTR_HDR, DESC, data_off, 0, 0)
+    assert len(out) == CTR_HDR
+    out += struct.pack("<16I", args.image_id, sizeimg, timestamp,
+                       pd_off, len(pdata_rows), sy_off, len(symbols),
+                       vt_off, len(slot_table), heap_off, len(heap_bytes),
+                       aob_off, len(aob_blob), 0, 0, 0)
+    assert len(out) == data_off
+    out += blocks
 
     with open(args.bin, "wb") as f:
         f.write(out)
-    print("      bin: {} bytes".format(len(out)))
+    print("      bin: {} bytes (container v1, image-id={})".format(len(out), args.image_id))
     print("      timestamp: 0x{:08X}".format(timestamp))
-    print("      layout: pd={} tg={} vt={} heap={} aob={}".format(
-        pd_off, tg_off, vt_off, heap_off, aob_off))
+    print("      layout: data={} pd={} sy={} vt={} heap={} aob={}".format(
+        data_off, pd_off, sy_off, vt_off, heap_off, aob_off))
     print("done.")
 
 if __name__ == "__main__":

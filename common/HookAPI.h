@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 // Plugin <-> Runtime HookAPI ABI generation.
 // This pre-release ABI is defined by the current field order; plugins must be rebuilt when it changes.
@@ -17,124 +18,6 @@
 #endif
 
 #ifdef __cplusplus
-
-// ---- GameEvent 参数容器（IScriptSystemArgs1）vtable 包装 ----
-// 槽位布局 = 引擎 ms_pkScriptSystemArgs_vtbl（18 槽，exe IDA @0x140FC0588 逐槽反编译验证）。
-// 本类是"指针直通"包装：ScriptSystemArgs* 直接就是引擎 args 对象指针（单指针
-// 布局，static_assert 锁死），成员函数按槽位调用其 vtable。
-// 用法：在引擎 args 对象指针上调用 Push*/Get* 成员填充/读取参数：
-//
-//   void MyPush(ScriptSystemArgs* args) {
-//       args->PushInt(42);
-//       args->PushString("hello", 5);
-//   }
-//
-// 生命周期：args 仅在所属回调执行期间存活，不要在回调外缓存。回调整体在
-// runtime 的 SEH 保护内执行。
-class ScriptSystemArgs {
-public:
-    // ---- Push：追加参数（返回新参数的索引）----
-    // 以下 5 槽调用约定经 exe IDA 反编译逐槽验证（Push_int(this, uint)、
-    // Push_String(this, const void*, size_t) 等），也是引擎官方桥接 lambda
-    // （CityBuilt 等）使用的全部参数形态。
-    uint64_t PushFloat(float value)     { return call<uint64_t, 4>(value); }
-    uint64_t PushInt(int value)         { return call<uint64_t, 5>(value); }
-    uint64_t PushString(const char* s, uint64_t len) { return call<uint64_t, 6>(s, len); }
-    uint64_t PushBool(bool value)       { return call<uint64_t, 7>(value); }
-    uint64_t PushNull()                 { return call<uint64_t, 8>(); }
-    // ---- Push：table 参数（引擎 Data::TypedVariantMap，官方 Events.Combat 同机制）----
-    // 表对象经 GameEventTable 构造填充（见下）；引擎解包时该参数成为 Lua table。
-    // PushTable 调 args vtable 槽2（Push_ContainerRvalue）——引擎按右值/移动语义接管
-    // 表所有权（与 SetVariant 槽21 按值拷贝条目一致）；PushTable 后表析构变 no-op，
-    // 禁止继续使用该表（尤其禁止再 SetXxx / 再次 PushTable）。
-    // 约束：表对象须存活到 PushTable 调用结束（回调内栈对象天然满足）。
-    uint64_t PushTable(const class GameEventTable& table);
-    // 刻意不暴露的槽位（同样经反编译确认，见 docs）：
-    //  - 槽[3] Push_UserData：把裸 8 字节指针塞进 Lua（userdata）——Lua 侧可长期持有，
-    //    C++ 对象生存期无法约束，悬空即崩，不开放。
-    //  - 槽[1] Push_Container(ConstRef)：借用语义，不开放。槽[2] Push_Container(Rvalue)
-    //    由 PushTable 使用：参数是引擎 Data::TypedVariantMap 真对象指针（经 GameEventTable
-    //    构造装真 vtable，非插件伪造的接口对象）。Lua 侧需要结构化数据时用 PushTable
-    //    或 JSON 字符串自行约定。
-
-    // ---- Get：按索引查询已 Push 的参数（索引从 0 起）----
-    // 真实签名（exe IDA 反编译逐槽验证）：(this, index, T* out) → bool（成功标志），
-    // 值写入 out；索引越界或类型不匹配返回 false 且不写 out。
-    // GetType 返回引擎类型码（0=无效 1=bool 2=int 3=float? 4=int 5=string 6=user 7=table，
-    // 精确含义见引擎 VariantType 枚举），Count 返回已 Push 参数个数。
-    uint64_t    Count() const                        { return call<uint64_t, 9>(); }
-    int         GetType(uint32_t index) const        { return call<int, 10>(index); }
-    bool        GetBool(uint32_t index, bool* out) const          { return call<bool, 11>(index, out); }
-    bool        GetInt(uint32_t index, int32_t* out) const        { return call<bool, 12>(index, out); }
-    bool        GetFloat(uint32_t index, float* out) const        { return call<bool, 13>(index, out); }
-    bool        GetString(uint32_t index, const char** out) const { return call<bool, 14>(index, out); }
-    void*       GetParent() const                                { return call<void*, 17>(); }
-    // 槽[15] GetTable / [16] GetUser 不暴露：容器与 userdata 是刻意不开放的
-    // 参数形态（见 Push 段注释），对应的读回通道一并收口。
-
-    // 裸指针（本类即指针直通包装，raw() 仅在需要喂给 void* 形参的引擎 API 时用）。
-    void* raw() const { return reinterpret_cast<void*>(const_cast<ScriptSystemArgs*>(this)); }
-
-private:
-    // 槽 [0] 为析构相关（不暴露：args 生命周期由 runtime 的 DestroyArgs 管理）。
-    template <typename Ret, size_t Slot, typename... A>
-    Ret call(A... args) const {
-        using Fn = Ret(__fastcall*)(const ScriptSystemArgs*, A...);
-        const void* const* vt = *reinterpret_cast<const void* const* const*>(this);
-        return reinterpret_cast<Fn>(vt[Slot])(this, args...);
-    }
-};
-// 指针直通说明：本类无数据成员，ScriptSystemArgs* 的值即引擎 IScriptSystemArgs1
-// 对象指针（call() 以 this 调用其 vtable 槽位）。sizeof 无意义（空类恒为 1），
-// 禁止按值传递或存储本类——只用指针。
-
-// ---- GameEvent table 参数（Data::TypedVariantMap 包装）----
-// 引擎官方 Events.Combat 的 combatResult 同机制：88 字节堆对象 + 引擎真 vtable。
-// 构造/析构经 HookAPI 新增的 AllocTypedVariantMap/FreeTypedVariantMap；键哈希用
-// api->MakeHash("字段名")；SetXxx 全部虚槽直调（零额外 API 表面积）。
-// 用法（Lua 路径内）：
-//   GameEventTable t(api);                    // api = OnLoad 收到的 HookAPI*
-//   t.SetInt   (api->MakeHash("playerId"), 42);
-//   t.SetString(api->MakeHash("name"), "Caesar");
-//   GameEventTable child(api);
-//   child.SetUInt(api->MakeHash("hp"), 100);
-//   t.SetChild (api->MakeHash("units"), child);   // 嵌套子表
-//   args->PushTable(t);                        // 所有权移交引擎（t 析构变 no-op）
-typedef struct HookAPI HookAPI;  // 前向声明（完整定义见下方 C 区）
-class GameEventTable {
-public:
-    explicit GameEventTable(const HookAPI* api);   // AllocTypedVariantMap：分配 88 字节并调引擎构造
-    ~GameEventTable();                             // 未 Push 过才 FreeTypedVariantMap；已 Push 则 no-op
-    GameEventTable(const GameEventTable&) = delete;
-    GameEventTable& operator=(const GameEventTable&) = delete;
-    GameEventTable(GameEventTable&& other) noexcept;       // 移动：转移 m_map/m_pushed/m_api，源置空
-    GameEventTable& operator=(GameEventTable&& other) noexcept;
-
-    bool   valid() const { return m_map != nullptr; }
-    void*  raw() const { return m_map; }
-    // 键 = api->MakeHash("字段名")。全部经引擎 vtable 虚槽（构造时装的真表）。
-    void SetInt   (uint32_t key, int32_t value);
-    void SetUInt  (uint32_t key, uint32_t value);
-    void SetFloat (uint32_t key, float value);
-    void SetBool  (uint32_t key, bool value);
-    void SetString(uint32_t key, const char* value);          // 空指针/空串 → 不写键（Lua 侧为 nil）
-    void SetChild (uint32_t key, const GameEventTable& child); // child 保持独立（引擎按值拷贝条目）
-    void Remove   (uint32_t key);
-
-    // 内部：PushTable 调用后置位（引擎接管生存期，析构变 no-op）
-    void markPushed() { m_pushed = true; }
-private:
-    // 引擎 vtable 虚槽直调（模式同 ScriptSystemArgs::call，this 为 m_map）
-    template <typename Ret, size_t Slot, typename... A>
-    Ret vtCall(A... args) const {
-        using Fn = Ret(__fastcall*)(void*, A...);
-        const void* const* vt = *reinterpret_cast<const void* const* const*>(m_map);
-        return reinterpret_cast<Fn>(vt[Slot])(m_map, args...);
-    }
-    void* m_map = nullptr;
-    mutable bool m_pushed = false;   // mutable：PushTable 以 const 引用置位（免 friend）
-    const HookAPI* m_api = nullptr;  // 仅析构/移动需要（Set 全走虚槽）
-};
 
 extern "C" {
 #endif
@@ -190,6 +73,39 @@ typedef struct HookImageInfo {
     size_t imageSize;
     uint64_t generation;  // exe 恒为 1；GameCore 每次 attach 递增
 } HookImageInfo;
+
+// ---- 通用取址描述（不限映像；exe 域配 HookInfoExe 二选一）----
+// 三种取址方式，各自可附带一条 AOB 兜底（仅主路径失败时使用；命中处即地址）：
+//   kHookInfoRva    : rva（走 pdata 矫正，语义同 ResolveByRva）
+//   kHookInfoVTable : vtableName + 槽序号（0,1,2...，同 ResolveByVTable）
+//   kHookInfoName   : 符号名（demangled / mangled 均可，同 ResolveByName）
+typedef enum HookInfoKind {
+    kHookInfoRva = 0,
+    kHookInfoVTable = 1,
+    kHookInfoName = 2
+} HookInfoKind;
+
+typedef struct HookInfoVTableRef {
+    const char* vtableName;
+    uint32_t slotIndex;   // 槽函数序号（0 起；不是字节偏移）
+} HookInfoVTableRef;
+
+typedef struct HookInfo {
+    HookInfoKind kind;
+    const char*  aob;     // 可选：AOB（语法同 ResolveByPattern）
+    uint32_t     index;   // AOB 多命中时选第几个（1 起；0 视为默认 1）
+    union {
+        uintptr_t         rva;
+        HookInfoVTableRef vtable;
+        const char*       name;
+    } u;
+} HookInfo;
+
+// 按当前进程实际加载的 exe 二选一：CivilizationVI.exe -> dx11，CivilizationVI_DX12.exe -> dx12。
+typedef struct HookInfoExe {
+    HookInfo dx11;
+    HookInfo dx12;
+} HookInfoExe;
 
 // Matches hks::LUA_GLOBAL - plugins can use this with LuaSetField.
 enum { kHookApiLuaGlobal = -10002 };
@@ -313,8 +229,6 @@ typedef struct HookAPI {
     void (*LuaPushCFunctionField)(void* L, int tableIndex, const char* fieldName, void* fn, const char* internalName);
     void (*LuaNewGlobalTable)(void* L, const char* globalName, int narr, int nrec);
 
-    unsigned int (*GetCurTurn)(void);
-
     void* (*LocalizationLookup)(void* outLocString, const char* key);
 
     uint32_t (*LocStringBytes)(void);
@@ -324,7 +238,6 @@ typedef struct HookAPI {
     int (*LocPushArgument)(void* loc, const char* arg);
     const char* (*LocToUtf8)(void* loc);
 
-    int64_t (*SendGameEvent)(int64_t eventId, unsigned int a, unsigned int b);
     void* (*EditPlayer)(int playerId);
     const char* (*GetCivilizationDescription)(void* player);
     uint32_t (*MakeHash)(const char* str);
@@ -366,23 +279,10 @@ typedef struct HookAPI {
     // TriggerGameEvent：手动触发一次（必须先注册——回查注册记录拿 pushFn，未注册返回 false），
     //   payload 传给注册时的 pushFn（payload 同步解析，仅在本调用期间有效；pushFn 为 null = 无参调用）。
     //   插件回调与 Lua 调用的 SEH/C++ 异常由 Loader 截获并返回 false。
+    //   GameCore 锁状态无法判定时（EngineUtility 解析失败或取/放锁调用异常）拒绝执行并返回 false：
+    //   宁可漏触发，也不在持锁状态下重入 Lua（可能自死锁或破坏 Lua 状态）。
     //   必须在游戏线程调用——Lua 状态非线程安全。
     bool (*TriggerGameEvent)(const char* name, const void* payload);
-
-    // GameEvent table 参数支持（Data::TypedVariantMap 生命周期管理；SetXxx 在头文件类内联）。
-    // Alloc：分配 88 字节并调引擎构造（返回引擎对象指针；失败 nullptr——GameCore 未就绪等）。
-    // Free：调引擎 scalar deleting destructor 并释放（传 engineObj 指针；仅对未 Push 的表调用，
-    //        PushTable 后所有权归引擎，禁止 Free）。
-    void* (*AllocTypedVariantMap)(void);
-    void  (*FreeTypedVariantMap)(void* engineObj);
-
-    // 官方 ScriptSystem::PushDataVariantMap 直调（vtable 槽21，0x140FC06C0）：
-    // 把 GameEventTable（TypedVariantKeyedContainer）压到 lua_State 栈顶，官方 ToLua 转换
-    // （嵌套子表完整；键走 VariantManager::FindKey 反查——官方字段名→字符串键、
-    // 未注册的自定义名→CRC32 数字键，见 exe sub_140DB5590）。
-    // useKeyLookup=false 恒数字键。仅游戏线程、L 有效、tableObj 为未 Push 的
-    // GameEventTable::raw() 时调用；GameCore 未就绪时无操作返回。
-    void (*PushDataVariantMap)(void* L, const void* tableObj, bool useKeyLookup);
 
     // GameCore::EngineUtility 全局对象指针（ms_pkCurrentGame 槽 +0x18，与 scriptSystem +0x20
     // 同族；IDA 实证 www.ms_pkEngineUtility）——锁协议用：
@@ -455,101 +355,277 @@ T ResolveByVTable(HookAPI* api, HookImageId image, const char* vtableSymbol, uin
     return reinterpret_cast<T>(api->ResolveByVTable(image, vtableSymbol, index));
 }
 
-// ---- GameEventTable 实现 / ScriptSystemArgs::PushTable（此处 HookAPI 已完整定义）----
+// ---------------- HookInfo 取址工具（header-only，只组合 HookAPI 既有入口，不占 ABI 字段）----------------
 
-// vtable 槽位（rva_map vtable_xrefs 双向验证：槽号×8 = vtable 偏移）：
-//   槽21 (+0xA8) SetVariant(uint, TypedVariantMap*)   嵌套子表
-//   槽33 (+0x108) SetVariant(uint, const char*)       字符串
-//   槽36 (+0x120) SetVariant(uint, float)
-//   槽37 (+0x128) SetVariant(uint, uint)
-//   槽38 (+0x130) SetVariant(uint, int)
-//   槽39 (+0x138) SetVariant(uint, bool)
-//   槽40 (+0x140) RemoveVariant(uint)
-enum GameEventTableVtSlot : uint32_t {
-    kGameEventTableVtSetChild  = 21,
-    kGameEventTableVtSetString = 33,
-    kGameEventTableVtSetFloat  = 36,
-    kGameEventTableVtSetUInt   = 37,
-    kGameEventTableVtSetInt    = 38,
-    kGameEventTableVtSetBool   = 39,
-    kGameEventTableVtRemove    = 40
-};
+static constexpr HookInfo HookRva(uintptr_t rva, const char* aob = nullptr,
+    uint32_t index = 1) {
+    HookInfo info{};
+    info.kind = kHookInfoRva;
+    info.aob = aob;
+    info.index = index;
+    info.u.rva = rva;
+    return info;
+}
 
-inline GameEventTable::GameEventTable(const HookAPI* api)
-    : m_map(api ? api->AllocTypedVariantMap() : nullptr), m_api(api) {}
+static constexpr HookInfo HookVTable(const char* vtableName, uint32_t slotIndex,
+    const char* aob = nullptr, uint32_t index = 1) {
+    HookInfo info{};
+    info.kind = kHookInfoVTable;
+    info.aob = aob;
+    info.index = index;
+    info.u.vtable.vtableName = vtableName;
+    info.u.vtable.slotIndex = slotIndex;
+    return info;
+}
 
-inline GameEventTable::~GameEventTable() {
-    // 已 Push（所有权移交引擎）或从未分配：no-op。未 Push：FreeTypedVariantMap 析构+释放。
-    if (m_map && !m_pushed && m_api) {
-        m_api->FreeTypedVariantMap(m_map);
+static constexpr HookInfo HookName(const char* name, const char* aob = nullptr,
+    uint32_t index = 1) {
+    HookInfo info{};
+    info.kind = kHookInfoName;
+    info.aob = aob;
+    info.index = index;
+    info.u.name = name;
+    return info;
+}
+
+// AOB 语法解析（与 HookAPI::ResolveByPattern 完全一致：?? 整字节通配、4?/?F 半字节、十六进制）。
+static inline bool HookParsePattern(const char* pattern, uint8_t* values, uint8_t* masks,
+    int maxTokens, int* outCount) {
+    if (!pattern || !values || !masks || !outCount || maxTokens <= 0) return false;
+    int count = 0;
+    const char* p = pattern;
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n' || *p == '\r') ++p;
+        if (!*p) break;
+        if (count >= maxTokens) return false;
+        uint8_t value = 0;
+        uint8_t mask = 0;
+        for (int nib = 0; nib < 2; ++nib) {
+            value = static_cast<uint8_t>(value << 4);
+            mask = static_cast<uint8_t>(mask << 4);
+            const char c = *p;
+            if (c == '?') {
+                ++p;
+            } else if (c >= '0' && c <= '9') {
+                value = static_cast<uint8_t>(value | (c - '0'));
+                mask = static_cast<uint8_t>(mask | 0xF);
+                ++p;
+            } else if (c >= 'a' && c <= 'f') {
+                value = static_cast<uint8_t>(value | (c - 'a' + 10));
+                mask = static_cast<uint8_t>(mask | 0xF);
+                ++p;
+            } else if (c >= 'A' && c <= 'F') {
+                value = static_cast<uint8_t>(value | (c - 'A' + 10));
+                mask = static_cast<uint8_t>(mask | 0xF);
+                ++p;
+            } else {
+                return false;
+            }
+        }
+        values[count] = value;
+        masks[count] = mask;
+        ++count;
     }
-    m_map = nullptr;
+    *outCount = count;
+    return count > 0;
 }
 
-inline GameEventTable::GameEventTable(GameEventTable&& other) noexcept
-    : m_map(other.m_map), m_pushed(other.m_pushed), m_api(other.m_api) {
-    other.m_map = nullptr;
-    other.m_pushed = false;
-    other.m_api = nullptr;
-}
-
-inline GameEventTable& GameEventTable::operator=(GameEventTable&& other) noexcept {
-    if (this != &other) {
-        if (m_map && !m_pushed && m_api) m_api->FreeTypedVariantMap(m_map);
-        m_map = other.m_map;
-        m_pushed = other.m_pushed;
-        m_api = other.m_api;
-        other.m_map = nullptr;
-        other.m_pushed = false;
-        other.m_api = nullptr;
+// 定位映像里指定名字的段（PE 段表，语义同 runtime 内部 ResolveSectionRva；返回段起始指针）。
+static inline const uint8_t* HookFindSection(HookAPI* api, HookImageId image, const char* name,
+    size_t* outSize) {
+    if (!api || !name) return nullptr;
+    HookImageInfo info{};
+    info.structSize = sizeof(HookImageInfo);
+    if (!api->GetImageInfo(image, &info) || !info.base) return nullptr;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(info.base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const uint8_t*>(info.base) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        bool match = true;
+        for (int k = 0; k < 8; ++k) {
+            if (sec->Name[k] != static_cast<unsigned char>(name[k])) { match = false; break; }
+            if (name[k] == '\0') break;
+        }
+        if (!match) continue;
+        const size_t size = sec->Misc.VirtualSize > sec->SizeOfRawData
+            ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        if (outSize) *outSize = size;
+        return reinterpret_cast<const uint8_t*>(info.base) + sec->VirtualAddress;
     }
-    return *this;
+    return nullptr;
 }
 
-inline void GameEventTable::SetInt(uint32_t key, int32_t value) {
-    if (m_map) vtCall<void*, kGameEventTableVtSetInt>(key, value);
+// AOB 第 index 个命中（1 起；0 视为 1）：index <= 1 直接走 HookAPI::ResolveByPattern（行为不变），
+// index > 1 时在 .text 段内自行扫描取第 index 个（API 只给首命中，故无法纯组合实现）。
+static inline void* HookScanPatternNth(HookAPI* api, HookImageId image, const char* pattern,
+    uint32_t index) {
+    if (!api || !pattern || !*pattern) return nullptr;
+    if (index <= 1) return api->ResolveByPattern(image, pattern, kSectionText);
+    constexpr int kMaxTokens = 512;
+    uint8_t values[kMaxTokens];
+    uint8_t masks[kMaxTokens];
+    int count = 0;
+    if (!HookParsePattern(pattern, values, masks, kMaxTokens, &count) || count == 0) return nullptr;
+    size_t sectionSize = 0;
+    const uint8_t* begin = HookFindSection(api, image, ".text", &sectionSize);
+    if (!begin || sectionSize < static_cast<size_t>(count)) return nullptr;
+    const size_t limit = sectionSize - static_cast<size_t>(count) + 1;
+    uint32_t hits = 0;
+    for (size_t i = 0; i < limit; ++i) {
+        bool match = true;
+        for (int j = 0; j < count; ++j) {
+            if ((begin[i + j] & masks[j]) != values[j]) { match = false; break; }
+        }
+        if (match && ++hits == index) return const_cast<uint8_t*>(begin + i);
+    }
+    return nullptr;
 }
 
-inline void GameEventTable::SetUInt(uint32_t key, uint32_t value) {
-    if (m_map) vtCall<void*, kGameEventTableVtSetUInt>(key, value);
+// 解析一条 HookInfo：主路径（Rva / VTable / Name）失败时，若有 aob 则按 index 兜底定位。
+static inline void* ResolveByHookInfo(HookAPI* api, HookImageId image, const HookInfo& info,
+    size_t span = 1) {
+    if (!api) return nullptr;
+    void* result = nullptr;
+    switch (info.kind) {
+        case kHookInfoRva:
+            if (info.u.rva != 0) result = api->ResolveByRva(image, info.u.rva, span);
+            break;
+        case kHookInfoVTable:
+            if (info.u.vtable.vtableName && *info.u.vtable.vtableName)
+                result = api->ResolveByVTable(image, info.u.vtable.vtableName, info.u.vtable.slotIndex);
+            break;
+        case kHookInfoName:
+            if (info.u.name && *info.u.name) result = api->ResolveByName(image, info.u.name);
+            break;
+        default:
+            break;
+    }
+    if (!result && info.aob && *info.aob)
+        result = HookScanPatternNth(api, image, info.aob, info.index);
+    return result;
 }
 
-inline void GameEventTable::SetFloat(uint32_t key, float value) {
-    if (m_map) vtCall<void*, kGameEventTableVtSetFloat>(key, value);
+// 当前进程 exe 的镜像 id（Dx11 / Dx12；未识别 = kHookImageInvalid）。内部细节，不写进文档。
+static inline HookImageId HookCurrentExeImage(HookAPI* api) {
+    if (!api) return kHookImageInvalid;
+    HookImageInfo info{};
+    info.structSize = sizeof(HookImageInfo);
+    if (api->GetImageInfo(kHookImageExeDx11, &info)) return kHookImageExeDx11;
+    info = HookImageInfo{};
+    info.structSize = sizeof(HookImageInfo);
+    if (api->GetImageInfo(kHookImageExeDx12, &info)) return kHookImageExeDx12;
+    return kHookImageInvalid;
 }
 
-inline void GameEventTable::SetBool(uint32_t key, bool value) {
-    if (m_map) vtCall<void*, kGameEventTableVtSetBool>(key, value);
+static inline void* ResolveByHookInfoExe(HookAPI* api, const HookInfoExe& info, size_t span = 1) {
+    const HookImageId image = HookCurrentExeImage(api);
+    if (image == kHookImageInvalid) return nullptr;
+    return ResolveByHookInfo(api, image,
+        image == kHookImageExeDx12 ? info.dx12 : info.dx11, span);
 }
 
-inline void GameEventTable::SetString(uint32_t key, const char* value) {
-    if (!m_map) return;
-    // 空指针/空串：不写键（Lua 侧读 nil），避免制造空串条目
-    if (!value || !*value) return;
-    vtCall<void*, kGameEventTableVtSetString>(key, value);
+static inline bool HookAobIsHex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-inline void GameEventTable::SetChild(uint32_t key, const GameEventTable& child) {
-    if (!m_map || !child.valid()) return;
-    vtCall<void*, kGameEventTableVtSetChild>(key, child.raw());
+// AOB 相对寻址定位（不限映像；内部扫 .text）：
+//   AOB 用 | 切分指令段；含 xx xx xx xx 的段 = 目标指令；段内恰好一组 xx（= disp32）。
+//   命中 H、目标段起止字节偏移 S/E（| 不计入）、xx 组偏移 D  ->  目标 = H + E + i32[H + D]。
+//   运行期 | 去掉、xx 换成 ??，交给 ResolveByPattern；命中不唯一/格式非法/目标越界 -> nullptr。
+static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char* aob,
+    uint32_t index = 1) {
+    if (!api || image == kHookImageInvalid || !aob || !*aob) return nullptr;
+    constexpr int kMaxTokens = 256;
+    char flat[kMaxTokens * 3 + 1];
+    size_t flatLen = 0;
+    int segIndex = 0;
+    int byteOff = 0;
+    int tokenSeg[kMaxTokens];
+    int tokenByte[kMaxTokens];
+    bool tokenXx[kMaxTokens];
+    char tokenText[kMaxTokens][3];
+    int tokenCount = 0;
+    int xxFirst = -1;
+    int xxCount = 0;
+
+    const char* p = aob;
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n' || *p == '\r') ++p;
+        if (!*p) break;
+        if (*p == '|') { ++segIndex; ++p; continue; }
+        const char c0 = p[0];
+        const char c1 = p[1];
+        if (!c0 || !c1) return nullptr;
+        if (c1 == ' ' || c1 == '\t' || c1 == ',' || c1 == '|' || c1 == '\n' || c1 == '\r')
+            return nullptr;   // 必须两位一组
+        const bool isXx = (c0 == 'x' || c0 == 'X') && (c1 == 'x' || c1 == 'X');
+        if (!isXx) {
+            const bool wild0 = (c0 == '?');
+            const bool wild1 = (c1 == '?');
+            if (!wild0 && !HookAobIsHex(c0)) return nullptr;
+            if (!wild1 && !HookAobIsHex(c1)) return nullptr;
+        }
+        if (tokenCount >= kMaxTokens || flatLen + 4 >= sizeof(flat)) return nullptr;
+        tokenText[tokenCount][0] = c0;
+        tokenText[tokenCount][1] = c1;
+        tokenText[tokenCount][2] = '\0';
+        tokenXx[tokenCount] = isXx;
+        tokenSeg[tokenCount] = segIndex;
+        tokenByte[tokenCount] = byteOff;
+        if (isXx) {
+            if (xxFirst < 0) xxFirst = tokenCount;
+            ++xxCount;
+            flat[flatLen++] = '?';
+            flat[flatLen++] = '?';
+        } else {
+            flat[flatLen++] = c0;
+            flat[flatLen++] = c1;
+        }
+        flat[flatLen++] = ' ';
+        ++tokenCount;
+        ++byteOff;
+        p += 2;
+    }
+    flat[flatLen] = '\0';
+    if (tokenCount == 0 || xxCount != 4 || xxFirst < 0) return nullptr;
+    const int xxSeg = tokenSeg[xxFirst];
+    for (int i = xxFirst; i < xxFirst + 4; ++i) {
+        if (i >= tokenCount || !tokenXx[i] || tokenSeg[i] != xxSeg) return nullptr;
+    }
+    // 目标段结束偏移 E = 该段最后一个 token 的字节偏移 + 1
+    int segEnd = -1;
+    for (int i = tokenCount - 1; i >= 0; --i) {
+        if (tokenSeg[i] == xxSeg) { segEnd = tokenByte[i] + 1; break; }
+    }
+    if (segEnd < 0) return nullptr;
+    const int D = tokenByte[xxFirst];
+    const int E = segEnd;
+    if (D < 0 || D + 4 > E) return nullptr;
+
+    void* hit = HookScanPatternNth(api, image, flat, index);
+    if (!hit) return nullptr;
+    int32_t disp = 0;
+    memcpy(&disp, static_cast<const char*>(hit) + D, sizeof(disp));
+    const intptr_t delta = static_cast<intptr_t>(E) + static_cast<intptr_t>(disp);
+    const uintptr_t hitAddr = reinterpret_cast<uintptr_t>(hit);
+    uintptr_t target = 0;
+    if (delta >= 0) {
+        target = hitAddr + static_cast<uintptr_t>(delta);
+    } else {
+        const uintptr_t back = static_cast<uintptr_t>(-delta);
+        if (back > hitAddr) return nullptr;
+        target = hitAddr - back;
+    }
+    HookImageInfo info{};
+    info.structSize = sizeof(HookImageInfo);
+    if (!api->GetImageInfo(image, &info) || !info.base || !info.imageSize) return nullptr;
+    if (target < info.base || target - info.base >= info.imageSize) return nullptr;
+    return reinterpret_cast<void*>(target);
 }
 
-inline void GameEventTable::Remove(uint32_t key) {
-    if (m_map) vtCall<void*, kGameEventTableVtRemove>(key);
-}
-
-inline uint64_t ScriptSystemArgs::PushTable(const GameEventTable& table) {
-    if (!table.valid()) return 0;
-    // args vtable 槽2 = Push_ContainerRvalue：引擎按右值/移动语义接管表对象
-    //（与 SetVariant 槽21 按值拷贝条目一致；官方 Combat 链路同机制）。槽2 之后表
-    // 所有权视为已移交：markPushed 使析构 no-op（若引擎实际为借用语义，表由引擎
-    // 生命周期管理，同样安全——两种情况都要求 PushTable 后不再使用该表）。
-    using Fn = uint64_t(__fastcall*)(const ScriptSystemArgs*, void*);
-    const void* const* vt = *reinterpret_cast<const void* const* const*>(this);
-    const uint64_t idx = reinterpret_cast<Fn>(vt[2])(this, table.raw());
-    const_cast<GameEventTable&>(table).markPushed();
-    return idx;
-}
 #endif
 
 // Recommended plugin exports (not required beyond OnLoad).

@@ -45,10 +45,11 @@ tools/out/
 # Local leftovers
 example1.log
 
-# third_party：保留 sqlite、hde；asmjit_src 仅保留 asmjit 子目录，其余不纳入版本管理
+# third_party：保留 sqlite、hde、lzma；asmjit_src 仅保留 asmjit 子目录，其余不纳入版本管理
 third_party/*
 !third_party/sqlite/
 !third_party/hde/
+!third_party/lzma/
 !third_party/asmjit_src/
 third_party/asmjit_src/*
 !third_party/asmjit_src/asmjit/
@@ -57,6 +58,14 @@ third_party/asmjit_src/*
 # old sidecar（depot 版本，仅跨版本测试用，不纳入版本管理）
 tools/Civ6DllLoader.symdb.old.bin
 tools/Civ6DllLoader.symdb.old.json
+
+# 大体积 .bin 数据（仅本地，不入版本管理；对应的 .json / .xp 走版本管理）
+tools/Civ6DllLoader.symdb.pack.bin
+tools/CivilizationVI.symdb.bin
+tools/CivilizationVI_DX12.symdb.bin
+
+# exe 站点定位工具的输出（本地产物）
+tools/exe_site_map.json
 
 # Rust 工具编译产物
 tools/rva_to_symbol/target/

@@ -103,6 +103,7 @@
     <ClInclude Include="..\common\ModScan.h" />
     <ClInclude Include="..\common\EnabledMods.h" />
     <ClInclude Include="..\third_party\sqlite\sqlite3.h" />
+    <ClInclude Include="..\third_party\lzma\LzmaDec.h" />
     <ClInclude Include="Civ6DLLHookLoaderAPI.h" />
     <ClInclude Include="Civ6MessageBus.h" />
     <ClInclude Include="HavokScript.h" />
@@ -137,6 +138,11 @@
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
     <ClCompile Include="..\third_party\hde\hde64.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="..\third_party\lzma\LzmaDec.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>

@@ -1,6 +1,8 @@
 #pragma code_page(65001)
-// Sidecar.rc — 打包压缩 sidecar（XPRESS_HUFF）为 RCDATA 资源，id=102
-// 与 PdataMatch::kSidecarResourceId 对应；Civ6DllLoader.symdb.bin.xp = [uint32 size][XPRESS_HUFF]
+// Sidecar.rc — 打包压缩 sidecar 为 RCDATA 资源，id=102
+// 与 PdataMatch::kSidecarResourceId 对应；内容是 sidecar 容器（C6SD v1），压缩信封 =
+//   "C6XC" + u32 algo + u32 originalSize + payload（algo=1 LZMA1）
+// 裸 C6SD 也可直通（旁路文件）。
 102 RCDATA "Civ6DllLoader.symdb.bin.xp"
 // FrontEnd UI 注入资源（UiInject.cpp 读取；103=lua / 104=xml）
 103 RCDATA "Resources\\Civ6DllLoader_FrontEndUI.lua"

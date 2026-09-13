@@ -41,7 +41,10 @@
 
 namespace {
 
-constexpr HookImageId kExeImage = kHookImageExeDx11;
+// 当前进程 exe 的镜像 id（未识别 = kHookImageInvalid）。
+HookImageId ExeImage() {
+    return HookCurrentExeImage(LoaderCore::RuntimeHookApi());
+}
 
 // RCDATA 资源 id（103=lua / 104=xml；102 已被 sidecar 占用）
 constexpr int kLuaResourceId = 103;
@@ -57,12 +60,21 @@ constexpr const wchar_t* kUiBaseName = L"Civ6DllLoader/Civ6DllLoader_FrontEndUI"
 constexpr const char* kModUiPrefix = "FrontEndUI_";
 constexpr size_t kMaxModinfoBytes = 256 * 1024;
 
-// exe 域 RVA（相对 GetModuleHandleW(nullptr) 基址）
-constexpr uintptr_t kRva_LoadUI       = 0x8AB40;   // MainMenuState::LoadUI
-constexpr uintptr_t kRva_AllocLuaCtx  = 0x7A500;   // AllocateControl<LuaContext>
-constexpr uintptr_t kRva_ChangeParent = 0x8707D0;  // ControlBase::ChangeParent（导出兜底）
-constexpr uintptr_t kRva_DestroyChild = 0x871410;  // ControlBase::DestroyChild（刷新时销毁根 context）
-constexpr uintptr_t kRva_UIManager    = 0x235F7C8; // ForgeUI::UIManager 全局指针槽
+// ---- exe 域取址表（双版本）----
+// 生成命令：python tools/gen_exe_aobs.py --emit-cpp（重建符号库/游戏更新后重新生成）。
+constexpr char kAob_LoadUI_Dx11[] = "48 89 5C 24 08 57 48 83 EC 20 48 83 B9 30 02 00 00 00 48 8B F9 74 ?? E8 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 89 87 30 02 00 00 48 85 C0 74 ?? 48 8B 0D ?? ?? ?? ?? 48 8B D0 E8 DD";
+constexpr char kAob_LoadUI_Dx12[] = "48 89 5C 24 08 57 48 83 EC 20 48 83 B9 30 02 00 00 00 48 8B F9 74 ?? E8 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 89 87 30 02 00 00 48 85 C0 74 ?? 48 8B 0D ?? ?? ?? ?? 48 8B D0 E8 4D";
+constexpr char kAob_AllocLuaCtx_Dx11[] = "48 89 5C 24 08 57 48 83 EC 20 48 8B F9 E8 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 44 8B 05 ?? ?? ?? ?? 45 85 C0 74 ?? 48 8B 05 ?? ?? ?? ?? 41 FF C8 4A 8B 1C C0 FF 05 ?? ?? ?? ?? 44 89 05 4B";
+constexpr char kAob_AllocLuaCtx_Dx12[] = "48 89 5C 24 08 57 48 83 EC 20 48 8B F9 E8 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 44 8B 05 ?? ?? ?? ?? 45 85 C0 74 ?? 48 8B 05 ?? ?? ?? ?? 41 FF C8 4A 8B 1C C0 FF 05 ?? ?? ?? ?? 44 89 05 9B";
+constexpr char kAob_ChangeParent[] = "48 85 D2 74 ?? 48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 8B FA 48 8B 49 58 48 85 C9 74 ?? 48 8B 01 48 8B D3 FF 90 D0 00 00 00 48 8B 07 48 8B D3 48 8B CF FF 50 48 48 8B CF E8 ?? ?? ?? ?? 84 C0";
+constexpr char kAob_DestroyChild[] = "40 57 48 83 EC 20 48 8B F9 48 8B 49 08 48 85 C9 74 ?? 48 8B 41 38 44 8B 41 48 48 89 5C 24 30 33 DB 48 89 74 24 38 8B 71 48 4E 8D 0C C0 49 3B C1 74 ?? 48 39 10 74 ?? FF C3 48 83 C0 08 49 3B C1";
+
+constexpr HookInfoExe kExeLoadUI = { HookRva(0x8AB40, kAob_LoadUI_Dx11), HookRva(0x8B080, kAob_LoadUI_Dx12) };
+constexpr HookInfoExe kExeAllocLuaCtx = { HookRva(0x7A500, kAob_AllocLuaCtx_Dx11), HookRva(0x7A9B0, kAob_AllocLuaCtx_Dx12) };
+constexpr HookInfoExe kExeChangeParent = { HookRva(0x8707D0, kAob_ChangeParent), HookRva(0x872550, kAob_ChangeParent) };
+constexpr HookInfoExe kExeDestroyChild = { HookRva(0x871410, kAob_DestroyChild), HookRva(0x873190, kAob_DestroyChild) };
+// ForgeUI::UIManager 全局指针槽：| 分指令段，xx = disp32（ResolveDataByAob 解出实际地址）。
+constexpr char kAob_UIManager[] = "48 8B 0D xx xx xx xx | E8 ?? ?? ?? ?? 48 89 87 30 02 00 00";
 
 // LuaContext 虚表 Initialize 槽偏移（LoadUI 汇编：call [vftable+200h]）
 constexpr uint32_t kVtInitSlot = 0x200;
@@ -172,15 +184,15 @@ void ExtractOne(HMODULE module, int id, const wchar_t* fileName) {
 // 特征码校验：确认 [addr, addr+len) 完整落在 exe 镜像内且字节匹配。
 bool SignatureMatch(uintptr_t addr, const uint8_t* sig, size_t len) {
     HookImageInfo info{ sizeof(HookImageInfo) };
-    if (!ImageAddress::GetInfo(kExeImage, &info)) return false;
+    if (!ImageAddress::GetInfo(ExeImage(), &info)) return false;
     if (!addr || !info.base || !info.imageSize) return false;
     if (addr < info.base || addr - info.base + len > info.imageSize) return false;
     return memcmp(reinterpret_cast<const void*>(addr), sig, len) == 0;
 }
 
-// RVA + 特征码解析一个地址；失败返回 0。
-uintptr_t ResolveChecked(uintptr_t rva, const uint8_t* sig, size_t sigLen, const char* tag) {
-    void* p = ImageAddress::ResolveByRva(kExeImage, rva, sigLen);
+// HookInfoExe + 特征码解析一个地址；失败返回 0。
+uintptr_t ResolveChecked(const HookInfoExe& info, const uint8_t* sig, size_t sigLen, const char* tag) {
+    void* p = LoaderCore::ResolveExeTarget(info, sigLen);
     if (!p || !SignatureMatch(reinterpret_cast<uintptr_t>(p), sig, sigLen)) {
         Logger::Log("UiInject: %s 特征码不匹配（游戏已更新？），跳过", tag);
         return 0;
@@ -630,7 +642,7 @@ void InjectFrontEndUi(void* state) {
     void* mgr = nullptr;
     void* frontEnd = nullptr;
     {
-        void* slot = ImageAddress::ResolveByRva(kExeImage, kRva_UIManager, sizeof(void*));
+        void* slot = ResolveDataByAob(LoaderCore::RuntimeHookApi(), ExeImage(), kAob_UIManager);
         if (!slot || !Runtime::IsReadableSpan(slot, sizeof(void*))) {
             Logger::Log("UiInject: UIManager 全局不可读，放弃注入");
             if (refresh) g_refreshRequested.store(true, std::memory_order_release);
@@ -661,7 +673,7 @@ void InjectFrontEndUi(void* state) {
 
     // 2) 解析注入链路函数指针
     UiApi api;
-    uintptr_t allocAddr = ResolveChecked(kRva_AllocLuaCtx, kSigAlloc, sizeof(kSigAlloc),
+    uintptr_t allocAddr = ResolveChecked(kExeAllocLuaCtx, kSigAlloc, sizeof(kSigAlloc),
                                          "AllocateControl<LuaContext>");
     if (!allocAddr) {
         if (refresh) g_refreshRequested.store(true, std::memory_order_release);
@@ -672,7 +684,7 @@ void InjectFrontEndUi(void* state) {
     api.changeParent = reinterpret_cast<ChangeParentFn>(
         GetProcAddress(GetModuleHandleW(nullptr), kChangeParentExport));
     if (!api.changeParent) {
-        uintptr_t cpAddr = ResolveChecked(kRva_ChangeParent, kSigChangeParent,
+        uintptr_t cpAddr = ResolveChecked(kExeChangeParent, kSigChangeParent,
                                           sizeof(kSigChangeParent), "ChangeParent");
         api.changeParent = reinterpret_cast<ChangeParentFn>(cpAddr);
     }
@@ -684,7 +696,7 @@ void InjectFrontEndUi(void* state) {
     api.destroyChild = reinterpret_cast<DestroyChildFn>(
         GetProcAddress(GetModuleHandleW(nullptr), kDestroyChildExport));
     if (!api.destroyChild) {
-        const uintptr_t destroyAddr = ResolveChecked(kRva_DestroyChild, kSigDestroyChild,
+        const uintptr_t destroyAddr = ResolveChecked(kExeDestroyChild, kSigDestroyChild,
                                                      sizeof(kSigDestroyChild), "DestroyChild");
         api.destroyChild = reinterpret_cast<DestroyChildFn>(destroyAddr);
     }
@@ -781,7 +793,7 @@ bool UiInject::Install() {
     }
 
     const uintptr_t loadUiAddr = reinterpret_cast<uintptr_t>(
-        ImageAddress::ResolveByRva(kExeImage, kRva_LoadUI, 1));
+        LoaderCore::ResolveExeTarget(kExeLoadUI, 1));
     if (!loadUiAddr || !SignatureMatch(loadUiAddr, kSigLoadUI, sizeof(kSigLoadUI))) {
         Logger::Log("UiInject: MainMenuState::LoadUI 特征码不匹配；hook 跳过 (addr=0x%llX)",
                     static_cast<unsigned long long>(loadUiAddr));

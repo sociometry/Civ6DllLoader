@@ -485,12 +485,13 @@ static bool ResolveSectionRva(HookImageId image, const char* sectionName,
 void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     uintptr_t effectiveRva = rva;
-    if (image == kHookImageGameCoreXP2) {
-        // XP2：插件传入的是旧映像坐标，先经 pdata 矫正表映射到当前映像。
-        const uintptr_t corrected = PdataMatch::CorrectRva(rva);
+    if (PdataMatch::HasContext(image)) {
+        // 有该模块的 sidecar 上下文：插件传入的是旧映像坐标，先矫正到当前映像。
+        // 版本一致时 CorrectRva 为恒等映射。
+        const uintptr_t corrected = PdataMatch::CorrectRva(image, rva);
         if (corrected == 0) {
-            Logger::Log("ResolveByRva: XP2 no pdata correction for rva=0x%llX span=%zu",
-                static_cast<unsigned long long>(rva), span);
+            Logger::Log("ResolveByRva: no pdata correction image=%u rva=0x%llX span=%zu",
+                static_cast<unsigned>(image), static_cast<unsigned long long>(rva), span);
             return nullptr;
         }
         effectiveRva = corrected;
@@ -508,16 +509,15 @@ void* ResolveByNameImpl(HookImageId image, const char* name) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     if (!name || !*name || !ImageAddress::IsLoaded(image)) return nullptr;
 
-    // 当前符号包只对应 XP2 GameCore。exe/Base/XP1 暂无名字数据库；
-    // 接口保留同一语义，后续可按 image 分发各自符号表。
-    if (image != kHookImageGameCoreXP2) {
+    // 每个模块有各自 sidecar 上下文（容器：exe/GameCore 各自符号表）。
+    if (!PdataMatch::HasContext(image)) {
         Logger::Log("ResolveByName: no symbol database for image=%u name=%s",
             static_cast<unsigned>(image), name);
         return nullptr;
     }
 
     // PdataMatch：sidecar 符号表存旧映像 RVA，按名矫正到当前映像后解析。
-    const uintptr_t corrected = PdataMatch::CorrectByName(name);
+    const uintptr_t corrected = PdataMatch::CorrectByName(image, name);
     if (corrected == 0) {
         Logger::Log("ResolveByName: no symbol for image=%u name=%s",
             static_cast<unsigned>(image), name);
@@ -797,7 +797,7 @@ static bool RegisterGlobalCaptureCore(HookImageId image, const char* providerFun
     }
 
     // CorrectByName 返回旧→新矫正后的 RVA（非地址），须经 ResolveByRva 换算为当前映像地址。
-    const uintptr_t corrected = PdataMatch::CorrectByName(providerFunction);
+    const uintptr_t corrected = PdataMatch::CorrectByName(kHookImageGameCoreXP2, providerFunction);
     void* target = corrected ? ImageAddress::ResolveByRva(kHookImageGameCoreXP2, corrected, 1) : nullptr;
     if (!target) {
         Logger::Log("RegisterGlobalCapture: no pdata correction for provider=%s", providerFunction);
@@ -904,7 +904,7 @@ void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbol, uint32_t 
     }
     uint32_t vtableRva = 0;
     uint32_t slotCount = 0;
-    if (!PdataMatch::CorrectVTableByName(vtableSymbol, vtableRva, slotCount)) {
+    if (!PdataMatch::CorrectVTableByName(image, vtableSymbol, vtableRva, slotCount)) {
         Logger::Log("ResolveByVTable: no vtable for symbol=%s (not found / not vtable / not corrected)",
             vtableSymbol);
         return nullptr;
@@ -1045,73 +1045,19 @@ static void CleanupCaptureSitesForOwner(const std::wstring& owner) {
 
 namespace {
 
-// ---- GameEvent table 参数（Data::TypedVariantMap）符号 ----
-// mangled 直用（symdb 去重后重载组的 demangled 只映射第一个重载，SetVariant 的
-// demangled 有歧义）。SetVariant 虚槽偏移 = 槽号×8，经 rva_map vtable_xrefs 双向
-// 验证（33=+0x108 字符串 / 36=+0x120 float / 37=+0x128 uint / 38=+0x130 int /
-// 39=+0x138 bool / 21=+0xA8 子表 / 40=+0x140 RemoveVariant）。
-static const char kGameEventTableCtorSymbol[] =
-    "??0TypedVariantMap@Data@@QEAA@XZ";
-    // = Data::TypedVariantMap::TypedVariantMap(void)
-static const char kGameEventTableDtorSymbol[] =
-    "??_GTypedVariantMap@Data@@UEAAPEAXI@Z";
-    // = Data::TypedVariantMap::~TypedVariantMap (scalar deleting dtor, unsigned int)
-static const char kGameEventTableSetIntSymbol[] =
-    "?SetVariant@TypedVariantMap@Data@@UEAAPEAVTypedVariant@2@IH@Z";
-    // = SetVariant(uint, int)
-static const char kGameEventTableSetUIntSymbol[] =
-    "?SetVariant@TypedVariantMap@Data@@UEAAPEAVTypedVariant@2@II@Z";
-    // = SetVariant(uint, uint)
-static const char kGameEventTableSetFloatSymbol[] =
-    "?SetVariant@TypedVariantMap@Data@@UEAAPEAVTypedVariant@2@IM@Z";
-    // = SetVariant(uint, float)
-static const char kGameEventTableSetBoolSymbol[] =
-    "?SetVariant@TypedVariantMap@Data@@UEAAPEAVTypedVariant@2@I_N@Z";
-    // = SetVariant(uint, bool)
-static const char kGameEventTableSetStringSymbol[] =
-    "?SetVariant@TypedVariantMap@Data@@UEAAPEAVTypedVariant@2@IPEBD@Z";
-    // = SetVariant(uint, char const*)
-static const char kGameEventTableSetChildSymbol[] =
-    "?SetVariant@TypedVariantMap@Data@@UEAAPEAVTypedVariant@2@IPEAV12@@Z";
-    // = SetVariant(uint, TypedVariantMap*)
-
 // ---- GameEvent 引擎 ABI 常量 ----
-// ms_pkCurrentGame → ms_pkScriptSystem 全局槽间距（当前版 0x14bfbaa88 vs
-// 0x14bfbaa68、旧版 0x180b88a88 vs 0x180b88a68，间距恒 0x20，双版本验证）。
-constexpr size_t   kGameEventScriptSystemDelta = 0x20;
-constexpr uint32_t kScriptSystemVtPushDataVariantMap = 21; // ScriptSystem vtable 槽：0x140FC06C0（exe），实函数 0x1401625B0 → sub_1404DA2D0 → FindKey 反查 ToLua
 // exe: ScriptSystem::CallHook 内的单例读取序列（mov rax,cs:singleton; mov rcx,[rax+10h]; jmp）
 // ——AOB 自锚定，避免硬编码 RVA 的版本脆性。
 constexpr const char* kLuaSingletonPattern =
     "48 8B 05 ?? ?? ?? ?? 48 8B 48 10 E9";
 void* g_activeLuaStateHit = nullptr;   // AOB 命中缓存（Contains 校验，跨代自动重扫）
 constexpr size_t   kGameEventNameMax           = 96;    // 事件名副本容量（注册表）
-// 注：IScriptSystemArgs1 的 18 槽 vtable（Push/Get 族）已封装为公共头文件类
-// ScriptSystemArgs（common/HookAPI.h），按需在类内直调，不经 API 表。
 
 // ms_pkCurrentGame 定位 pattern（GameSignals::Subscribe 开头 mov rdi, cs:ms_pkCurrentGame
 // 序列；读命中+3 的 disp32，目标槽 = 命中+7+disp32）。GetCurrentGameSlot 用它解析
-// ms_pkCurrentGame 槽，GetGameEventScriptSystem 主方案读相邻槽取得 scriptSystem。
+// ms_pkCurrentGame 槽（GetEngineUtilityImpl 读 +0x18 取 EngineUtility）。
 constexpr char kGameEventCurrentGamePattern[] =
     "48 8B 3D ?? ?? ?? ?? 48 85 FF 0F 84 ?? ?? ?? ?? 48 8B BF 80 02 00 00";
-// ms_pkScriptSystem 兜底定位 pattern（独立于 ms_pkCurrentGame；两版本各命中 5 处且
-// 全部指向 ms_pkScriptSystem，读命中+3 的 disp32，目标槽 = 命中+7+disp32）。
-constexpr char kGameEventScriptSystemPattern[] =
-    "48 8B 35 ?? ?? ?? ?? 48 8B DA 48 8B CE 48 8B 06 FF 50 40";
-
-// GameEventTable（Data::TypedVariantMap）ctor/dtor 解析缓存（与 GameEventSymbols 同
-// 策略：Contains 校验失败即重解）。
-struct GameEventTableSymbols {
-    void* ctor = nullptr;
-    void* dtor = nullptr;
-};
-static GameEventTableSymbols g_gameEventTableSymbols;
-// Data::TypedVariantMap 构造 / scalar deleting 析构签名（mangled 见符号区）：
-//  ctor:  void __cdecl TypedVariantMap(void)                      —— 对裸内存装真 vtable
-//  dtor:  virtual void* scalar deleting dtor(unsigned int flags)  —— flags=0 仅析构不 delete
-using GameEventTableCtorFn = void(__fastcall*)(void* self);
-using GameEventTableDtorFn = void*(__fastcall*)(void* self, unsigned int flags);
-
 // GameSignals::Subscribe 内 "mov rdi, cs:ms_pkCurrentGame" 指令地址（按代缓存，重扫兜底）。
 static void* g_gameEventContainerHit = nullptr;
 
@@ -1146,20 +1092,6 @@ static int32_t GameEventReadInt32Safe(const void* addr) {
     return value;
 }
 
-// 按名解析并缓存（版本矫正后的当前映像地址）；失败打日志并返回 nullptr。
-// 线程假设：调用点（Trigger / Register）都在游戏线程（文档要求），缓存读写无需加锁。
-template <typename T>
-static T GameEventResolve(void** cache, const char* symbol, const char* what) {
-    if (*cache && ImageAddress::Contains(kHookImageGameCoreXP2, *cache)) {
-        return reinterpret_cast<T>(*cache);
-    }
-    *cache = ResolveByNameImpl(kHookImageGameCoreXP2, symbol);
-    if (!*cache) {
-        Logger::Log("GameEvent: %s resolve failed (%s)", what, symbol);
-    }
-    return reinterpret_cast<T>(*cache);
-}
-
 // ms_pkCurrentGame 的 .data 槽地址（命中地址按代缓存，重载后 Contains 失效自动重扫）。
 static void* GetCurrentGameSlot() {
     if (!g_gameEventContainerHit ||
@@ -1172,46 +1104,6 @@ static void* GetCurrentGameSlot() {
         static_cast<const char*>(g_gameEventContainerHit) + 3);
     if (disp == 0) return nullptr;
     return static_cast<char*>(g_gameEventContainerHit) + 7 + disp;
-}
-
-// scriptSystem（IScriptSystem1*）实时解析（不缓存——每次读，天然跨 GameCore 代安全）：
-// 主方案：ms_pkScriptSystem 全局槽 = ms_pkCurrentGame 槽 + 0x20（当前版 0x14bfbaa88 vs
-// 0x14bfbaa68、旧版 0x180b88a88 vs 0x180b88a68，间距恒 0x20，双版本验证），读槽内指针。
-// 兜底：主方案拿不到时用 kGameEventScriptSystemPattern 在 .text 扫首个命中，读 disp32
-// 算槽地址再读指针。SEH 读取兜底坏地址。
-static void* GetGameEventScriptSystem() {
-    void* currentGameSlot = GetCurrentGameSlot();
-    if (currentGameSlot) {
-        void* scriptSystem = GameEventReadPtrSafe(
-            static_cast<const char*>(currentGameSlot) + kGameEventScriptSystemDelta, 0);
-        if (scriptSystem) return scriptSystem;
-    }
-    void* hit = ResolveByPatternImpl(kHookImageGameCoreXP2,
-        kGameEventScriptSystemPattern, kSectionText);
-    if (!hit) return nullptr;
-    const int32_t disp = GameEventReadInt32Safe(static_cast<const char*>(hit) + 3);
-    if (disp == 0) return nullptr;
-    return GameEventReadPtrSafe(static_cast<char*>(hit) + 7 + disp, 0);
-}
-
-// 官方 ScriptSystem::PushDataVariantMap 直调（vtable 槽21）：把 TypedVariantMap 压到
-// Lua 栈顶（官方 ToLua：嵌套子表完整，FindKey 反查决定键形态）。插件在 Lua 回调内
-// 构造 GameEventTable → 本函数压栈 → GameEvents[name].Call，绕开 args/CallHook 桥。
-void PushDataVariantMapImpl(void* L, const void* tableObj, bool useKeyLookup) {
-    if (!L || !tableObj) return;
-    void* scriptSystem = GetGameEventScriptSystem();
-    if (!scriptSystem) {
-        Logger::Log("PushDataVariantMap: no scriptSystem");
-        return;
-    }
-    __try {
-        void** vt = *reinterpret_cast<void***>(scriptSystem);
-        auto fn = reinterpret_cast<void(__fastcall*)(void*, void*, const void*, bool)>(
-            vt[kScriptSystemVtPushDataVariantMap]);
-        fn(scriptSystem, L, tableObj, useKeyLookup);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::Log("PushDataVariantMap: exception");
-    }
 }
 
 // GameCore::EngineUtility 全局（ms_pkCurrentGame 槽 +0x18，与 scriptSystem +0x20 同族）。
@@ -1344,6 +1236,19 @@ static bool GameEventInvokeLuaSeh(const char* name, GameEventPushFn pushFn,
     return ok;
 }
 
+// EngineUtility 全局解析失败的限次告警：此时"GameCore 锁状态未知"，TriggerGameEvent
+// 会直接拒绝执行——必须可诊断，但脚本可能高频触发，不能刷屏。
+static void WarnEngineUtilityUnavailable(const char* name) {
+    static std::atomic<int> s_warned{ 0 };
+    const int seen = s_warned.fetch_add(1, std::memory_order_relaxed);
+    if (seen < 10) {
+        Logger::Log("GameEvent: TriggerGameEvent(\"%s\") refused: EngineUtility unavailable "
+                    "(GameCore lock state unknown; AOB pattern mismatch or GameCore not ready)", name);
+    } else if (seen == 10) {
+        Logger::Log("GameEvent: EngineUtility still unavailable; further refusals are not logged");
+    }
+}
+
 // 内层主体：无 C++ 异常语义（SEH 段 + 资源兜底）。
 static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
                                    const void* payload) noexcept {
@@ -1369,6 +1274,8 @@ static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
     }
 
     // 锁协议（官方 Utility::CallHook 同款）：持锁则先释放，Lua 工作完成后恢复。
+    // EngineUtility 解析失败 / 取放锁调用异常 = GameCore 锁状态未知：此时不进入 Lua
+    //（带锁重入 Lua 可能自死锁或破坏 Lua 状态），本次触发直接拒绝并限次告警。
     void* eu = GetEngineUtilityImpl();
     bool had = false;
     if (eu) {
@@ -1377,9 +1284,14 @@ static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
             had = reinterpret_cast<bool(__fastcall*)(void*)>(vt[6])(eu);  // HasGameCoreLock
             if (had) reinterpret_cast<void(__fastcall*)(void*)>(vt[7])(eu); // Release
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Logger::Log("GameEvent: lock protocol fault code=0x%08X name=%s", GetExceptionCode(), name);
             had = false;
             eu = nullptr;
         }
+    }
+    if (!eu) {
+        WarnEngineUtilityUnavailable(name);
+        return false;
     }
 
     const bool ok = GameEventInvokeLuaSeh(name, pushFn, payload, L, base);
@@ -1387,11 +1299,14 @@ static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
     // ★ 栈清理在 __try 之外——崩溃路径同样执行（资源兜底）
     GameEventPopToBaseSeh(L, base);
 
-    if (eu && had) {
+    if (had) {
         __try {
             void** vt = *reinterpret_cast<void***>(eu);
             reinterpret_cast<void(__fastcall*)(void*)>(vt[8])(eu);       // GetGameCoreLock
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // 已释放锁但取回失败：后续 Lua/游戏逻辑将在无锁状态下运行，必须留痕。
+            Logger::Log("GameEvent: failed to re-acquire GameCore lock code=0x%08X name=%s",
+                GetExceptionCode(), name);
         }
     }
     return ok;
@@ -1473,65 +1388,6 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
     slot->name[nameLength] = '\0';
     Logger::Log("GameEvent: registered Lua-event \"%s\" pushFn=%p", name, pushFn);
     return true;
-}
-
-// ---- GameEventTable（Data::TypedVariantMap）生命周期：Alloc / Free ----
-// 堆方案（保守版）：symdb 无普通 operator new（??2@YAPEAX_K@Z，仅 nothrow 变体
-// ??2@YAPEAX_KAEBUnothrow_t@std@@@Z @0x9b0624），且本 DLL 为静态 CRT（/MT，Release），
-// 与引擎 CRT 不保证同堆——scalar deleting dtor 内部 operator delete 走引擎堆，不能
-// 配我们的分配。故：Alloc = malloc(88) + 引擎 ctor（ctor 只写对象内容并装真 vtable；
-// 对象内部资源的分配/释放由引擎自己的 new/delete 配对，与外壳无关）；Free = 引擎
-// scalar deleting dtor 传 deallocate=0（仅析构不 delete）+ free（外壳走我们自己的堆）。
-namespace {
-
-// SEH 隔离：/EHsc 下 __try 函数内不允许带析构的局部对象（lock_guard 等），引擎
-// 调用放这里（无析构局部）。ctor/dtor 均为引擎代码，GameCore teardown 竞态兜底。
-static void* GameEventTableCallCtor(void* obj, void* ctor) {
-    __try {
-        reinterpret_cast<GameEventTableCtorFn>(ctor)(obj);
-        return obj;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-static bool GameEventTableCallDtor(void* obj, void* dtor) {
-    __try {
-        reinterpret_cast<GameEventTableDtorFn>(dtor)(obj, 0);   // deallocate=0：仅析构不 delete
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-}  // namespace
-
-void* AllocTypedVariantMapImpl() {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    auto ctor = GameEventResolve<GameEventTableCtorFn>(
-        &g_gameEventTableSymbols.ctor, kGameEventTableCtorSymbol, "TypedVariantMap ctor");
-    if (!ctor) return nullptr;
-    void* obj = malloc(88);   // TypedVariantMap 为 88 字节堆对象（IDA 实证）
-    if (!obj) return nullptr;
-    if (!GameEventTableCallCtor(obj, ctor)) {
-        free(obj);
-        Logger::Log("GameEventTable: ctor exception, alloc rolled back");
-        return nullptr;
-    }
-    return obj;
-}
-
-void FreeTypedVariantMapImpl(void* engineObj) {
-    if (!engineObj) return;
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    auto dtor = GameEventResolve<GameEventTableDtorFn>(
-        &g_gameEventTableSymbols.dtor, kGameEventTableDtorSymbol, "TypedVariantMap dtor");
-    if (dtor) {
-        GameEventTableCallDtor(engineObj, dtor);
-    } else {
-        Logger::Log("GameEventTable: dtor resolve failed, shell only");
-    }
-    free(engineObj);   // 外壳始终由我们释放（与 malloc 配对）
 }
 
 void* ResolveCurrentGameCoreByName(const char* name) {
@@ -1665,26 +1521,6 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         g_pushRegistrations[registrationIndex].methods.swap(candidate.methods);
     }
     return g_gameCorePhaseReady ? kHookApiPushMethodsInstalled : kHookApiPushMethodsDeferred;
-}
-
-// 版本锁定偏移：当前回合 dword 位于 CurrentTurnStorage 解引用对象 +0xC0。
-// 符号库/游戏版本错位时由下方可读探测兜住，返回 0 而不是读崩。
-constexpr size_t kCurTurnDwordOffset = 0xC0;
-
-unsigned int GetCurTurnImpl() {
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    auto* slot = reinterpret_cast<uint64_t**>(
-        ResolveCurrentGameCoreByName("GameCore::Globals::CurrentTurnStorage"));
-    if (!slot || !Runtime::IsReadableSpan(slot, sizeof(uint64_t*)) || !*slot) {
-        Logger::Log("GetCurTurn: current-turn storage unavailable");
-        return 0;
-    }
-    auto* storage = reinterpret_cast<const uint8_t*>(*slot);
-    if (!Runtime::IsReadableSpan(storage, kCurTurnDwordOffset + sizeof(uint32_t))) {
-        Logger::Log("GetCurTurn: storage readable-span check failed (version-locked offset?)");
-        return 0;
-    }
-    return *reinterpret_cast<const uint32_t*>(storage + kCurTurnDwordOffset);
 }
 
 namespace {
@@ -2725,15 +2561,10 @@ const char* LocToUtf8Impl(void* loc) {
     return Localization::ToUTF8Ptr(reinterpret_cast<Localization::String*>(loc));
 }
 
-using SendGameEventFn = int64_t*(__fastcall*)(int64_t eventId, unsigned int a, unsigned int b);
 using EditPlayerFn = void*(__fastcall*)(int playerId);
 using GetCivDescFn = const char*(__fastcall*)(void* player);
 using MakeHashFn = uint32_t(__fastcall*)(const char* str);
 
-static SendGameEventFn ResolveSendGameEvent() {
-    return reinterpret_cast<SendGameEventFn>(
-        ResolveCurrentGameCoreByName("GameCore::Reporting::Event::Send"));
-}
 static EditPlayerFn ResolveEditPlayer() {
     return reinterpret_cast<EditPlayerFn>(
         ResolveCurrentGameCoreByName("GameCore::Context::Globals::EditPlayer"));
@@ -2745,16 +2576,6 @@ static GetCivDescFn ResolveGetCivDesc() {
 static MakeHashFn ResolveMakeHash() {
     return reinterpret_cast<MakeHashFn>(
         ResolveCurrentGameCoreByName("GameCore::Utilities::MakeHash"));
-}
-
-int64_t SendGameEventImpl(int64_t eventId, unsigned int a, unsigned int b) {
-    auto fn = ResolveSendGameEvent();
-    if (!fn) {
-        Logger::Log("SendGameEvent: symbol missing");
-        return 0;
-    }
-    auto* r = fn(eventId, a, b);
-    return reinterpret_cast<int64_t>(r);
 }
 
 void* EditPlayerImpl(int playerId) {
@@ -2926,8 +2747,6 @@ static HookAPI g_hookApi = {
     &LuaPushCFunctionFieldImpl,
     &LuaNewGlobalTableImpl,
 
-    &GetCurTurnImpl,
-
     &LocalizationLookupImpl,
 
     &LocStringBytesImpl,
@@ -2937,7 +2756,6 @@ static HookAPI g_hookApi = {
     &LocPushArgumentImpl,
     &LocToUtf8Impl,
 
-    &SendGameEventImpl,
     &EditPlayerImpl,
     &GetCivilizationDescriptionImpl,
     &MakeHashImpl,
@@ -2953,13 +2771,64 @@ static HookAPI g_hookApi = {
     &RegisterGameEventImpl,
     &TriggerGameEventImpl,
 
-    &AllocTypedVariantMapImpl,
-    &FreeTypedVariantMapImpl,
-    &PushDataVariantMapImpl,
     &GetEngineUtilityImpl,
     &GetActiveLuaStateImpl,
     &LuaPushNilImpl,
 };
+
+// loader 内部复用 common/HookAPI.h 的 HookInfo 取址工具时的入口（LoaderHooks/UiInject 用）。
+HookAPI* LoaderCore::RuntimeHookApi() {
+    return &g_hookApi;
+}
+
+// exe 版本锚（SizeOfImage + FileHeader.TimeDateStamp）：无符号库时判断"能否直接信任原始 RVA"。
+// 由 tools/gen_exe_aobs.py 的同一份逆向数据得出；游戏更新后这里会失配 -> 只走 AOB 兜底。
+namespace {
+constexpr uint32_t kAnchorDx11SizeOfImage = 0x36D1000;
+constexpr uint32_t kAnchorDx11TimeDate   = 0x667C6FC6;
+constexpr uint32_t kAnchorDx12SizeOfImage = 0xFE22000;
+constexpr uint32_t kAnchorDx12TimeDate   = 0x667C7363;
+}
+
+static bool ExeMatchesAnchor(HookImageId image) {
+    HookImageInfo info{ sizeof(HookImageInfo) };
+    if (!ImageAddress::GetInfo(image, &info) || !info.base || !info.imageSize) return false;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(info.base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const uint8_t*>(info.base) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    const uint32_t sizeOfImage = nt->OptionalHeader.SizeOfImage;
+    const uint32_t timeDate = nt->FileHeader.TimeDateStamp;
+    if (image == kHookImageExeDx11) {
+        return sizeOfImage == kAnchorDx11SizeOfImage && timeDate == kAnchorDx11TimeDate;
+    }
+    if (image == kHookImageExeDx12) {
+        return sizeOfImage == kAnchorDx12SizeOfImage && timeDate == kAnchorDx12TimeDate;
+    }
+    return false;
+}
+
+void* LoaderCore::ResolveExeTarget(const HookInfoExe& info, size_t span) {
+    const HookImageId image = HookCurrentExeImage(&g_hookApi);
+    if (image == kHookImageInvalid) return nullptr;
+    const HookInfo& entry = (image == kHookImageExeDx12) ? info.dx12 : info.dx11;
+    const bool haveContext = PdataMatch::HasContext(image);
+    if (haveContext || ExeMatchesAnchor(image)) {
+        if (void* p = ResolveByHookInfo(&g_hookApi, image, entry, span)) return p;
+        Logger::Log("ResolveExeTarget: image=%u kind=%d unresolved (rva=0x%llX aob=%s)",
+            static_cast<unsigned>(image), static_cast<int>(entry.kind),
+            static_cast<unsigned long long>(entry.kind == kHookInfoRva ? entry.u.rva : 0),
+            entry.aob ? "yes" : "no");
+        return nullptr;
+    }
+    Logger::Log("ResolveExeTarget: [WARN] image=%u no symbol DB and PE identity != anchor; "
+                "RVA path skipped, AOB fallback only", static_cast<unsigned>(image));
+    if (entry.aob && *entry.aob) {
+        return g_hookApi.ResolveByPattern(image, entry.aob, kSectionText);
+    }
+    return nullptr;
+}
 
 typedef void (*OnLoadFunc)(HookAPI*);
 typedef void (*OnUnloadFunc)();
@@ -2984,8 +2853,8 @@ bool AttachGameCore(HMODULE gameCore) {
     }
     // XP2：先建 pdata 矫正表（sidecar 由 RuntimeEntry InitEarly 装载）。失败 = 无法矫正，
     // 拒绝注入（GameCore 本身照常运行）。
-    if (image == kHookImageGameCoreXP2 && !PdataMatch::BuildNewTable(gameCore)) {
-        Logger::Log("GameCore rejected: XP2 pdata table build failed");
+    if (PdataMatch::HasContext(image) && !PdataMatch::BuildNewTable(image, gameCore)) {
+        Logger::Log("GameCore rejected: pdata table build failed");
         return false;
     }
 
@@ -3687,6 +3556,6 @@ void LoaderCore::ResetForReload() {
     RemoveGameCoreGenerationHooks(teardownGeneration);
     // GameCore 重载后 Global 插件注册的 GameEvent 槽位跨代保留：Register/Trigger 与
     // Lua 路径内化（GameEventInvokeLua）每次实时取活跃 state / scriptSystem（见
-    // GetGameEventScriptSystem / GetActiveLuaStateImpl），无需在此重挂任何信号环。
+    // GetActiveLuaStateImpl），无需在此重挂任何信号环。
     Logger::Log("ResetForReload: teardown callbacks fired, GameCore plugins unloaded, shared hooks reset, generation hooks cleared");
 }

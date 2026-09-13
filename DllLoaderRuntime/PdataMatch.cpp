@@ -3,20 +3,37 @@
 // 游戏更新后 GameCore_XP2 的 RVA 变化：通过 PE 异常目录（.pdata）对函数做跨版本匹配，
 // 把 old RVA（sidecar 签名表）矫正为 new RVA（当前加载的 GameCore 映像）。
 //
-// sidecar 二进制格式（Civ6DllLoader.symdb.bin，小端，pack(1)）：
-//   Header(52B)  : "C6SD" + version=4 + baseSizeOfImage + baseTimeDateStamp
-//                  + pdataCount + targetCount
-//                  + pdataOffset + targetOffset + heapOffset + heapSize + vtableOffset(0=无)
-//                  + aobOffset + aobSize
-//   pdata 签名表  : pdataCount x 16B = begin_rva + size + unwind_hash（按 begin_rva 递增）
-//   符号表        : targetCount x 32B = demangledNameOffset + mangledNameOffset + old_rva
-//                  + kind(0=Function,1=vtable) + vtableSlotCount + reserved
+// sidecar 二进制格式（Civ6DllLoader.symdb.bin，小端，pack(1)）——只有一种：多模块扁平容器。
+//
+// 多模块扁平容器（唯一格式；单模块符号库也是它，moduleCount=1）：
+//   Header(32B)  : "C6SD" + version=1 + moduleCount + moduleTableOffset/moduleTableSize
+//                  + dataOffset + flags + reserved
+//   ModuleDesc   : 64B/模块 = imageId(1=ExeDx11,2=ExeDx12,5=GameCoreXP2)
+//                  + baseSizeOfImage + baseTimeDateStamp
+//                  + pdataOffset/pdataCount + symbolOffset/symbolCount
+//                  + vtableOffset/vtableSlotCount + heapOffset/heapSize
+//                  + aobOffset/aobSize + reserved[3]（offset 均为文件绝对偏移）
+//   数据块        : 各模块 5 段依次排列（8B 对齐）：pdata / 符号 / vtable 槽位 / 字符串堆 / AOB
+//
+// 通用表结构：
+//   pdata 签名表  : 16B/条 = begin_rva + size + unwind_hash（按 begin_rva 递增）
+//   符号表        : 32B/条 = demangledNameOffset + mangledNameOffset + old_rva
+//                  + kind(0=Function,1=vtable) + vtableSlotCount(u16) + reserved(u8)
 //                  + normHeadHash + reserved2 + reserved3（nameOffset 相对堆）
 //   vtable 槽位表 : 8B/条 = slotOffset + slotOldRva（按 vtable 符号出现顺序连续）
 //   字符串堆      : NUL 结尾 UTF-8 名字连续存放
+//   AOB 表        : 每条 Function = bodySize(u32) + body[n] + mask[n]（变长，n<=64）
 //
-// 流程：Init（加载/解析 sidecar）→ BuildNewTable（解析 new .pdata + 算签名 + 版本指纹
-//   + 磁盘缓存 + 全表序列对齐）→ CorrectRva / CorrectByName（查询 old->new 映射）。
+// 压缩信封（Civ6DllLoader.symdb.bin.xp，RCDATA 102；只有侧载文件/资源用，裸 bin 不需要）：
+//   "C6XC" + u32 algo(=1, LZMA1) + u32 original_size + payload（13B .lzma 头 + LZMA1 流）
+//   未压缩 = 直接以 "C6SD" 开头（旁路文件 Civ6DllLoader.symdb.bin 的原样）
+//
+// 流程：Init（加载/解析 sidecar）→ BuildNewTable（身份判定 → 恒等 或 全表对齐 + 缓存）
+//   → CorrectRva / CorrectByName（查询 old->new 映射）。
+// BuildNewTable 身份判定顺序（与 sidecar 头记录比对）：
+//   1) SizeOfImage + FileHeader.TimeDateStamp 一致 = 同一构建 → 恒等映射，不再比较 pdata；
+//   2) 头身份不同 → 逐条比较 pdata 表，一致（纯重建、函数边界未变）→ 同样恒等映射；
+//   3) 两者都不同 → 启动跨版本匹配（缓存 / 全表对齐 / 叶子 AOB / vtable）。
 // 对齐 = 窗口哈希锚点（唯一候选）+ LIS 锚点链（old 递增且 new 递增）
 //   + 锚点间线性插值（插值处签名全等才接受）+ 头哈希校验（有 normHeadHash 的 Function）。
 
@@ -25,12 +42,12 @@
 #include "PdataMatch.h"
 #include "NormHash.h"
 #include "../common/Logger.h"
+#include "../third_party/lzma/LzmaDec.h"
 
 #include <Windows.h>
-#include <compressapi.h>
-#pragma comment(lib, "Cabinet.lib")
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <map>
@@ -45,13 +62,20 @@ namespace {
 // ---- sidecar（Civ6DllLoader.symdb.bin）----
 
 constexpr char kSidecarMagic[4] = { 'C', '6', 'S', 'D' };
-constexpr uint32_t kSidecarVersion = 4;      // v4：增加 PE TimeDateStamp；槽位仍为 8 字节
-constexpr uint32_t kSidecarVersionMax = 4;
+constexpr uint32_t kSidecarVersion = 1;      // 唯一版本：多模块扁平容器（单模块符号库 = moduleCount 1）
 constexpr uint32_t kSidecarResourceId = 102;  // RCDATA 资源 id（旧资源 101 已随旧符号库退役，勿复用）
 constexpr wchar_t kSidecarFileName[] = L"Civ6DllLoader.symdb.bin";
 
+// ---- 压缩信封（RCDATA 102 / 旁路 .xp；裸 bin 以 "C6SD" 开头，不走这里）----
+//
+// 信封: "C6XC" + u32 algo + u32 originalSize + payload
+//   algo 1 = LZMA1（唯一算法；LzmaDec，third_party/lzma；payload = .lzma 头 13B + LZMA1 流）
+constexpr char kCompressedMagic[4] = { 'C', '6', 'X', 'C' };
+constexpr uint32_t kCompressAlgoLzma = 1;         // LZMA1（自带解码器）
+constexpr size_t kLzmaHeaderSize = 13;            // .lzma: 5B props(lc/lp/pb + dictSize) + 8B 原始大小
+
 constexpr uint32_t kMaxPdataCount = 4'000'000;
-constexpr uint32_t kMaxTargetCount = 4'000'000;
+constexpr uint32_t kMaxSymbolCount = 4'000'000;
 constexpr uint64_t kMaxHeapBytes = 256ull * 1024 * 1024;
 constexpr uint32_t kMaxVtableSlots = 4'000'000;
 constexpr uint32_t kUnmatched = UINT32_MAX;
@@ -59,25 +83,36 @@ constexpr uint32_t kUnmatched = UINT32_MAX;
 // ---- 磁盘缓存（exe 目录 Civ6DllLoader\pdata_cache.bin）----
 
 constexpr char kCacheMagic[4] = { 'C', '6', 'P', 'C' };
-constexpr uint32_t kCacheVersion = 2;  // v2：新增 oldFingerprint（区分 sidecar 更新）
+constexpr uint32_t kCacheVersion = 1;
 constexpr wchar_t kCacheDirName[] = L"Civ6DllLoader";
 constexpr wchar_t kCacheFileName[] = L"pdata_cache.bin";
 
 #pragma pack(push, 1)
-struct SidecarHeader {           // 52 字节
+struct ContainerHeader {         // 32 字节
     char magic[4];
-    uint32_t version;
+    uint32_t version;            // kSidecarVersion
+    uint32_t moduleCount;
+    uint32_t moduleTableOffset;
+    uint32_t moduleTableSize;
+    uint32_t dataOffset;
+    uint32_t flags;
+    uint32_t reserved;
+};
+struct ModuleDesc {              // 64 字节/模块
+    uint32_t imageId;            // 1=ExeDx11, 2=ExeDx12, 5=GameCoreXP2
     uint32_t baseSizeOfImage;
+    uint32_t baseTimeDateStamp;  // 源 PE FileHeader.TimeDateStamp
+    uint32_t pdataOffset;        // 以下 offset 均为文件绝对偏移
     uint32_t pdataCount;
-    uint32_t targetCount;
-    uint32_t pdataOffset;
-    uint32_t targetOffset;
+    uint32_t symbolOffset;
+    uint32_t symbolCount;
+    uint32_t vtableOffset;
+    uint32_t vtableSlotCount;
     uint32_t heapOffset;
     uint32_t heapSize;
-    uint32_t vtableOffset;       // 0 = 无
     uint32_t aobOffset;
     uint32_t aobSize;
-    uint32_t baseTimeDateStamp;  // source GameCore PE FileHeader.TimeDateStamp
+    uint32_t reserved[3];
 };
 struct PdataSig {                // pdata 签名表条目（sidecar 里 16 字节；运行时 new 表 20 字节）
     uint32_t begin_rva;
@@ -90,8 +125,8 @@ struct SymbolEntry {             // 符号表条目，32 字节
     uint32_t mangledNameOffset;    // 相对堆，0 = 无
     uint32_t old_rva;
     uint8_t kind;                  // 0=Function，1=vtable
-    uint8_t vtableSlotCount;
-    uint16_t reserved;
+    uint16_t vtableSlotCount;      // vtable 槽位数（16 位；pack(1) 占 +13..+14）
+    uint8_t reserved;              // 保留（0）
     uint64_t normHeadHash;
     uint32_t reserved2;
     uint32_t reserved3;
@@ -109,7 +144,8 @@ struct CacheHeader {             // pdata_cache.bin 头，28 字节
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SidecarHeader) == 52, "SidecarHeader must be 52 bytes");
+static_assert(sizeof(ContainerHeader) == 32, "ContainerHeader must be 32 bytes");
+static_assert(sizeof(ModuleDesc) == 64, "ModuleDesc must be 64 bytes");
 static_assert(sizeof(PdataSig) == 20, "PdataSig must be 20 bytes");
 static_assert(sizeof(SymbolEntry) == 32, "SymbolEntry must be 32 bytes");
 static_assert(sizeof(VtableSlot) == 8, "VtableSlot must be 8 bytes");
@@ -139,7 +175,7 @@ std::vector<Symbol> g_symbols;                    // 符号表
 std::unordered_map<std::string, size_t> g_byDemangled;
 std::unordered_map<std::string, size_t> g_byMangled;
 std::unordered_map<uint32_t, uint64_t> g_headHashByRva;  // old_rva -> normHeadHash（Function 且有值）
-struct AobInfo {                // 函数体 AOB 条目信息（v2 sidecar）
+struct AobInfo {                // 函数体 AOB 条目信息
     uint32_t bodySize = 0;
     size_t dataOffset = 0;      // 在 g_aobData 里的偏移（body 起始，mask 紧随其后）
 };
@@ -147,7 +183,7 @@ struct VtableInfo {              // vtable 符号信息（跨版本定位用）
     uint32_t old_rva = 0;        // vtable 地址（.rdata）
     std::vector<VtableSlot> slots;  // 槽位表（offset + funcRva，含叶子槽函数）
 };
-std::vector<uint8_t> g_aobData;                    // 函数体 AOB 表原始数据（v2）
+std::vector<uint8_t> g_aobData;                    // 函数体 AOB 表原始数据
 std::unordered_map<uint32_t, AobInfo> g_aobByRva;  // old_rva -> AOB 信息
 uint64_t g_oldFingerprint = 0;                 // old pdata 表指纹（sidecar 内容）
 uint32_t g_baseSizeOfImage = 0;
@@ -160,6 +196,29 @@ std::vector<PdataSig> g_newPdata;                 // new 签名表（按 begin_r
 std::vector<uint32_t> g_map;                      // old_idx -> new_idx / kUnmatched
 uint64_t g_fingerprint = 0;
 bool g_tableReady = false;
+
+// ---- 多模块上下文（每个 HookImageId 一份）----
+struct ContextState {
+    uint32_t imageId = 0;
+    uint32_t baseSizeOfImage = 0;
+    uint32_t baseTimeDateStamp = 0;
+    std::vector<PdataSig> oldPdata;
+    std::vector<Symbol> symbols;
+    std::unordered_map<std::string, size_t> byDemangled;
+    std::unordered_map<std::string, size_t> byMangled;
+    std::unordered_map<uint32_t, uint64_t> headHashByRva;
+    std::vector<uint8_t> aobData;
+    std::unordered_map<uint32_t, AobInfo> aobByRva;
+    uint64_t oldFingerprint = 0;
+    bool loaded = false;
+    bool identical = false;
+    std::unordered_map<uint32_t, uint32_t> leafMap;
+    std::vector<PdataSig> newPdata;
+    std::vector<uint32_t> map;
+    uint64_t fingerprint = 0;
+    bool tableReady = false;
+};
+static std::unordered_map<uint32_t, ContextState> g_contexts;  // imageId -> 上下文
 
 // ---- 工具函数 ----
 
@@ -185,83 +244,115 @@ bool ReadWholeFile(const wchar_t* path, std::vector<uint8_t>& out) {
     return ok;
 }
 
-// 解压 sidecar：格式 [uint32 original_size LE][XPRESS_HUFF data]（cabinet.dll 公共 API，
-// 与 tools/compress_sidecar.py 对称）。未压缩文件以 "C6SD" 开头，调用方直接透传给 ParseSidecar。
-bool DecompressSidecar(const std::vector<uint8_t>& packed, std::vector<uint8_t>& out) {
-    if (packed.size() < 4) return false;
-    uint32_t origSize = 0;
-    std::memcpy(&origSize, packed.data(), 4);
-    if (origSize == 0 || origSize > 512u * 1024 * 1024) return false;  // 安全上限
-
-    const uint8_t* src = packed.data() + 4;
-    const SIZE_T srcLen = static_cast<SIZE_T>(packed.size() - 4);
-
-    DECOMPRESSOR_HANDLE dec = nullptr;
-    if (!CreateDecompressor(COMPRESS_ALGORITHM_XPRESS_HUFF, nullptr, &dec)) {
-        Logger::Log("PdataMatch: CreateDecompressor failed (gle=%lu)", GetLastError());
+// LZMA1 解码（third_party/lzma）。payload = .lzma 头（5B props + 8B 原始大小）+ LZMA1 流；
+// LzmaDecode 把 dest 直接当字典用（dicSize 必须 <= destLen），一次解完，无需额外窗口内存。
+bool LzmaDecodeRaw(const uint8_t* payload, size_t payloadLen, uint32_t origSize,
+    std::vector<uint8_t>& out) {
+    if (payloadLen <= kLzmaHeaderSize) {
+        Logger::Log("PdataMatch: lzma payload too small (%zu)", payloadLen);
         return false;
     }
+    // .lzma 头的 8 字节原始大小若已知（非 0xFF...）则必须与信封一致
+    uint64_t declared = 0;
+    for (int i = 0; i < 8; ++i) declared |= static_cast<uint64_t>(payload[5 + i]) << (8 * i);
+    if (declared != UINT64_MAX && declared != origSize) {
+        Logger::Log("PdataMatch: lzma size mismatch (header=%llu envelope=%u)",
+            static_cast<unsigned long long>(declared), origSize);
+        return false;
+    }
+    const uint8_t* stream = payload + kLzmaHeaderSize;
+    const SizeT streamLen = static_cast<SizeT>(payloadLen - kLzmaHeaderSize);
+    if (streamLen < LZMA_REQUIRED_INPUT_MAX) {
+        Logger::Log("PdataMatch: lzma stream too small (%zu)", payloadLen - kLzmaHeaderSize);
+        return false;
+    }
+
+    struct SzAllocator final : ISzAlloc {
+        static void* AllocImpl(void* self, size_t size) { (void)self; return std::malloc(size); }
+        static void FreeImpl(void* self, void* address) { (void)self; std::free(address); }
+        SzAllocator() { Alloc = &AllocImpl; Free = &FreeImpl; }
+    };
+    SzAllocator alloc;
+
     out.resize(origSize);
-    SIZE_T used = 0;
-    const BOOL ok = Decompress(dec, src, srcLen, out.data(), origSize, &used);
-    CloseDecompressor(dec);
-    if (!ok || used != origSize) {
-        Logger::Log("PdataMatch: Decompress failed ok=%d used=%zu want=%u (gle=%lu)",
-            static_cast<int>(ok), static_cast<size_t>(used), origSize, GetLastError());
+    SizeT destLen = static_cast<SizeT>(origSize);
+    SizeT srcLen = streamLen;
+    ELzmaStatus status = LZMA_STATUS_NOT_SPECIFIED;
+    const SRes res = LzmaDecode(out.data(), &destLen, stream, &srcLen,
+        payload, LZMA_PROPS_SIZE, LZMA_FINISH_END, &status, &alloc);
+    if (res != SZ_OK || destLen != origSize) {
+        Logger::Log("PdataMatch: LzmaDecode failed res=%d destLen=%zu want=%u status=%d",
+            static_cast<int>(res), static_cast<size_t>(destLen), origSize, static_cast<int>(status));
+        out.clear();
+        return false;
+    }
+    // LzmaDecode 会把 *srcLen 更新为实际消费字节数：必须整段用完（尾部多余 = 载荷被改过）。
+    if (srcLen != streamLen) {
+        Logger::Log("PdataMatch: lzma payload trailing bytes (consumed=%zu of %zu)",
+            static_cast<size_t>(srcLen), static_cast<size_t>(streamLen));
         out.clear();
         return false;
     }
     return true;
 }
 
-// 解析 sidecar（data 指向完整文件字节；所有字段拷贝进自有结构，不保留引用）
-bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
-    if (!data || size < sizeof(SidecarHeader)) {
-        Logger::Log("PdataMatch: %s too small (%zu bytes)", sourceTag, size);
+// 解压 sidecar（自带 LZMA1 解码器，与 tools/compress_sidecar.py 对称）：
+//   "C6XC" + u32 algo(=1) + u32 originalSize + payload（13B .lzma 头 + LZMA1 流）
+// 未压缩文件以 "C6SD" 开头，调用方直接透传给 ParseContainer。
+bool DecompressSidecar(const std::vector<uint8_t>& packed, std::vector<uint8_t>& out) {
+    if (packed.size() < 12 || std::memcmp(packed.data(), kCompressedMagic, 4) != 0) {
+        Logger::Log("PdataMatch: bad sidecar envelope (%zu bytes, no C6XC magic)", packed.size());
         return false;
     }
-    SidecarHeader hdr{};
-    std::memcpy(&hdr, data, sizeof(hdr));
-    if (std::memcmp(hdr.magic, kSidecarMagic, 4) != 0) {
-        Logger::Log("PdataMatch: %s bad magic", sourceTag);
+    uint32_t algoTag = 0;
+    uint32_t origSize = 0;
+    std::memcpy(&algoTag, packed.data() + 4, 4);
+    std::memcpy(&origSize, packed.data() + 8, 4);
+    if (algoTag != kCompressAlgoLzma) {
+        Logger::Log("PdataMatch: unknown compress algo %u", algoTag);
         return false;
     }
-    if (hdr.version < kSidecarVersion || hdr.version > kSidecarVersionMax) {
-        Logger::Log("PdataMatch: %s unsupported version %u", sourceTag, hdr.version);
+    if (origSize == 0 || origSize > 512u * 1024 * 1024) return false;  // 安全上限
+
+    const uint8_t* src = packed.data() + 12;
+    const size_t srcLen = static_cast<size_t>(packed.size() - 12);
+    if (!LzmaDecodeRaw(src, srcLen, origSize, out)) return false;
+    Logger::Log("PdataMatch: sidecar decompressed algo=lzma %zu -> %u bytes", srcLen, origSize);
+    return true;
+}
+
+// 解析容器内一个模块的数据段（data = 容器字节；各段偏移为文件绝对偏移，身份已由调用方校验）
+bool ParseModuleData(const uint8_t* data, size_t size, const ModuleDesc& m, const char* sourceTag) {
+    if (!data) return false;
+    const uint32_t aobOffset = m.aobOffset;
+    uint32_t aobSize = m.aobSize;
+    if (m.pdataCount > kMaxPdataCount || m.symbolCount > kMaxSymbolCount ||
+        m.heapSize > kMaxHeapBytes || m.vtableSlotCount > kMaxVtableSlots) {
+        Logger::Log("PdataMatch: %s unreasonable counts (pdata=%u symbols=%u heap=%u slots=%u)",
+            sourceTag, m.pdataCount, m.symbolCount, m.heapSize, m.vtableSlotCount);
         return false;
     }
-    if (size < sizeof(SidecarHeader)) {
-        Logger::Log("PdataMatch: %s v4 header too small (%zu bytes)", sourceTag, size);
-        return false;
-    }
-    const uint32_t aobOffset = hdr.aobOffset;
-    uint32_t aobSize = hdr.aobSize;
-    if (static_cast<uint64_t>(aobOffset) + aobSize > size) {
-        Logger::Log("PdataMatch: %s AOB table out of range (off=%u size=%u)", sourceTag, aobOffset, aobSize);
-        return false;
-    }
-    if (hdr.pdataCount > kMaxPdataCount || hdr.targetCount > kMaxTargetCount ||
-        hdr.heapSize > kMaxHeapBytes || hdr.vtableOffset > size) {
-        Logger::Log("PdataMatch: %s unreasonable counts (pdata=%u target=%u heap=%u vtable=0x%08X)",
-            sourceTag, hdr.pdataCount, hdr.targetCount, hdr.heapSize, hdr.vtableOffset);
-        return false;
-    }
-    const uint64_t pdataEnd = static_cast<uint64_t>(hdr.pdataOffset) +
-        static_cast<uint64_t>(hdr.pdataCount) * 16;  // sidecar pdata 表固定 16 字节/条
-    const uint64_t targetEnd = static_cast<uint64_t>(hdr.targetOffset) +
-        static_cast<uint64_t>(hdr.targetCount) * sizeof(SymbolEntry);
-    const uint64_t heapEnd = static_cast<uint64_t>(hdr.heapOffset) + hdr.heapSize;
-    if (pdataEnd > size || targetEnd > size || heapEnd > size) {
-        Logger::Log("PdataMatch: %s truncated extents", sourceTag);
+    const uint64_t pdataEnd = static_cast<uint64_t>(m.pdataOffset) +
+        static_cast<uint64_t>(m.pdataCount) * 16;  // sidecar pdata 表固定 16 字节/条
+    const uint64_t symbolEnd = static_cast<uint64_t>(m.symbolOffset) +
+        static_cast<uint64_t>(m.symbolCount) * sizeof(SymbolEntry);
+    const uint64_t heapEnd = static_cast<uint64_t>(m.heapOffset) + m.heapSize;
+    const uint64_t slotEnd = static_cast<uint64_t>(m.vtableOffset) +
+        static_cast<uint64_t>(m.vtableSlotCount) * sizeof(VtableSlot);
+    const uint64_t aobEnd = static_cast<uint64_t>(aobOffset) + aobSize;
+    if (pdataEnd > size || symbolEnd > size || heapEnd > size || slotEnd > size || aobEnd > size) {
+        Logger::Log("PdataMatch: %s module extents out of range (pdata=%llu symbols=%llu heap=%llu "
+                    "slots=%llu aob=%llu size=%zu)", sourceTag, pdataEnd, symbolEnd, heapEnd,
+            slotEnd, aobEnd, size);
         return false;
     }
 
     // pdata 签名表
     std::vector<PdataSig> oldPdata;
-    oldPdata.reserve(hdr.pdataCount);
-    for (uint32_t i = 0; i < hdr.pdataCount; ++i) {
+    oldPdata.reserve(m.pdataCount);
+    for (uint32_t i = 0; i < m.pdataCount; ++i) {
         // sidecar 的 pdata 表固定 16 字节/条（begin_rva + size + unwind_hash），无 prologSize
-        const uint8_t* p = data + hdr.pdataOffset + static_cast<uint64_t>(i) * 16;
+        const uint8_t* p = data + m.pdataOffset + static_cast<uint64_t>(i) * 16;
         PdataSig e{};
         std::memcpy(&e.begin_rva, p, 4);
         std::memcpy(&e.size, p + 4, 4);
@@ -278,9 +369,9 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
         [](const PdataSig& a, const PdataSig& b) { return a.begin_rva < b.begin_rva; });
 
     // 符号表 + vtable 槽位 + 字符串堆
-    const uint8_t* heap = data + hdr.heapOffset;
+    const uint8_t* heap = data + m.heapOffset;
     std::vector<Symbol> symbols;
-    symbols.reserve(hdr.targetCount);
+    symbols.reserve(m.symbolCount);
     std::unordered_map<std::string, size_t> byDemangled;
     std::unordered_map<std::string, size_t> byMangled;
     std::unordered_map<uint32_t, uint64_t> headHashByRva;
@@ -290,18 +381,18 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
     uint32_t slotCursor = 0;
     size_t vtableSymbols = 0;
 
-    for (uint32_t i = 0; i < hdr.targetCount; ++i) {
+    for (uint32_t i = 0; i < m.symbolCount; ++i) {
         SymbolEntry se{};
-        std::memcpy(&se, data + hdr.targetOffset + static_cast<uint64_t>(i) * sizeof(SymbolEntry), sizeof(se));
+        std::memcpy(&se, data + m.symbolOffset + static_cast<uint64_t>(i) * sizeof(SymbolEntry), sizeof(se));
         Symbol sym;
         sym.old_rva = se.old_rva;
         sym.kind = se.kind;
         sym.normHeadHash = se.normHeadHash;
 
         const auto readName = [&](uint32_t off) -> std::string {
-            if (off == 0 || off >= hdr.heapSize) return {};
+            if (off == 0 || off >= m.heapSize) return {};
             const char* p = reinterpret_cast<const char*>(heap + off);
-            const size_t maxLen = hdr.heapSize - off;
+            const size_t maxLen = m.heapSize - off;
             const size_t len = strnlen(p, maxLen);
             if (len >= maxLen) return {};  // 堆内无 NUL，视为损坏
             return std::string(p, len);
@@ -309,28 +400,30 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
         sym.demangled = readName(se.demangledNameOffset);
         sym.mangled = readName(se.mangledNameOffset);
 
-        if (sym.kind == 1 && se.vtableSlotCount != 0) {
-            if (hdr.vtableOffset == 0 ||
-                static_cast<uint64_t>(slotCursor) + se.vtableSlotCount > kMaxVtableSlots ||
-                static_cast<uint64_t>(hdr.vtableOffset) +
-                    (static_cast<uint64_t>(slotCursor) + se.vtableSlotCount) * sizeof(VtableSlot) > size) {
+        const uint32_t slotCount = se.vtableSlotCount;
+
+        if (sym.kind == 1 && slotCount != 0) {
+            if (m.vtableOffset == 0 ||
+                static_cast<uint64_t>(slotCursor) + slotCount > kMaxVtableSlots ||
+                static_cast<uint64_t>(m.vtableOffset) +
+                    (static_cast<uint64_t>(slotCursor) + slotCount) * sizeof(VtableSlot) > size) {
                 Logger::Log("PdataMatch: %s vtable slot overflow at symbol %u", sourceTag, i);
                 return false;
             }
-            sym.slots.reserve(se.vtableSlotCount);
-            for (uint8_t s = 0; s < se.vtableSlotCount; ++s) {
+            sym.slots.reserve(slotCount);
+            for (uint32_t s = 0; s < slotCount; ++s) {
                 VtableSlot vs{};
-                std::memcpy(&vs, data + hdr.vtableOffset +
+                std::memcpy(&vs, data + m.vtableOffset +
                     static_cast<uint64_t>(slotCursor + s) * sizeof(VtableSlot), sizeof(vs));
                 sym.slots.push_back(vs);
             }
-            slotCursor += se.vtableSlotCount;
+            slotCursor += slotCount;
             ++vtableSymbols;
         } else if (sym.kind == 0 && sym.normHeadHash != 0 && sym.old_rva != 0) {
             headHashByRva.emplace(sym.old_rva, sym.normHeadHash);
         }
 
-        // v4：Function 符号读函数体 AOB（bodySize + body + mask）
+        // Function 符号读函数体 AOB（bodySize + body + mask）
         if (sym.kind == 0 && aobSize != 0) {
             if (aobCursor + 4 <= static_cast<uint64_t>(aobOffset) + aobSize) {
                 uint32_t bodySize = 0;
@@ -365,8 +458,8 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
     g_headHashByRva = std::move(headHashByRva);
     g_aobData = std::move(aobData);
     g_aobByRva = std::move(aobByRva);
-    g_baseSizeOfImage = hdr.baseSizeOfImage;
-    g_baseTimeDateStamp = hdr.baseTimeDateStamp;
+    g_baseSizeOfImage = m.baseSizeOfImage;
+    g_baseTimeDateStamp = m.baseTimeDateStamp;
     g_loaded = true;
     Logger::Log("PdataMatch: %s loaded pdata=%zu symbols=%zu vtable_symbols=%zu vtable_slots=%u base=0x%08X timestamp=0x%08X",
         sourceTag, g_oldPdata.size(), g_symbols.size(), vtableSymbols, slotCursor,
@@ -374,47 +467,115 @@ bool ParseSidecar(const uint8_t* data, size_t size, const char* sourceTag) {
     return true;
 }
 
-bool LoadSidecar(HMODULE runtimeModule) {
+
+bool ParseModuleToContext(const uint8_t* data, size_t size, const ModuleDesc& m, const char* sourceTag) {
+    if (!ParseModuleData(data, size, m, sourceTag)) return false;
+    ContextState ctx;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        ctx.imageId = m.imageId;
+        ctx.baseSizeOfImage = g_baseSizeOfImage;
+        ctx.baseTimeDateStamp = g_baseTimeDateStamp;
+        ctx.oldPdata = std::move(g_oldPdata);
+        ctx.symbols = std::move(g_symbols);
+        ctx.byDemangled = std::move(g_byDemangled);
+        ctx.byMangled = std::move(g_byMangled);
+        ctx.headHashByRva = std::move(g_headHashByRva);
+        ctx.aobData = std::move(g_aobData);
+        ctx.aobByRva = std::move(g_aobByRva);
+        ctx.oldFingerprint = g_oldFingerprint;
+        ctx.loaded = true;
+        g_contexts[m.imageId] = std::move(ctx);
+    }
+    return true;
+}
+
+bool ParseContainer(const uint8_t* data, size_t size, const char* sourceTag) {
+    if (size < sizeof(ContainerHeader)) {
+        Logger::Log("PdataMatch: %s container too small (%zu bytes)", sourceTag, size);
+        return false;
+    }
+    ContainerHeader h{};
+    std::memcpy(&h, data, sizeof(h));
+    if (std::memcmp(h.magic, kSidecarMagic, 4) != 0) {
+        Logger::Log("PdataMatch: %s bad magic", sourceTag);
+        return false;
+    }
+    if (h.version != kSidecarVersion) {
+        Logger::Log("PdataMatch: %s unsupported version %u", sourceTag, h.version);
+        return false;
+    }
+    if (h.moduleCount == 0 || h.moduleCount > 8) {
+        Logger::Log("PdataMatch: %s bad moduleCount=%u (expect 1..8)", sourceTag, h.moduleCount);
+        return false;
+    }
+    const uint64_t tableEnd = static_cast<uint64_t>(h.moduleTableOffset) + h.moduleTableSize;
+    if (static_cast<uint64_t>(h.moduleTableOffset) > size || tableEnd > size ||
+        h.moduleTableSize < static_cast<uint64_t>(h.moduleCount) * sizeof(ModuleDesc)) {
+        Logger::Log("PdataMatch: %s bad module table", sourceTag);
+        return false;
+    }
+    for (uint32_t i = 0; i < h.moduleCount; ++i) {
+        ModuleDesc m{};
+        std::memcpy(&m, data + h.moduleTableOffset + static_cast<uint64_t>(i) * sizeof(ModuleDesc), sizeof(m));
+        // 容器只允许装 exe(DX11/DX12) 与 GameCoreXP2，且必须具备 PE 身份（否则无法做身份判定）。
+        if (m.imageId != kHookImageExeDx11 && m.imageId != kHookImageExeDx12 &&
+            m.imageId != kHookImageGameCoreXP2) {
+            Logger::Log("PdataMatch: %s module %u has unsupported imageId=%u", sourceTag, i, m.imageId);
+            return false;
+        }
+        if (m.baseSizeOfImage == 0 || m.baseTimeDateStamp == 0) {
+            Logger::Log("PdataMatch: %s module %u (image=%u) missing PE identity",
+                sourceTag, i, m.imageId);
+            return false;
+        }
+        if (!ParseModuleToContext(data, size, m, sourceTag)) {
+            Logger::Log("PdataMatch: %s module %u (image=%u) parse failed", sourceTag, i, m.imageId);
+            return false;
+        }
+    }
+    Logger::Log("PdataMatch: %s container modules=%u", sourceTag, h.moduleCount);
+    return true;
+}
+
+// 单个来源的原始字节 -> 未压缩 sidecar 字节（"C6SD" 直通，否则按压缩信封解压）。
+bool DecodeSidecarBlob(const std::vector<uint8_t>& blob, std::vector<uint8_t>& out, const char* tag) {
+    if (blob.size() >= 4 && std::memcmp(blob.data(), kSidecarMagic, 4) == 0) {
+        out = blob;
+        return true;
+    }
+    if (DecompressSidecar(blob, out)) return true;
+    Logger::Log("PdataMatch: %s sidecar decompress failed (%zu bytes)", tag, blob.size());
+    return false;
+}
+
+// 来源 1：Loader 同目录旁路文件 Civ6DllLoader.symdb.bin（开发用覆盖：测新符号库无需重编）。
+bool LoadSidecarFromFile(HMODULE runtimeModule, std::vector<uint8_t>& out) {
+    if (!runtimeModule) return false;
     wchar_t path[MAX_PATH]{};
-    if (!runtimeModule || !GetModuleFileNameW(runtimeModule, path, MAX_PATH)) return false;
+    if (!GetModuleFileNameW(runtimeModule, path, MAX_PATH)) return false;
     std::wstring wpath(path);
-    const size_t slash = wpath.find_last_of(L"\\/");
+    const size_t slash = wpath.find_last_of(L"/\\");
     if (slash == std::wstring::npos) return false;
     wpath.resize(slash + 1);
     wpath += kSidecarFileName;
     std::vector<uint8_t> blob;
     if (!ReadWholeFile(wpath.c_str(), blob)) return false;
-    if (blob.size() >= 4 && std::memcmp(blob.data(), kSidecarMagic, 4) == 0) {
-        return ParseSidecar(blob.data(), blob.size(), "sidecar");
-    }
-    std::vector<uint8_t> raw;
-    if (!DecompressSidecar(blob, raw)) {
-        Logger::Log("PdataMatch: sidecar file decompress failed (%zu bytes)", blob.size());
-        return false;
-    }
-    return ParseSidecar(raw.data(), raw.size(), "sidecar");
+    return DecodeSidecarBlob(blob, out, "file");
 }
 
-bool LoadSidecarResource(HMODULE runtimeModule) {
+// 来源 2：RCDATA 102（部署产物，多模块容器）。
+bool LoadSidecarFromResource(HMODULE runtimeModule, std::vector<uint8_t>& out) {
     if (!runtimeModule) return false;
     HRSRC res = FindResourceW(runtimeModule, MAKEINTRESOURCEW(kSidecarResourceId), RT_RCDATA);
     if (!res) return false;
     HGLOBAL glob = LoadResource(runtimeModule, res);
-    if (!glob) return false;
-    const DWORD sz = SizeofResource(runtimeModule, res);
-    const void* ptr = LockResource(glob);
-    if (!ptr || sz == 0) return false;
+    const DWORD sz = glob ? SizeofResource(runtimeModule, res) : 0;
+    const void* ptr = glob ? LockResource(glob) : nullptr;
+    if (!ptr || !sz) return false;
     std::vector<uint8_t> blob(static_cast<const uint8_t*>(ptr),
         static_cast<const uint8_t*>(ptr) + sz);
-    if (blob.size() >= 4 && std::memcmp(blob.data(), kSidecarMagic, 4) == 0) {
-        return ParseSidecar(blob.data(), blob.size(), "rcdata");
-    }
-    std::vector<uint8_t> raw;
-    if (!DecompressSidecar(blob, raw)) {
-        Logger::Log("PdataMatch: rcdata sidecar decompress failed (%zu bytes)", blob.size());
-        return false;
-    }
-    return ParseSidecar(raw.data(), raw.size(), "rcdata");
+    return DecodeSidecarBlob(blob, out, "rcdata");
 }
 
 // 对 pdata 表算版本指纹：对 (size, unwind_hash) 全表字节做 FNV-1a64（每条 size(4) + unwind_hash(8)）
@@ -1026,7 +1187,7 @@ std::unordered_map<uint32_t, uint32_t> BuildVtableMap(
 }
 
 // exe 目录下 Civ6DllLoader\pdata_cache.bin（目录不存在则创建）
-std::wstring CachePath() {
+std::wstring CachePath(uint32_t imageId) {
     wchar_t exePath[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return {};
     std::wstring dir(exePath);
@@ -1036,7 +1197,13 @@ std::wstring CachePath() {
     dir += kCacheDirName;
     CreateDirectoryW(dir.c_str(), nullptr);  // 已存在则忽略失败（后续写失败仅记日志）
     dir += L"\\";
-    dir += kCacheFileName;
+    if (imageId == kHookImageGameCoreXP2) {
+        dir += kCacheFileName;               // GameCoreXP2 用固定名
+    } else {
+        dir += L"pdata_cache_";
+        dir += std::to_wstring(imageId);
+        dir += L".bin";
+    }
     return dir;
 }
 
@@ -1104,85 +1271,139 @@ bool SaveCache(const std::wstring& path, uint64_t fingerprint, uint64_t oldFinge
     return ok;
 }
 
-// 需持有 g_mutex 调用：在 old pdata 表二分查找包含 oldRva 的条目并矫正
-uintptr_t CorrectRvaLocked(uintptr_t oldRva) {
+// 在给定上下文中矫正 old_rva -> new_rva（需持有 g_mutex 调用）
+uintptr_t CorrectRvaLocked(const ContextState& ctx, uintptr_t oldRva) {
     // 版本一致：跳过一切 pdata 匹配，直接恒等解析（gap 符号/vtable 的 RVA 也有效）
-    if (g_identical) return oldRva;
-    if (!g_tableReady || g_oldPdata.empty() || g_newPdata.empty() ||
-        g_map.size() != g_oldPdata.size()) {
+    if (ctx.identical) return oldRva;
+    if (!ctx.tableReady || ctx.oldPdata.empty() || ctx.newPdata.empty() ||
+        ctx.map.size() != ctx.oldPdata.size()) {
         return 0;
     }
     // 二分：最后一个 begin_rva <= oldRva 的条目（pdata 允许嵌套，先取最内层候选）
     size_t lo = 0;
-    size_t hi = g_oldPdata.size();
+    size_t hi = ctx.oldPdata.size();
     while (lo < hi) {
         const size_t mid = lo + (hi - lo) / 2;
-        if (g_oldPdata[mid].begin_rva <= oldRva) lo = mid + 1;
+        if (ctx.oldPdata[mid].begin_rva <= oldRva) lo = mid + 1;
         else hi = mid;
     }
     if (lo == 0) {
         // gap（第一个函数之前）：查叶子 AOB 匹配结果
-        const auto lit = g_leafMap.find(static_cast<uint32_t>(oldRva));
-        return lit != g_leafMap.end() ? lit->second : 0;
+        const auto lit = ctx.leafMap.find(static_cast<uint32_t>(oldRva));
+        return lit != ctx.leafMap.end() ? lit->second : 0;
     }
-
     // 从最内层候选向前回扫找包含 oldRva 的条目（嵌套深度通常 <= 3，封顶防退化）
     constexpr size_t kMaxBackscan = 64;
     size_t idx = lo - 1;
     size_t scanned = 0;
     for (;;) {
-        const PdataSig& oe = g_oldPdata[idx];
+        const PdataSig& oe = ctx.oldPdata[idx];
         if (oldRva < static_cast<uintptr_t>(oe.begin_rva) + oe.size) break;  // 包含
         if (idx == 0 || scanned >= kMaxBackscan) {
-            // gap / 数据段：查叶子 AOB 匹配结果
-            const auto lit = g_leafMap.find(static_cast<uint32_t>(oldRva));
-            return lit != g_leafMap.end() ? lit->second : 0;
+            const auto lit = ctx.leafMap.find(static_cast<uint32_t>(oldRva));
+            return lit != ctx.leafMap.end() ? lit->second : 0;
         }
         --idx;
         ++scanned;
     }
-
     const size_t oldIdx = idx;
-    const PdataSig& oe = g_oldPdata[oldIdx];
-    const uint32_t newIdx = g_map[oldIdx];
-    if (newIdx == kUnmatched || newIdx >= g_newPdata.size()) return 0;
-    const PdataSig& ne = g_newPdata[newIdx];
+    const PdataSig& oe = ctx.oldPdata[oldIdx];
+    const uint32_t newIdx = ctx.map[oldIdx];
+    if (newIdx == kUnmatched || newIdx >= ctx.newPdata.size()) return 0;
+    const PdataSig& ne = ctx.newPdata[newIdx];
     const uintptr_t offset = oldRva - oe.begin_rva;
     if (offset == 0) return ne.begin_rva;                        // 函数开头
     if (ne.size == oe.size) return ne.begin_rva + offset;        // size 不变才允许内部偏移
     return 0;                                                    // deny
 }
 
+// 清空全部解析状态（上下文 + 构建用临时 globals）：Init 起始与候选重试前调用。
+void ResetAllParsedState() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_contexts.clear();
+    g_oldPdata.clear();
+    g_symbols.clear();
+    g_byDemangled.clear();
+    g_byMangled.clear();
+    g_headHashByRva.clear();
+    g_aobData.clear();
+    g_aobByRva.clear();
+    g_oldFingerprint = 0;
+    g_identical = false;
+    g_leafMap.clear();
+    g_baseSizeOfImage = 0;
+    g_baseTimeDateStamp = 0;
+    g_loaded = false;
+    g_newPdata.clear();
+    g_map.clear();
+    g_fingerprint = 0;
+    g_tableReady = false;
+}
+
+// 数据已搬进 g_contexts 后清掉构建用临时 globals。
+void ClearTempGlobals() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_oldPdata.clear();
+    g_symbols.clear();
+    g_byDemangled.clear();
+    g_byMangled.clear();
+    g_headHashByRva.clear();
+    g_aobData.clear();
+    g_aobByRva.clear();
+    g_leafMap.clear();
+    g_newPdata.clear();
+    g_map.clear();
+    g_loaded = false;
+    g_tableReady = false;
+}
 }  // namespace
 
 bool Init(HMODULE runtimeModule) {
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_oldPdata.clear();
-        g_symbols.clear();
-        g_byDemangled.clear();
-        g_byMangled.clear();
-        g_headHashByRva.clear();
-        g_aobData.clear();
-        g_aobByRva.clear();
-        g_oldFingerprint = 0;
-        g_identical = false;
-        g_leafMap.clear();
-        g_baseSizeOfImage = 0;
-        g_baseTimeDateStamp = 0;
-        g_loaded = false;
-        g_newPdata.clear();
-        g_map.clear();
-        g_fingerprint = 0;
-        g_tableReady = false;
+    // 候选来源与优先级：
+    //  1) 旁路文件 Civ6DllLoader.symdb.bin（开发用覆盖：测新符号库无需重编）。
+    //  2) RCDATA 102：部署产物。
+    // 任一候选解析失败都继续尝试下一个：保住"旁路文件损坏/版本不认识时仍可用内嵌资源"的回退链。
+    ResetAllParsedState();
+
+    std::vector<uint8_t> fileBlob;
+    const bool haveFile = LoadSidecarFromFile(runtimeModule, fileBlob);
+
+    struct Candidate {
+        const char* tag;
+        bool isResource;
+    };
+    std::vector<Candidate> order;
+    if (haveFile) order.push_back(Candidate{ "file", false });
+    order.push_back(Candidate{ "rcdata", true });
+
+    // RCDATA 按需加载：只有轮到它当候选时才解压（避免开发用旁路文件生效时白解 44MB）。
+    std::vector<uint8_t> resourceBlob;
+    bool resourceTried = false;
+    for (const Candidate& candidate : order) {
+        const std::vector<uint8_t>* bytes = &fileBlob;
+        if (candidate.isResource) {
+            if (!resourceTried) {
+                resourceTried = true;
+                if (!LoadSidecarFromResource(runtimeModule, resourceBlob)) {
+                    Logger::Log("PdataMatch: sidecar source=rcdata unavailable");
+                    continue;
+                }
+            }
+            bytes = &resourceBlob;
+        }
+        ResetAllParsedState();   // 候选之间不留半解析的上下文
+        if (ParseContainer(bytes->data(), bytes->size(), candidate.tag)) {
+            Logger::Log("PdataMatch: sidecar source=%s (%zu bytes)", candidate.tag, bytes->size());
+            ClearTempGlobals();
+            return true;
+        }
+        Logger::Log("PdataMatch: sidecar source=%s parse failed; trying next source", candidate.tag);
     }
-    if (LoadSidecar(runtimeModule)) return true;
-    if (LoadSidecarResource(runtimeModule)) return true;
     Logger::Log("PdataMatch: no sidecar (Civ6DllLoader.symdb.bin or RCDATA 102) - pdata correction unavailable");
     return false;
 }
 
-bool BuildNewTable(HMODULE gameCore) {
+static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
     std::vector<PdataSig> oldTable;
     std::unordered_map<uint32_t, uint64_t> headHashByRva;
     std::vector<VtableInfo> vtables;
@@ -1212,16 +1433,6 @@ bool BuildNewTable(HMODULE gameCore) {
         Logger::Log("PdataMatch: BuildNewTable failed to parse new .pdata");
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (imageSize != g_baseSizeOfImage || timeDateStamp != g_baseTimeDateStamp) {
-            Logger::Log("PdataMatch: GameCore identity mismatch "
-                        "(sidecar size=0x%08X timestamp=0x%08X; "
-                        "loaded size=0x%08X timestamp=0x%08X)",
-                g_baseSizeOfImage, g_baseTimeDateStamp, imageSize, timeDateStamp);
-            return false;
-        }
-    }
     Logger::Log("PdataMatch: new pdata entries=%zu fingerprint=0x%016llX",
         newTable.size(), static_cast<unsigned long long>(fingerprint));
 
@@ -1229,28 +1440,57 @@ bool BuildNewTable(HMODULE gameCore) {
     bool fromCache = false;
     size_t anchors = 0;
 
-    // 恒等检查：old/new pdata 逐条完全一致 -> 版本未变，直接恒等映射（100% 覆盖、零回归）。
-    // 版本一致时走这条路径，避免全表匹配漏配极小函数（如 19 字节的 MakeHash）导致
-    // ResolveByRva 误返回 null。
-    bool identical = oldTable.size() == newTable.size();
-    if (identical) {
-        for (size_t i = 0; i < oldTable.size(); ++i) {
-            if (oldTable[i].begin_rva != newTable[i].begin_rva ||
-                oldTable[i].size != newTable[i].size ||
-                oldTable[i].unwind_hash != newTable[i].unwind_hash) {
-                identical = false;
-                break;
+    // 身份判定（与 sidecar 头记录的两项比对，顺序即优先级）：
+    //  1) SizeOfImage + TimeDateStamp 相同 = 同一 GameCore 构建 -> 直接恒等映射，不再比较 pdata 表。
+    //  2) 头身份不同 -> 逐条比较 pdata 表；完全一致（纯重建、函数边界未变）同样恒等映射。
+    //  3) 头身份与 pdata 都不同 -> 才启动跨版本匹配（缓存 / AlignTables / 叶子 AOB / vtable）。
+    bool headerIdentity = false;
+    bool identical = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        headerIdentity = (imageSize == g_baseSizeOfImage && timeDateStamp == g_baseTimeDateStamp);
+        if (headerIdentity && fingerprint != g_oldFingerprint) {
+            // 头身份相同但 pdata 指纹不同：sidecar 的身份字段与表内容可能来自不同 DLL。
+            Logger::Log("PdataMatch: header identity match but pdata fingerprint differs "
+                        "(new=0x%016llX sidecar=0x%016llX); sidecar may be inconsistent",
+                static_cast<unsigned long long>(fingerprint),
+                static_cast<unsigned long long>(g_oldFingerprint));
+        }
+    }
+
+    if (headerIdentity) {
+        identical = true;
+        Logger::Log("PdataMatch: identity by header (size=0x%08X ts=0x%08X) -> identity mapping",
+            imageSize, timeDateStamp);
+    } else {
+        identical = oldTable.size() == newTable.size();
+        if (identical) {
+            for (size_t i = 0; i < oldTable.size(); ++i) {
+                if (oldTable[i].begin_rva != newTable[i].begin_rva ||
+                    oldTable[i].size != newTable[i].size ||
+                    oldTable[i].unwind_hash != newTable[i].unwind_hash) {
+                    identical = false;
+                    break;
+                }
             }
+        }
+        if (identical) {
+            Logger::Log("PdataMatch: header identity differs (size 0x%08X vs 0x%08X, ts 0x%08X vs 0x%08X) "
+                        "but pdata tables identical -> identity mapping",
+                imageSize, g_baseSizeOfImage, timeDateStamp, g_baseTimeDateStamp);
+        } else {
+            Logger::Log("PdataMatch: header identity and pdata both differ -> cross-version matching "
+                        "(old=%zu new=%zu)", oldTable.size(), newTable.size());
         }
     }
 
     if (identical) {
         mapping.resize(oldTable.size());
         for (size_t i = 0; i < mapping.size(); ++i) mapping[i] = static_cast<uint32_t>(i);
-        Logger::Log("PdataMatch: pdata identical (version unchanged) -> identity mapping entries=%zu",
+        Logger::Log("PdataMatch: identity mapping entries=%zu",
             mapping.size());
     } else {
-        const std::wstring cachePath = CachePath();
+        const std::wstring cachePath = CachePath(imageId);
         if (!cachePath.empty() && LoadCache(cachePath, fingerprint, g_oldFingerprint,
                 oldTable.size(), newTable.size(), mapping)) {
             fromCache = true;
@@ -1304,54 +1544,145 @@ bool BuildNewTable(HMODULE gameCore) {
     return true;
 }
 
-uintptr_t CorrectRva(uintptr_t oldRva) {
+// 把构建用 globals 搬回对应上下文（构建正常结束或异常退出都必须执行——否则该模块的
+// old pdata/符号表永久丢失）。按 imageId 重新查表，不跨放锁窗口持有裸指针。
+static void RestoreContextFromGlobals(uint32_t imageId) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return CorrectRvaLocked(oldRva);
+    const auto it = g_contexts.find(imageId);
+    if (it != g_contexts.end()) {
+        ContextState& ctx = it->second;
+        ctx.oldPdata = std::move(g_oldPdata);
+        ctx.symbols = std::move(g_symbols);
+        ctx.byDemangled = std::move(g_byDemangled);
+        ctx.byMangled = std::move(g_byMangled);
+        ctx.headHashByRva = std::move(g_headHashByRva);
+        ctx.aobData = std::move(g_aobData);
+        ctx.aobByRva = std::move(g_aobByRva);
+        ctx.oldFingerprint = g_oldFingerprint;
+        ctx.baseSizeOfImage = g_baseSizeOfImage;
+        ctx.baseTimeDateStamp = g_baseTimeDateStamp;
+        ctx.leafMap = std::move(g_leafMap);
+        ctx.newPdata = std::move(g_newPdata);
+        ctx.map = std::move(g_map);
+        ctx.fingerprint = g_fingerprint;
+        ctx.identical = g_identical;
+        ctx.tableReady = g_tableReady;
+    }
+    g_loaded = false;
 }
 
-uintptr_t CorrectByName(const char* name) {
+bool BuildNewTable(uint32_t imageId, HMODULE target) {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto it = g_contexts.find(imageId);
+        if (it == g_contexts.end() || !it->second.loaded) {
+            Logger::Log("PdataMatch: BuildNewTable: no context for image=%u", imageId);
+            return false;
+        }
+        ContextState& ctx = it->second;
+        // 构建期间该上下文不可用：显式清掉"上次可用"的结论，避免并发 CorrectRva 在同一
+        // imageId 上读到过期的恒等映射（铁律：拿不准就返回 0，不猜）。
+        ctx.tableReady = false;
+        ctx.identical = false;
+        // 上下文 -> 构建用 globals（move，构建完再搬回）
+        g_oldPdata = std::move(ctx.oldPdata);
+        g_symbols = std::move(ctx.symbols);
+        g_byDemangled = std::move(ctx.byDemangled);
+        g_byMangled = std::move(ctx.byMangled);
+        g_headHashByRva = std::move(ctx.headHashByRva);
+        g_aobData = std::move(ctx.aobData);
+        g_aobByRva = std::move(ctx.aobByRva);
+        g_oldFingerprint = ctx.oldFingerprint;
+        g_baseSizeOfImage = ctx.baseSizeOfImage;
+        g_baseTimeDateStamp = ctx.baseTimeDateStamp;
+        g_loaded = ctx.loaded;
+        g_identical = false;
+        g_leafMap.clear();
+        g_newPdata.clear();
+        g_map.clear();
+        g_fingerprint = 0;
+        g_tableReady = false;
+    }
+
+    // RAII：BuildNewTableImpl 中途抛异常（例如畸形 sidecar 触发大分配）也必须把数据搬回
+    // 上下文，否则该模块的 old pdata/符号表永久丢失。
+    struct RestoreGuard {
+        uint32_t imageId;
+        ~RestoreGuard() { RestoreContextFromGlobals(imageId); }
+    } restoreGuard{ imageId };
+
+    bool ok = false;
+    try {
+        ok = BuildNewTableImpl(imageId, target);
+    } catch (...) {
+        // 保持 fail-closed：解析/对齐抛异常 = 该映像不做矫正（调用方按未命中处理）。
+        Logger::Log("PdataMatch: BuildNewTable exception; correction unavailable for image=%u",
+            static_cast<unsigned>(imageId));
+        ok = false;
+    }
+    return ok;
+}
+
+bool HasContext(uint32_t imageId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const auto it = g_contexts.find(imageId);
+    return it != g_contexts.end() && it->second.loaded;
+}
+
+uintptr_t CorrectRva(uint32_t imageId, uintptr_t oldRva) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const auto it = g_contexts.find(imageId);
+    if (it == g_contexts.end()) return 0;
+    return CorrectRvaLocked(it->second, oldRva);
+}
+
+uintptr_t CorrectByName(uint32_t imageId, const char* name) {
     if (!name || !*name) return 0;
     std::lock_guard<std::mutex> lock(g_mutex);
-    // 两个 map 分别独立查找，避免跨容器迭代器比较（UB，Debug 下 _ITERATOR_DEBUG_LEVEL=2 会 assert）
-    size_t symIdx = SIZE_MAX;  // SIZE_MAX 来自 <cstdint>（本文件已使用）
-    const auto itD = g_byDemangled.find(name);
-    if (itD != g_byDemangled.end()) {
+    const auto it = g_contexts.find(imageId);
+    if (it == g_contexts.end()) return 0;
+    const ContextState& ctx = it->second;
+    size_t symIdx = SIZE_MAX;
+    const auto itD = ctx.byDemangled.find(name);
+    if (itD != ctx.byDemangled.end()) {
         symIdx = itD->second;
     } else {
-        const auto itM = g_byMangled.find(name);
-        if (itM != g_byMangled.end()) symIdx = itM->second;
+        const auto itM = ctx.byMangled.find(name);
+        if (itM != ctx.byMangled.end()) symIdx = itM->second;
     }
-    if (symIdx == SIZE_MAX || symIdx >= g_symbols.size()) return 0;
-    const uint32_t oldRva = g_symbols[symIdx].old_rva;
+    if (symIdx == SIZE_MAX || symIdx >= ctx.symbols.size()) return 0;
+    const uint32_t oldRva = ctx.symbols[symIdx].old_rva;
     if (oldRva == 0) return 0;
-    return CorrectRvaLocked(oldRva);  // 函数开头矫正（vtable 等非 pdata 符号自然返回 0）
+    return CorrectRvaLocked(ctx, oldRva);
 }
 
-uint64_t Fingerprint() {
+uint64_t Fingerprint(uint32_t imageId) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_fingerprint;
+    const auto it = g_contexts.find(imageId);
+    return it != g_contexts.end() ? it->second.fingerprint : 0;
 }
 
-bool CorrectVTableByName(const char* name, uint32_t& outRva, uint32_t& outSlotCount) {
+bool CorrectVTableByName(uint32_t imageId, const char* name, uint32_t& outRva, uint32_t& outSlotCount) {
     if (!name || !*name) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
+    const auto it = g_contexts.find(imageId);
+    if (it == g_contexts.end()) return false;
+    const ContextState& ctx = it->second;
     size_t symIdx = SIZE_MAX;
-    const auto itD = g_byDemangled.find(name);
-    if (itD != g_byDemangled.end()) {
+    const auto itD = ctx.byDemangled.find(name);
+    if (itD != ctx.byDemangled.end()) {
         symIdx = itD->second;
     } else {
-        const auto itM = g_byMangled.find(name);
-        if (itM != g_byMangled.end()) symIdx = itM->second;
+        const auto itM = ctx.byMangled.find(name);
+        if (itM != ctx.byMangled.end()) symIdx = itM->second;
     }
-    if (symIdx == SIZE_MAX || symIdx >= g_symbols.size()) return false;
-    const Symbol& sym = g_symbols[symIdx];
+    if (symIdx == SIZE_MAX || symIdx >= ctx.symbols.size()) return false;
+    const Symbol& sym = ctx.symbols[symIdx];
     if (sym.kind != 1 || sym.slots.empty()) return false;  // 非 vtable
-    // vtable RVA 矫正：版本一致恒等；跨版本查 g_leafMap（vtable 槽位结构匹配结果）
-    const uintptr_t corrected = CorrectRvaLocked(sym.old_rva);
+    const uintptr_t corrected = CorrectRvaLocked(ctx, sym.old_rva);
     if (corrected == 0) return false;
     outRva = static_cast<uint32_t>(corrected);
     outSlotCount = static_cast<uint32_t>(sym.slots.size());
     return true;
 }
-
 }  // namespace PdataMatch
