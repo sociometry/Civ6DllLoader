@@ -118,6 +118,7 @@
     <ClInclude Include="ImageAddress.h" />
     <ClInclude Include="LoaderUpdate.h" />
     <ClInclude Include="PatchRegistry.h" />
+    <ClInclude Include="PluginBoundary.h" />
     <ClInclude Include="UiInject.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
@@ -128,6 +129,7 @@
     <ClCompile Include="ImageAddress.cpp" />
     <ClCompile Include="LoaderHooks.cpp" />
     <ClCompile Include="PatchRegistry.cpp" />
+    <ClCompile Include="PluginBoundary.cpp" />
     <ClCompile Include="UiInject.cpp" />
     <ClCompile Include="..\common\ModScan.cpp" />
     <ClCompile Include="..\common\RuntimePackage.cpp" />

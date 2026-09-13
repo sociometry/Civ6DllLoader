@@ -21,6 +21,11 @@ namespace PatchRegistry {
 // 返回 false 表示失败（参数无效/区间冲突/内存保护失败）。
 bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner);
 
+// 查询 [target, target+len) 是否与任何已登记的补丁区间重叠。
+// 供 MinHook 装钩前做仲裁：同一段字节既被装钩又被打补丁时，两侧各自的"恢复原始字节"
+// 会互相覆盖，最终恢复出第三种状态。调用方不得持注册表的锁（内部自己取）。
+bool OverlapsRegistered(const void* target, size_t len);
+
 // Revert：恢复原始字节并移除记录；无记录返回 false。
 bool Revert(void* target);
 bool RevertOwned(void* target, const wchar_t* owner);

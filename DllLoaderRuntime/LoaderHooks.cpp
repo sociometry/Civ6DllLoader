@@ -63,7 +63,7 @@ bool CheckGetRuleSetSignature(uintptr_t addr);
 
 // 当前进程 exe 的镜像 id（未识别 = kHookImageInvalid）。
 HookImageId ExeImage() {
-    return HookCurrentExeImage(LoaderCore::RuntimeHookApi());
+    return LoaderCore::CurrentExeImage();
 }
 
 // ---- hook 目标函数签名（MinHook 与调用约定无关，x64 下 __fastcall 即默认约定）----
@@ -319,7 +319,7 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
     } else {
         // 区分幂等短路与真失败：读 exe 全局 hModule 槽（由 RIP 相对指令解出，不写数据地址）。
         const uintptr_t hModAddr = reinterpret_cast<uintptr_t>(
-            ResolveDataByAob(LoaderCore::RuntimeHookApi(), ExeImage(), kAob_hModule));
+            LoaderCore::ResolveDataByAobCore(ExeImage(), kAob_hModule));
         HMODULE* hMod = reinterpret_cast<HMODULE*>(hModAddr);
         if (hMod && *hMod != nullptr) {
             Logger::Log("LoadDLL idempotent short-circuit; (re)initializing plugins against loaded module");
@@ -402,6 +402,33 @@ bool LoaderHooks::InstallAll() {
         return false;
     };
 
+    // 可选 hook 的统一安装事务：失败只放弃这一个并记日志，**不连坐**已装好的钩子。
+    // 关键点：一个可选 hook（lEnableMod / lDisableMod / UnloadDLL）的签名或启用失败，
+    // 绝不该把核心的 LoadDLL 钩子一起回滚掉 —— 原实现在这里 return rollback(...)，
+    // 等于"丢一个可选功能 = 丢全部功能"。
+    const auto installOptional = [&](const char* name, uintptr_t addr,
+                                     bool (*check)(uintptr_t), void* detour, void** original) {
+        if (!addr || !check(addr)) {
+            Logger::Log("%s signature mismatch; hook skipped (addr=0x%llX)", name,
+                static_cast<unsigned long long>(addr));
+            return;
+        }
+        MH_STATUS s = MH_CreateHook(reinterpret_cast<LPVOID>(addr), detour,
+            reinterpret_cast<LPVOID*>(original));
+        if (s != MH_OK) {
+            Logger::Log("%s MH_CreateHook failed: %s", name, MH_StatusToString(s));
+            return;
+        }
+        s = MH_EnableHook(reinterpret_cast<LPVOID>(addr));
+        if (s != MH_OK) {
+            Logger::Log("%s MH_EnableHook failed: %s", name, MH_StatusToString(s));
+            MH_RemoveHook(reinterpret_cast<LPVOID>(addr));  // 摘掉半成品记录，避免下次 ALREADY_CREATED
+            return;
+        }
+        createdHooks.push_back(reinterpret_cast<LPVOID>(addr));
+        Logger::Log("%s hook installed at 0x%llX", name, static_cast<unsigned long long>(addr));
+    };
+
     // ---- LoadDLL（RVA 0xF8510 / 0xF8850，AOB 兜底）----
     const uintptr_t loadDllAddr = reinterpret_cast<uintptr_t>(
         LoaderCore::ResolveExeTarget(kExeLoadDLL, 1));
@@ -423,69 +450,24 @@ bool LoaderHooks::InstallAll() {
     Logger::Log("LoadDLL hook installed at 0x%llX",
         static_cast<unsigned long long>(loadDllAddr));
 
-    // ---- lDisableMod（RVA 0x4CCD50 / 0x4CD5B0，AOB 兜底）----
-    const uintptr_t disableAddr = reinterpret_cast<uintptr_t>(
-        LoaderCore::ResolveExeTarget(kExelDisableMod, 1));
-    if (!disableAddr || !CheckModToggleSignature(disableAddr)) {
-        Logger::Log("lDisableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
-            static_cast<unsigned long long>(disableAddr), GetLastError());
-        return rollback("lDisableMod validation failed");
-    }
-    if ((st = MH_CreateHook((LPVOID)disableAddr, &DisableModDetour, (LPVOID*)&g_origDisableMod))
-            != MH_OK) {
-        Logger::Log("lDisableMod MH_CreateHook failed: %s", MH_StatusToString(st));
-        return rollback("lDisableMod create failed");
-    }
-    createdHooks.push_back((LPVOID)disableAddr);
-    if ((st = MH_EnableHook((LPVOID)disableAddr)) != MH_OK) {
-        Logger::Log("lDisableMod MH_EnableHook failed: %s", MH_StatusToString(st));
-        return rollback("lDisableMod enable failed");
-    }
-    Logger::Log("lDisableMod hook installed at 0x%llX",
-        static_cast<unsigned long long>(disableAddr));
+    // ---- lDisableMod（RVA 0x4CCD50 / 0x4CD5B0，AOB 兜底；可选）----
+    installOptional("lDisableMod",
+        reinterpret_cast<uintptr_t>(LoaderCore::ResolveExeTarget(kExelDisableMod, 1)),
+        &CheckModToggleSignature, reinterpret_cast<void*>(&DisableModDetour),
+        reinterpret_cast<void**>(&g_origDisableMod));
 
-    // ---- lEnableMod（RVA 0x4CCFE0 / 0x4CD840，AOB 兜底）----
-    const uintptr_t enableAddr = reinterpret_cast<uintptr_t>(
-        LoaderCore::ResolveExeTarget(kExelEnableMod, 1));
-    if (!enableAddr || !CheckModToggleSignature(enableAddr)) {
-        Logger::Log("lEnableMod signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
-            static_cast<unsigned long long>(enableAddr), GetLastError());
-        return rollback("lEnableMod validation failed");
-    }
-    if ((st = MH_CreateHook((LPVOID)enableAddr, &EnableModDetour, (LPVOID*)&g_origEnableMod))
-            != MH_OK) {
-        Logger::Log("lEnableMod MH_CreateHook failed: %s", MH_StatusToString(st));
-        return rollback("lEnableMod create failed");
-    }
-    createdHooks.push_back((LPVOID)enableAddr);
-    if ((st = MH_EnableHook((LPVOID)enableAddr)) != MH_OK) {
-        Logger::Log("lEnableMod MH_EnableHook failed: %s", MH_StatusToString(st));
-        return rollback("lEnableMod enable failed");
-    }
-    Logger::Log("lEnableMod hook installed at 0x%llX",
-        static_cast<unsigned long long>(enableAddr));
+    // ---- lEnableMod（RVA 0x4CCFE0 / 0x4CD840，AOB 兜底；可选）----
+    installOptional("lEnableMod",
+        reinterpret_cast<uintptr_t>(LoaderCore::ResolveExeTarget(kExelEnableMod, 1)),
+        &CheckModToggleSignature, reinterpret_cast<void*>(&EnableModDetour),
+        reinterpret_cast<void**>(&g_origEnableMod));
 
-    // ---- UnloadDLL（RVA 0xF8E30 / 0xF9170，AOB 兜底）----
-    const uintptr_t unloadDllAddr = reinterpret_cast<uintptr_t>(
-        LoaderCore::ResolveExeTarget(kExeUnloadDLL, 1));
-    if (!unloadDllAddr || !CheckUnloadDllSignature(unloadDllAddr)) {
-        Logger::Log("UnloadDLL signature mismatch; hook skipped (addr=0x%llX, err=%lu)",
-            static_cast<unsigned long long>(unloadDllAddr), GetLastError());
-        return rollback("UnloadDLL validation failed");
-    }
-    if ((st = MH_CreateHook((LPVOID)unloadDllAddr, &UnloadDllDetour, (LPVOID*)&g_origUnloadDLL))
-            != MH_OK) {
-        Logger::Log("UnloadDLL MH_CreateHook failed: %s", MH_StatusToString(st));
-        return rollback("UnloadDLL create failed");
-    }
-    createdHooks.push_back((LPVOID)unloadDllAddr);
-    if ((st = MH_EnableHook((LPVOID)unloadDllAddr)) != MH_OK) {
-        Logger::Log("UnloadDLL MH_EnableHook failed: %s", MH_StatusToString(st));
-        return rollback("UnloadDLL enable failed");
-    }
-    Logger::Log("UnloadDLL hook installed at 0x%llX",
-        static_cast<unsigned long long>(unloadDllAddr));
+    // ---- UnloadDLL（RVA 0xF8E30 / 0xF9170，AOB 兜底；可选）----
+    installOptional("UnloadDLL",
+        reinterpret_cast<uintptr_t>(LoaderCore::ResolveExeTarget(kExeUnloadDLL, 1)),
+        &CheckUnloadDllSignature, reinterpret_cast<void*>(&UnloadDllDetour),
+        reinterpret_cast<void**>(&g_origUnloadDLL));
 
-    Logger::Log("InstallAll: all core hooks installed (%zu)", createdHooks.size());
+    Logger::Log("InstallAll: %zu hook(s) installed (LoadDLL is the required one)", createdHooks.size());
     return true;
 }

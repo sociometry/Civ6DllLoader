@@ -117,6 +117,8 @@ HMODULE LoaderCore::RuntimeModuleHandle() {
 void LoaderCore::InitEarly() {
     Logger::Init(L"Civ6DllLoader_Loader.log");
     Logger::Log("InitEarly: runtimeVersion=0x%08X", kLoaderRuntimeVersion);
+    // HookAPI 表必须落在只读页：插件写它要当场 AV，而不是静默改掉 Loader 的行为。
+    LoaderCore::VerifyHookApiTableProtection();
     if (!PdataMatch::Init(g_runtimeModule)) {
         Logger::Log("InitEarly: PdataMatch::Init 失败（sidecar 缺失，继续）");
     } else {

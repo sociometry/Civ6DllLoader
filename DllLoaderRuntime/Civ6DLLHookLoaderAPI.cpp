@@ -19,6 +19,7 @@
 #include "HavokScript.h"
 #include "PdataMatch.h"
 #include "ImageAddress.h"
+#include "PluginBoundary.h"
 
 #include <cstdarg>
 #include <cstdlib>
@@ -168,6 +169,53 @@ struct HookRecord {
 };
 
 static std::unordered_map<void*, HookRecord> g_hookRecords;
+
+// ================= 统一挂钩站点（Unified Hook Site） =================
+// 对同一个 target，MinHook 只挂一次，挂到 Loader 自己 asmjit 生成的「中转 stub」。
+// 一个站点把 Detour 槽、Capture 槽与 MinHook 侧合并到同一节点：
+//   - Detour 槽：activeDetour/detourOwner —— InstallHook 的独占插件 detour；
+//   - Capture 槽：hasCapture/captureParamIndex/captureOuts —— RegisterGlobalCapture 的
+//     共享参数捕获订阅（同一 target 上 1 个 Detour + N 个 Capture 共存）；
+//   - MinHook 侧：stubCode/minhookTrampoline/hookInstalled。
+// stub 每次调用先读 hasCapture：无捕获直接尾跳 nextTarget（快路径，Detour-only 站点
+// 几乎零开销）；有捕获才保存参数、调用 CaptureDispatch，再尾跳 nextTarget。
+// nextTarget = activeDetour（有 Detour 时）或 minhookTrampoline（无 Detour 时）。
+//
+// 生命周期硬约束（M1）：站点、stub、trampoline 一经建立就【永不物理脱钩】。退役只
+// 拔插槽（activeDetour=nullptr / hasCapture=false / captureOuts.clear()），绝不调用
+// MH_RemoveHook、绝不 JitRuntime::release、绝不 g_hookSites.erase。理由：stub 先减
+// 计数再尾跳，且 activeCalls==0 不能证明没有调用者仍在 stub 内；释放任何 JIT 代码 /
+// 节点 / trampoline 都是 UAF。节点只在进程退出时随静态对象回收。
+// 唯一的物理重建是「跨 GameCore 代际重建」（M4，见 GetOrCreateHookSiteLocked）：
+// 旧映像已卸载，旧 trampoline 悬垂，必须摘掉旧 MinHook 记录后重挂。
+struct HookSite {
+    struct CaptureOut {
+        void** address = nullptr;
+        std::wstring ownerId;
+    };
+
+    void* stubCode = nullptr;             // asmjit 中转 stub 入口（永不释放）
+    void* minhookTrampoline = nullptr;    // MH_CreateHook 产出（尾跳回原函数）
+    void* activeDetour = nullptr;         // 插件 detour；nullptr = 无
+    void* nextTarget = nullptr;           // stub 实际尾跳目标 = activeDetour ?: minhookTrampoline
+    std::wstring detourOwner;             // activeDetour 的 owner（空 = 无）
+    bool hasCapture = false;              // stub 裸读的 POD 字节；true 才走慢路径
+    bool hookInstalled = false;           // MinHook 已 Create+Enable（前导字节已被改写）
+    bool retiring = false;                // g_captureMutex 保护；阻止新的捕获写入
+    uint32_t captureParamIndex = 0;
+    std::vector<CaptureOut> captureOuts;  // g_captureMutex 保护
+    uint64_t gameCoreGeneration = 0;      // 站点建立时的域代际（exe / 非 GameCore 域 = 0）
+};
+
+static std::map<void*, HookSite> g_hookSites;
+// 站点锁复用 Runtime::MinHookMutex()（不要再引第三个锁）。锁序固定 MinHook -> capture：
+// g_captureMutex 只保护派发侧数据（captureOuts / retiring / captureParamIndex）。
+static std::mutex g_captureMutex;
+static asmjit::JitRuntime g_captureRuntime;  // 统一 stub 的 JIT 分配器（永不 release）
+
+extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr);
+static bool BuildHookHubStub(HookSite* site, void** outStub);
+static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);
 
 // 阶段 B 是否已完成（InitializeGameCorePhase 成功置 true；ResetForReload 复位）。
 static bool g_gameCorePhaseReady = false;
@@ -332,20 +380,283 @@ static MH_STATUS InstallHookOwnedByLocked(void* target, void* detour, void** ori
     return MH_OK;
 }
 
-static bool InstallHookOwnedBy(void* target, void* detour, void** original,
-                               const wchar_t* owner, HookKind kind = HookKind::Plugin) {
-    lock_guard<mutex> lock(Runtime::MinHookMutex());
-    return InstallHookOwnedByLocked(target, detour, original, owner, kind) == MH_OK;
+// 站点的域代际：GameCore 域目标取当前映像代际；exe / 非 GameCore 域恒为 0
+// （与 HookRecord 的口径一致，避免代际比较把 exe 域站点误判为陈旧）。
+static uint64_t SiteGenerationForTarget(const void* target) {
+    return TargetInCurrentGameCore(const_cast<void*>(target))
+        ? ImageAddress::GameCoreGeneration()
+        : 0;
 }
 
+// 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
+// 快路径（hasCapture == 0，Detour-only 站点的常态）：
+//   mov r10, imm64(site)
+//   cmp byte ptr [r10 + off(hasCapture)], 0
+//   jne slow
+//   mov rax, [r10 + off(nextTarget)]
+//   jmp rax
+// 慢路径（有 capture）：
+//   sub rsp, 0x98
+//   mov [rsp+20],rcx / [rsp+28],rdx / [rsp+30],r8 / [rsp+38],r9
+//   movaps [rsp+40],xmm0 / [rsp+50],xmm1 / [rsp+60],xmm2 / [rsp+70],xmm3
+//   lea rcx,[rsp+20] ; mov edx,[r10+off(captureParamIndex)] ; mov r8,r10
+//   mov r10, imm64(&CaptureDispatch) ; call r10
+//   恢复 rcx/rdx/r8/r9 + xmm0-3
+//   add rsp, 0x98
+//   mov r10, imm64(site)          ; C 调用会打掉 r10，必须重载
+//   mov rax, [r10 + off(nextTarget)]
+//   jmp rax
+// rax/r10/r11 在函数入口是 volatile，且都不是参数寄存器，快路径只动 rax/r10。
+// 栈对齐：入口 rsp ≡ 8 (mod 16)，sub 0x98（≡8）后 rsp ≡ 0 (mod 16)，[rsp+0..0x20)
+// 恰好是 CaptureDispatch 的 shadow space，[rsp+0x20..0x80) 保存参数（movaps 目标全部
+// 16 字节对齐）。慢路径【不再】调用 CaptureEnter/CaptureLeave：在「永不释放」前提下
+// 计数不是安全判据（见 HookSite 注释）。
+// stub 运行时从 site 字段读 nextTarget，因此 MinHook trampoline 可在 stub 生成之后由
+// MH_CreateHook 回填，无需生成后回写任何可执行字节。
+static bool BuildHookHubStub(HookSite* site, void** outStub) {
+    using namespace asmjit;
+    CodeHolder code;
+    if (code.init(g_captureRuntime.environment(), g_captureRuntime.cpu_features()) != Error::kOk) {
+        return false;
+    }
+    x86::Assembler a(&code);
+    const Label slow = a.new_label();
+    const int32_t offHasCapture = static_cast<int32_t>(offsetof(HookSite, hasCapture));
+    const int32_t offNextTarget = static_cast<int32_t>(offsetof(HookSite, nextTarget));
+    const int32_t offParamIndex = static_cast<int32_t>(offsetof(HookSite, captureParamIndex));
+
+    // 快路径：无 capture -> 直接尾跳（不保存参数、不发生 C 调用）。
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
+    a.cmp(x86::byte_ptr(x86::r10, offHasCapture), 0);
+    a.jne(slow);
+    a.mov(x86::rax, x86::ptr(x86::r10, offNextTarget));
+    a.jmp(x86::rax);
+
+    // 慢路径：保存参数 -> CaptureDispatch -> 恢复 -> 尾跳 nextTarget。
+    a.bind(slow);
+    a.sub(x86::rsp, 0x98);
+    a.mov(x86::ptr(x86::rsp, 0x20), x86::rcx);
+    a.mov(x86::ptr(x86::rsp, 0x28), x86::rdx);
+    a.mov(x86::ptr(x86::rsp, 0x30), x86::r8);
+    a.mov(x86::ptr(x86::rsp, 0x38), x86::r9);
+    a.movaps(x86::ptr(x86::rsp, 0x40), x86::xmm0);
+    a.movaps(x86::ptr(x86::rsp, 0x50), x86::xmm1);
+    a.movaps(x86::ptr(x86::rsp, 0x60), x86::xmm2);
+    a.movaps(x86::ptr(x86::rsp, 0x70), x86::xmm3);
+    a.lea(x86::rcx, x86::ptr(x86::rsp, 0x20));
+    a.mov(x86::edx, x86::dword_ptr(x86::r10, offParamIndex));
+    a.mov(x86::r8, x86::r10);
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureDispatch));
+    a.call(x86::r10);
+    a.mov(x86::rcx, x86::ptr(x86::rsp, 0x20));
+    a.mov(x86::rdx, x86::ptr(x86::rsp, 0x28));
+    a.mov(x86::r8, x86::ptr(x86::rsp, 0x30));
+    a.mov(x86::r9, x86::ptr(x86::rsp, 0x38));
+    a.movaps(x86::xmm0, x86::ptr(x86::rsp, 0x40));
+    a.movaps(x86::xmm1, x86::ptr(x86::rsp, 0x50));
+    a.movaps(x86::xmm2, x86::ptr(x86::rsp, 0x60));
+    a.movaps(x86::xmm3, x86::ptr(x86::rsp, 0x70));
+    a.add(x86::rsp, 0x98);
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
+    a.mov(x86::rax, x86::ptr(x86::r10, offNextTarget));
+    a.jmp(x86::rax);
+
+    void* stub = nullptr;
+    if (g_captureRuntime.add(&stub, &code) != Error::kOk || !stub) {
+        return false;
+    }
+    *outStub = stub;
+    return true;
+}
+
+// 取/建 target 上的统一站点。调用方必须持有 Runtime::MinHookMutex()（站点锁）。
+// 首次建站（或跨 GameCore 代际重建）才 MH_CreateHook + MH_EnableHook。
+// 失败不抛异常：记日志并返回 nullptr；只在确认尚未发布（created）时 erase 该空节点，
+// 且 erase 之后绝不再使用 site 引用（M5）。
+static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
+    if (!target) return nullptr;
+    const uint64_t generation = SiteGenerationForTarget(target);
+
+    auto it = g_hookSites.find(target);
+    const bool created = (it == g_hookSites.end());
+    if (created) {
+        it = g_hookSites.emplace(target, HookSite{}).first;
+    }
+    HookSite* site = &it->second;
+
+    const bool rebuild = !created && site->gameCoreGeneration != generation;
+    if (!created && !rebuild && site->hookInstalled) {
+        return site;   // 既有、同代、可用
+    }
+
+    if (rebuild) {
+        // M4：跨 GameCore 代际。旧映像已卸载，旧 trampoline（指向旧映像前导字节的重定位
+        // 副本）不再可用，绝不复用。这是「代际重建」，不是 M1 禁止的「退役」：只发生在
+        // 注册路径，target 刚由当前映像解析、可读，此刻摘除旧 MinHook 记录不会踩到未映射内存。
+        Logger::Log("HookSite: rebuild across generation target=%p %llu -> %llu (%s)",
+            target, static_cast<unsigned long long>(site->gameCoreGeneration),
+            static_cast<unsigned long long>(generation), why ? why : "");
+        if (site->hookInstalled && Runtime::IsReadableSpan(target, 1)) {
+            MH_DisableHook(target);
+            const MH_STATUS st = MH_RemoveHook(target);
+            if (st != MH_OK && st != MH_ERROR_NOT_CREATED) {
+                Logger::Log("HookSite: stale hook remove failed target=%p status=%s",
+                    target, MH_StatusToString(st));
+            }
+        }
+        site->hookInstalled = false;
+        site->minhookTrampoline = nullptr;
+        site->activeDetour = nullptr;
+        site->detourOwner.clear();
+        site->nextTarget = nullptr;
+        std::lock_guard<std::mutex> captureLock(g_captureMutex);
+        site->hasCapture = false;
+        site->retiring = false;
+        site->captureOuts.clear();
+    }
+
+    if (!site->stubCode && !BuildHookHubStub(site, &site->stubCode)) {
+        Logger::Log("HookSite: stub build failed target=%p (%s)", target, why ? why : "");
+        if (created) g_hookSites.erase(it);
+        return nullptr;
+    }
+
+    MH_STATUS status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
+    if (status == MH_ERROR_ALREADY_CREATED) {
+        // 只有「本站节点已存在（!created）且该目标没有 Loader 共享钩登记」才可能是本站
+        // 自己的残留 MinHook 记录（例如上一次代际 MH_RemoveHook 失败）。对全新站点，
+        // #ALREADY_CREATED 只可能是别人的钩子 —— 尤其是 InstallSharedHook 装的
+        // ScriptData / ForUI / PushMethods。无条件摘除会释放共享钩的 trampoline，使
+        // g_origRegisterScriptData 等悬垂并静默顶掉 Lua 脚本全局注册，因此必须拒绝。
+        const bool heldBySharedHook = g_hookRecords.find(target) != g_hookRecords.end();
+        const bool ourStaleRecord = !created && !heldBySharedHook;
+        if (ourStaleRecord && Runtime::IsReadableSpan(target, 1)) {
+            MH_RemoveHook(target);
+            status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
+        } else {
+            Logger::Log("HookSite: target %p already hooked by %s; refusing to replace (%s)",
+                target, heldBySharedHook ? "a loader shared hook" : "another owner",
+                why ? why : "");
+            if (created) g_hookSites.erase(it);
+            return nullptr;
+        }
+    }
+    if (status != MH_OK) {
+        Logger::Log("HookSite: MH_CreateHook failed target=%p status=%s (%s)",
+            target, MH_StatusToString(status), why ? why : "");
+        if (created) g_hookSites.erase(it);
+        return nullptr;
+    }
+    // 先把 stub 的尾跳目标置为新 trampoline，再 Enable：否则 Enable 之后、赋值之前进入
+    // stub 的调用会 jmp 到 nullptr。
+    site->gameCoreGeneration = generation;
+    site->nextTarget = site->minhookTrampoline;
+    if ((status = MH_EnableHook(target)) != MH_OK) {
+        Logger::Log("HookSite: MH_EnableHook failed target=%p status=%s (%s)",
+            target, MH_StatusToString(status), why ? why : "");
+        MH_RemoveHook(target);
+        if (created) g_hookSites.erase(it);
+        return nullptr;
+    }
+    site->hookInstalled = true;
+    Logger::Log("HookSite: installed hub stub target=%p stub=%p trampoline=%p gen=%llu (%s)",
+        target, site->stubCode, site->minhookTrampoline,
+        static_cast<unsigned long long>(generation), why ? why : "");
+    return site;
+}
+
+// 退役站点 detour 槽：只拔插槽（M1），绝不 MH_RemoveHook / g_hookSites.erase。
+// 调用方必须持有 Runtime::MinHookMutex()。
+static size_t RetireHookSiteDetoursForOwnerLocked(const std::wstring& owner) {
+    if (owner.empty()) return 0;
+    size_t retired = 0;
+    for (auto& [target, site] : g_hookSites) {
+        if (site.activeDetour && site.detourOwner == owner) {
+            site.activeDetour = nullptr;
+            site.detourOwner.clear();
+            site.nextTarget = site.minhookTrampoline;
+            ++retired;
+            Logger::Log("HookSite: retired detour slot %p (owner=%ls)", target, owner.c_str());
+        }
+    }
+    return retired;
+}
+
+static size_t RetireHookSiteDetoursForGenerationLocked(uint64_t generation) {
+    size_t retired = 0;
+    for (auto& [target, site] : g_hookSites) {
+        if (!site.activeDetour || site.gameCoreGeneration != generation) continue;
+        site.activeDetour = nullptr;
+        site.detourOwner.clear();
+        site.nextTarget = site.minhookTrampoline;
+        ++retired;
+        Logger::Log("HookSite: retired detour slot %p across generation %llu", target,
+            static_cast<unsigned long long>(generation));
+    }
+    return retired;
+}
+
+// 字节修改仲裁：MinHook 会改写目标函数的前导字节。同一个函数既被 InstallHook 装钩、
+// 又被 Patch 打补丁时，两侧各自的"恢复原始字节"会互相覆盖，最终恢复出第三种字节状态
+// （谁先卸载谁踩谁）。这里做双向检查：
+//   - 装钩前：目标前导窗口是否与已登记补丁重叠 -> InstallHookImpl
+//   - 打补丁前：目标区间是否压住某个已装钩目标的前导窗口 -> HookPatch
+// 窗口取与"可读探测"同一口径（32 字节，保守）。
+constexpr size_t kHookPrologueWindow = PluginBoundary::kMinHookTargetSpan;
+
+// 调用方不得持 Runtime::MinHookMutex()（内部自己取）。同时遍历两套登记：
+//   - g_hookRecords：Loader 共享钩（ScriptData / PushMethods）；
+//   - g_hookSites：统一站点的 MinHook 侧（hookInstalled 才会改写前导字节）。
+static bool OverlapsHookPrologue(const void* target, size_t len) {
+    if (!target || len == 0) return false;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
+    const uintptr_t end = begin + len;
+    if (end < begin) return true;   // 地址回绕：按冲突处理
+    lock_guard<mutex> lock(Runtime::MinHookMutex());
+    for (const auto& record : g_hookRecords) {
+        const uintptr_t hookBegin = reinterpret_cast<uintptr_t>(record.first);
+        const uintptr_t hookEnd = hookBegin + kHookPrologueWindow;
+        if (begin < hookEnd && hookBegin < end) return true;
+    }
+    for (const auto& [siteTarget, site] : g_hookSites) {
+        if (!site.hookInstalled) continue;   // 未 Enable 的站点尚未改写前导字节
+        const uintptr_t hookBegin = reinterpret_cast<uintptr_t>(siteTarget);
+        const uintptr_t hookEnd = hookBegin + kHookPrologueWindow;
+        if (begin < hookEnd && hookBegin < end) return true;
+    }
+    return false;
+}
+
+// 插件 Detour 入口：不再直接 MH_CreateHook(target, detour)，而是把 detour 挂进
+// target 的统一站点（MinHook 只挂一次，挂到站点 stub）。同一 target 已有 Detour 时
+// 明确拒绝（Detour 槽独占）；Capture 槽可与之共存，挂载顺序无关。
 bool InstallHookImpl(void* target, void* detour, void** original) {
+    // target / original 都是插件内存：必须在取锁【之前】用页属性探测拦掉坏地址。
+    // 否则 MinHook 读目标前导字节时出错，会把 g_pluginLifecycleMutex 与
+    // Runtime::MinHookMutex() 一起泄漏（/EHsc 下 lock_guard 不析构 -> 永久死锁）。
+    if (!PluginBoundary::IsReadable(target, PluginBoundary::kMinHookTargetSpan)) {
+        Logger::Log("InstallHook rejected: target not readable %p (span=%zu)",
+            target, PluginBoundary::kMinHookTargetSpan);
+        return false;
+    }
+    if (original && !PluginBoundary::IsWritable(original, sizeof(void*))) {
+        Logger::Log("InstallHook rejected: original out-param not writable %p", original);
+        return false;
+    }
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    if (PatchRegistry::OverlapsRegistered(target, kHookPrologueWindow)) {
+        Logger::Log("InstallHook rejected: target %p overlaps a registered patch "
+                    "(unpatch it first)", target);
+        return false;
+    }
     if (TargetInTearingDownGameCore(target)) {
         Logger::Log("InstallHook rejected: target %p belongs to tearing-down GameCore", target);
         return false;
     }
     auto owner = RequirePluginOwner(detour, "InstallHook");
-    if (owner && TargetInCurrentGameCore(target)) {
+    if (!owner) return false;
+    if (TargetInCurrentGameCore(target)) {
         const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
             [&owner](const PluginEntry& entry) {
                 return entry.ownerId == *owner;
@@ -358,7 +669,26 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
             return false;
         }
     }
-    return owner && InstallHookOwnedBy(target, detour, original, owner->c_str());
+
+    // 锁序 lifecycle -> MinHook -> capture：站点在 MinHook 站点锁下取/建。
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    HookSite* site = GetOrCreateHookSiteLocked(target, "InstallHook");
+    if (!site) {
+        Logger::Log("InstallHook: hook site unavailable target=%p", target);
+        return false;
+    }
+    if (site->activeDetour) {
+        Logger::Log("InstallHook rejected: target %p already has a detour (owner=%ls detour=%p)",
+            target, site->detourOwner.c_str(), site->activeDetour);
+        return false;
+    }
+    site->activeDetour = detour;
+    site->detourOwner = *owner;
+    site->nextTarget = detour;
+    if (original) *original = site->minhookTrampoline;
+    Logger::Log("InstallHook: target=%p detour=%p original=%p owner=%ls (hub stub=%p)",
+        target, detour, original ? *original : nullptr, owner->c_str(), site->stubCode);
+    return true;
 }
 
 // 摘除单个 MinHook 钩子；目标内存不可读（GameCore 映像已卸载，重载兜底路径会出现）
@@ -443,7 +773,16 @@ bool IsImageLoadedImpl(HookImageId image) {
 }
 
 bool GetImageInfoImpl(HookImageId image, HookImageInfo* outInfo) {
+    // outInfo 是插件内存：ImageAddress::GetInfo 会先【读】structSize 再【写】字段，
+    // 而 GameCore 分支的写发生在 ImageAddress::g_mutex 内。坏地址在这里出错会泄漏
+    // 那两把锁，所以进锁前先做读写探测（VirtualQuery 不会出错）。
+    if (!PluginBoundary::IsReadableWritable(outInfo, sizeof(HookImageInfo))) {
+        Logger::Log("GetImageInfo rejected: outInfo not readable+writable %p (need %zu bytes)",
+            static_cast<const void*>(outInfo), sizeof(HookImageInfo));
+        return false;
+    }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
     return ImageAddress::GetInfo(image, outInfo);
 }
 
@@ -482,8 +821,10 @@ static bool ResolveSectionRva(HookImageId image, const char* sectionName,
     return false;
 }
 
-void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+// 内部分辨核心：不做插件边界校验、不加插件生命周期锁。
+// Loader 自己（ResolveExeTarget / LoaderHooks / UiInject）走 Core；插件走下面的 *Impl。
+// 这样游戏线程在 LoadDLL detour 里解析自家 hook 目标时，不会去拿那把可能被卡住的插件锁。
+static void* ResolveByRvaCore(HookImageId image, uintptr_t rva, size_t span) {
     uintptr_t effectiveRva = rva;
     if (PdataMatch::HasContext(image)) {
         // 有该模块的 sidecar 上下文：插件传入的是旧映像坐标，先矫正到当前映像。
@@ -505,31 +846,54 @@ void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
     return result;
 }
 
-void* ResolveByNameImpl(HookImageId image, const char* name) {
+// 插件入口：参数全是标量（没有需要锁外抄写的插件内存），只需加锁。
+void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    if (!name || !*name || !ImageAddress::IsLoaded(image)) return nullptr;
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return ResolveByRvaCore(image, rva, span);
+}
+
+// 内部核心：name 由调用方保证可读（Loader 用字面量 / 插件先抄写）。
+static void* ResolveByNameCore(HookImageId image, const char* nameSafe) {
+    if (!ImageAddress::IsLoaded(image)) return nullptr;
 
     // 每个模块有各自 sidecar 上下文（容器：exe/GameCore 各自符号表）。
     if (!PdataMatch::HasContext(image)) {
         Logger::Log("ResolveByName: no symbol database for image=%u name=%s",
-            static_cast<unsigned>(image), name);
+            static_cast<unsigned>(image), nameSafe);
         return nullptr;
     }
 
     // PdataMatch：sidecar 符号表存旧映像 RVA，按名矫正到当前映像后解析。
-    const uintptr_t corrected = PdataMatch::CorrectByName(image, name);
+    const uintptr_t corrected = PdataMatch::CorrectByName(image, nameSafe);
     if (corrected == 0) {
         Logger::Log("ResolveByName: no symbol for image=%u name=%s",
-            static_cast<unsigned>(image), name);
+            static_cast<unsigned>(image), nameSafe);
         return nullptr;
     }
     void* result = ImageAddress::ResolveByRva(image, corrected, 1);
     if (!result) {
         Logger::Log("ResolveByName: out-of-range RVA image=%u name=%s rva=0x%llX",
-            static_cast<unsigned>(image), name,
+            static_cast<unsigned>(image), nameSafe,
             static_cast<unsigned long long>(corrected));
     }
     return result;
+}
+
+void* ResolveByNameImpl(HookImageId image, const char* name) {
+    if (!name || !*name) return nullptr;
+
+    // name 是插件内存：锁外先抄进 Loader 自有 string，锁内只碰副本
+    // （PdataMatch 查表与日志都读它）。坏指针在这里失败，此时没有任何锁被持有。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(name, nameCopy) || nameCopy.empty()) {
+        Logger::Log("ResolveByName rejected: name pointer unreadable");
+        return nullptr;
+    }
+
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return ResolveByNameCore(image, nameCopy.c_str());
 }
 
 void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImageSection section) {
@@ -562,12 +926,8 @@ void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImag
     return ImageAddress::ResolveByRva(image, sectionRva + rva, span);
 }
 
-void* ResolveByPatternImpl(HookImageId image, const char* pattern, HookImageSection section) {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    if (!pattern || !*pattern) {
-        Logger::Log("ResolveByPattern: empty pattern");
-        return nullptr;
-    }
+// 内部核心：pattern 由调用方保证可读（Loader 用字面量 / 插件先抄写）。
+static void* ResolveByPatternCore(HookImageId image, const char* pattern, HookImageSection section) {
     // 解析 AOB："48 8B ?? ?? 74 ?? E8"（?? 整字节通配，也支持单 nibble 如 4?）。
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> masks;
@@ -669,116 +1029,66 @@ void* ResolveByPatternImpl(HookImageId image, const char* pattern, HookImageSect
     return nullptr;
 }
 
+void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSection section) {
+    if (!patternIn || !*patternIn) {
+        Logger::Log("ResolveByPattern: empty pattern");
+        return nullptr;
+    }
+    // pattern 是插件内存：锁外抄写（原实现在锁内逐字节遍历它，一个没有结尾符的指针
+    // 会一路读到出错 -> lock_guard 不析构 -> 锁永久泄漏），锁内只碰副本。
+    std::string patternCopy;
+    if (!PluginBoundary::CopyCString(patternIn, patternCopy) || patternCopy.empty()) {
+        Logger::Log("ResolveByPattern rejected: pattern pointer unreadable");
+        return nullptr;
+    }
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return ResolveByPatternCore(image, patternCopy.c_str(), section);
+}
+
 // ---------------- RegisterGlobalCapture（全局参数捕获站） ----------------
-// 每个 providerFunction（经 pdata 矫正后的目标地址）对应一个捕获站点：首个注册者
-// 生成裸机码 stub 并 MinHook 挂到目标函数入口；后续同一站点的注册只追加 out 槽。
-// 目标函数每次被调用时，stub 把第 paramIndex 个整数参数（rcx/rdx/r8/r9 之一）写入
-// 该站点注册的全部 out 槽。
-struct CaptureSite {
-    struct Out {
-        void** address = nullptr;
-        std::wstring ownerId;
-    };
+// 站点结构 / stub 生成 / GetOrCreateHookSiteLocked 见文件前部「统一挂钩站点」。
+// 本段只保留：派发器（CaptureDispatch）、注册入口、以及只拔插槽的退役路径。
+// 语义：首个注册者在 target 上建统一站点（MinHook 挂到中转 stub）；后续同一站点的
+// 注册只追加 out 槽。目标函数每次被调用时，stub 把第 captureParamIndex 个整数参数
+// （rcx/rdx/r8/r9 之一）写入该站点的全部 out 槽。
 
-    void* original = nullptr;    // MH_CreateHook 产出的 trampoline（stub 尾跳目标）
-    void* stubCode = nullptr;    // JitRuntime 分配的 stub 入口
-    uint32_t paramIndex = 0;
-    std::vector<Out> outs;
-    std::atomic<uint32_t> activeCalls{ 0 };
-    bool retiring = false;       // g_captureMutex 保护；阻止新 out 注册和捕获写入
-};
-static std::map<uintptr_t, CaptureSite> g_captureSites;
-static std::mutex g_captureMutex;
-static std::mutex g_captureRetireMutex; // 串行化各 owner / 整代清理，避免重复释放同一站点
-static std::mutex g_captureDrainMutex;
-static std::condition_variable g_captureDrainCv;
-static asmjit::JitRuntime g_captureRuntime;
-static bool RemoveCaptureHook(uintptr_t target);
-
-extern "C" void CaptureEnter(CaptureSite* site) {
-    if (site) site->activeCalls.fetch_add(1, std::memory_order_acq_rel);
-}
-
-extern "C" void CaptureLeave(CaptureSite* site) {
-    if (!site) return;
-    if (site->activeCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        std::lock_guard<std::mutex> lock(g_captureDrainMutex);
-        g_captureDrainCv.notify_all();
+// 叶子 shim：out 槽虽然在注册时已探过可写，但插件之后可能自行释放该地址或改页保护。
+// 只有 POD 局部变量（MSVC C2712）；异常在这里被吃掉 —— 没有发生栈展开，调用方的
+// lock_guard 照常析构，因此绝不会因这次写入失败而泄漏 g_captureMutex。
+__declspec(noinline) static bool SafeWritePointer(void* dst, void* value) {
+    __try {
+        *reinterpret_cast<void**>(dst) = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 
-// stub 调用的分发器：regs 指向 stub 栈帧里保存的 4 个整数参数槽（rcx/rdx/r8/r9），
-// 取第 paramIndex 个值写入站点全部 out 槽。与注册路径共用 g_captureMutex。
+// stub 慢路径调用的分发器：regs 指向 stub 栈帧保存的 4 个整数参数槽（rcx/rdx/r8/r9）。
+// 锁序恒为 MinHook -> capture，因此这里【只】取 g_captureMutex。
+// paramIndex 由 stub 传入，但一律以锁内站点字段为准（防止 stub 裸读到的陈旧值索引错
+// 参数）；hasCapture/retiring/空 outs 任一不成立都直接返回（陈旧读到 1 的兜底）。
 extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr) {
-    CaptureSite* site = static_cast<CaptureSite*>(sitePtr);
-    if (!site || !regs || paramIndex > 3) return;
-    const void* val = static_cast<void* const*>(regs)[paramIndex];
+    HookSite* site = static_cast<HookSite*>(sitePtr);
+    if (!site || !regs) return;
     std::lock_guard<std::mutex> lock(g_captureMutex);
-    if (site->retiring) return;
-    for (const CaptureSite::Out& out : site->outs) {
-        if (out.address) *out.address = const_cast<void*>(val);
+    if (!site->hasCapture || site->retiring) return;
+    uint32_t index = site->captureParamIndex;
+    if (index > 3) index = paramIndex;
+    if (index > 3) return;
+    if (site->captureOuts.empty()) return;
+    const void* val = static_cast<void* const*>(regs)[index];
+    for (const HookSite::CaptureOut& out : site->captureOuts) {
+        if (!out.address) continue;
+        if (!SafeWritePointer(out.address, const_cast<void*>(val))) {
+            Logger::Log("CaptureDispatch: out slot not writable %p (plugin freed it?)",
+                static_cast<const void*>(out.address));
+        }
     }
 }
 
-// 生成捕获站点 stub（裸 x64 机器码，Windows x64 调用约定）：
-//   MinHook 跳入时：rcx/rdx/r8/r9 = 前 4 个整数参数，xmm0-3 = 前 4 个浮点参数，
-//   [rsp] = 返回地址（此时 rsp ≡ 8 (mod 16)）。sub rsp, 0x98 后 rsp ≡ 0 (mod 16)：
-//   [rsp+0x00..0x20) 恰好充当 CaptureEnter/CaptureDispatch/CaptureLeave 的 shadow space，
-//   [rsp+0x20..0x80) 保存参数（movaps 目标全部 16 字节对齐）。
-// original 回填方案（免写可执行内存、免扫描/免 reloc）：stub 尾部
-//   mov rax, imm64(&site->original)  —— 生成时固化的 C++ 站点成员地址
-//                                      （std::map 节点地址稳定，绝对寻址）
-//   mov rax, [rax]                   —— 运行时读 trampoline 指针
-//   jmp rax                          —— 尾跳 MinHook trampoline
-// MH_CreateHook 在 MH_EnableHook 之前把 trampoline 写入 site->original，因此 stub
-// 首次可执行时该值必已就绪，无需生成后回填任何 stub 字节。
-static bool BuildCaptureStub(CaptureSite* site, void** outStub) {
-    using namespace asmjit;
-    CodeHolder code;
-    if (code.init(g_captureRuntime.environment(), g_captureRuntime.cpu_features()) != Error::kOk) {
-        return false;
-    }
-    x86::Assembler a(&code);
-    a.sub(x86::rsp, 0x98);
-    a.mov(x86::ptr(x86::rsp, 0x20), x86::rcx);
-    a.mov(x86::ptr(x86::rsp, 0x28), x86::rdx);
-    a.mov(x86::ptr(x86::rsp, 0x30), x86::r8);
-    a.mov(x86::ptr(x86::rsp, 0x38), x86::r9);
-    a.movaps(x86::ptr(x86::rsp, 0x40), x86::xmm0);
-    a.movaps(x86::ptr(x86::rsp, 0x50), x86::xmm1);
-    a.movaps(x86::ptr(x86::rsp, 0x60), x86::xmm2);
-    a.movaps(x86::ptr(x86::rsp, 0x70), x86::xmm3);
-    a.mov(x86::rcx, reinterpret_cast<uintptr_t>(site));
-    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureEnter));
-    a.call(x86::r10);
-    a.lea(x86::rcx, x86::ptr(x86::rsp, 0x20));
-    a.mov(x86::edx, static_cast<uint32_t>(site->paramIndex));
-    a.mov(x86::r8, reinterpret_cast<uintptr_t>(site));
-    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureDispatch));
-    a.call(x86::r10);
-    a.mov(x86::rcx, reinterpret_cast<uintptr_t>(site));
-    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureLeave));
-    a.call(x86::r10);
-    a.mov(x86::rcx, x86::ptr(x86::rsp, 0x20));
-    a.mov(x86::rdx, x86::ptr(x86::rsp, 0x28));
-    a.mov(x86::r8, x86::ptr(x86::rsp, 0x30));
-    a.mov(x86::r9, x86::ptr(x86::rsp, 0x38));
-    a.movaps(x86::xmm0, x86::ptr(x86::rsp, 0x40));
-    a.movaps(x86::xmm1, x86::ptr(x86::rsp, 0x50));
-    a.movaps(x86::xmm2, x86::ptr(x86::rsp, 0x60));
-    a.movaps(x86::xmm3, x86::ptr(x86::rsp, 0x70));
-    a.add(x86::rsp, 0x98);
-    a.mov(x86::rax, reinterpret_cast<uintptr_t>(&site->original));
-    a.mov(x86::rax, x86::ptr(x86::rax));
-    a.jmp(x86::rax);
-
-    void* stub = nullptr;
-    if (g_captureRuntime.add(&stub, &code) != Error::kOk || !stub) {
-        return false;
-    }
-    *outStub = stub;
-    return true;
-}
+// 捕获站点 stub 生成已合并到 BuildHookHubStub（见文件前部「统一挂钩站点」）。
 
 // RegisterGlobalCapture 内部核心（无插件 owner 校验）：从插件入口提取的公共核心，
 // 供 RegisterGlobalCaptureImpl 复用。ownerId 空串 = Loader 归属（GameCore 重载
@@ -809,78 +1119,67 @@ static bool RegisterGlobalCaptureCore(HookImageId image, const char* providerFun
         return false;
     }
 
-    lock_guard<std::mutex> captureLock(g_captureMutex);
-    CaptureSite& site = g_captureSites[reinterpret_cast<uintptr_t>(target)];
-    if (site.stubCode) {
-        if (site.retiring) {
-            Logger::Log("RegisterGlobalCapture: target is being retired provider=%s", providerFunction);
-            return false;
-        }
-        // 已存在站点：paramIndex 必须一致，仅追加 out 槽。
-        if (site.paramIndex != paramIndex) {
+    // 锁序 lifecycle -> MinHook -> capture：先在站点锁下取/建站点（只有首次建站才挂
+    // MinHook），再进 capture 锁登记订阅。同一 target 上的 Detour / 既有 Capture 都被复用。
+    HookSite* site = nullptr;
+    {
+        lock_guard<std::mutex> hookLock(Runtime::MinHookMutex());
+        site = GetOrCreateHookSiteLocked(target, "RegisterGlobalCapture");
+    }
+    if (!site) {
+        Logger::Log("RegisterGlobalCapture: hook site unavailable provider=%s", providerFunction);
+        return false;
+    }
+
+    size_t slotCount = 0;
+    {
+        lock_guard<std::mutex> captureLock(g_captureMutex);
+        if (site->hasCapture && site->captureParamIndex != paramIndex) {
             Logger::Log("RegisterGlobalCapture: paramIndex conflict provider=%s have=%u want=%u",
-                providerFunction, static_cast<unsigned>(site.paramIndex),
+                providerFunction, static_cast<unsigned>(site->captureParamIndex),
                 static_cast<unsigned>(paramIndex));
             return false;
         }
-        site.outs.push_back({ out, ownerId });
-        return true;
+        // 先追加 out 槽再置 hasCapture：stub 裸读到 hasCapture=1 时 outs 必已可见。
+        site->captureParamIndex = paramIndex;
+        site->captureOuts.push_back({ out, ownerId });
+        site->retiring = false;
+        site->hasCapture = true;
+        slotCount = site->captureOuts.size();
     }
-
-    // 在生成/启用 hook 前准备订阅，避免启用成功后再分配 vector/string 时失败。
-    // capture 锁保护整个安装过程，Dispatch 只会在安装成功并解锁后写入。
-    site.paramIndex = paramIndex;
-    site.outs.push_back({ out, ownerId });
-    if (!BuildCaptureStub(&site, &site.stubCode)) {
-        Logger::Log("RegisterGlobalCapture: stub build failed provider=%s", providerFunction);
-        g_captureSites.erase(reinterpret_cast<uintptr_t>(target));
-        return false;
-    }
-    MH_STATUS status;
-    bool hookCreated = false;
-    {
-        lock_guard<std::mutex> mhLock(Runtime::MinHookMutex());
-        status = MH_CreateHook(target, site.stubCode, &site.original);
-        if (status == MH_OK) {
-            hookCreated = true;
-            status = MH_EnableHook(target);
-        }
-    }
-    bool hookRemoved = true;
-    if (status != MH_OK && hookCreated) {
-        // Enable 失败后 MinHook 仍可能保留 CreateHook 记录；先完整摘除，
-        // 否则重试会撞 ALREADY_CREATED，且 target 可能继续引用 stub。
-        hookRemoved = RemoveCaptureHook(reinterpret_cast<uintptr_t>(target));
-    }
-    if (status != MH_OK) {
-        Logger::Log("RegisterGlobalCapture: hook failed %s provider=%s",
-            MH_StatusToString(status), providerFunction);
-        void* failedStub = site.stubCode;
-        if (hookRemoved) {
-            g_captureSites.erase(reinterpret_cast<uintptr_t>(target));
-            if (failedStub) g_captureRuntime.release(failedStub);
-        } else {
-            // 无法确认 target 已经脱离 stub 时宁可保留整站和代码，避免 UAF；
-            // 标记 retiring，后续注册拒绝，重载清理会再次尝试摘钩。
-            site.retiring = true;
-            site.outs.clear(); // 注册已返回失败，不能再保留调用者的输出地址
-            Logger::Log("RegisterGlobalCapture: rollback remove failed; site retained target=%p",
-                target);
-        }
-        return false;
-    }
-    Logger::Log("RegisterGlobalCapture: installed provider=%s target=%p param=%u owner=%ls",
-        providerFunction, target, static_cast<unsigned>(paramIndex), ownerId.c_str());
+    Logger::Log("RegisterGlobalCapture: installed provider=%s target=%p param=%u owner=%ls "
+                "(hub stub=%p outs=%zu)",
+        providerFunction, target, static_cast<unsigned>(paramIndex), ownerId.c_str(),
+        site->stubCode, slotCount);
     return true;
 }
 
 // 插件入口：owner 校验后走核心（out 槽须位于插件模块内）。
 bool RegisterGlobalCaptureImpl(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out) {
+    if (!providerFunction || !*providerFunction) return false;
+
+    // out 是宿主【写】的目标（CaptureDispatch 会往它写），providerFunction 是宿主
+    // 【读】的字符串名 —— 两者都是插件内存，处理一律放在取锁之前。
+    // CaptureDispatch 侧另有叶子 SEH 兜底（防插件注册后自行释放该地址 / 改页保护）。
+    if (!PluginBoundary::IsWritable(out, sizeof(void*))) {
+        Logger::Log("RegisterGlobalCapture rejected: out slot not writable %p",
+            static_cast<const void*>(out));
+        return false;
+    }
+    std::string providerCopy;
+    if (!PluginBoundary::CopyCString(providerFunction, providerCopy) || providerCopy.empty()) {
+        Logger::Log("RegisterGlobalCapture rejected: providerFunction unreadable");
+        return false;
+    }
+
     // owner 查询与注册必须在同一生命周期锁内，防止查询后插件先被停用并完成清理。
+    // 注意：owner 探针必须用插件自己的 out 指针（RequirePluginOwner 只做模块归属
+    // 查询，不解引用），不能用 Loader 副本，否则会被判成 Loader 自身。
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
     auto owner = RequirePluginOwner(reinterpret_cast<const void*>(out), "RegisterGlobalCapture");
     if (!owner) return false;
-    return RegisterGlobalCaptureCore(image, providerFunction, paramIndex, out, *owner);
+    return RegisterGlobalCaptureCore(image, providerCopy.c_str(), paramIndex, out, *owner);
 }
 
 // 读 [vtable + index*8] 的槽函数指针。本函数无 C++ 对象（无展开要求），可用 SEH 兜底。
@@ -896,12 +1195,8 @@ static void* ReadVTableSlotSafe(void* vtable, uint32_t index) {
 }
 
 // ---------------- ResolveByVTable（按 vtable 符号 + 槽序号解析虚函数） ----------------
-void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbol, uint32_t index) {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    if (!vtableSymbol || !*vtableSymbol) {
-        Logger::Log("ResolveByVTable rejected: empty vtable symbol");
-        return nullptr;
-    }
+// 内部核心：vtableSymbol 由调用方保证可读。
+static void* ResolveByVTableCore(HookImageId image, const char* vtableSymbol, uint32_t index) {
     uint32_t vtableRva = 0;
     uint32_t slotCount = 0;
     if (!PdataMatch::CorrectVTableByName(image, vtableSymbol, vtableRva, slotCount)) {
@@ -929,111 +1224,120 @@ void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbol, uint32_t 
     return slotFunc;
 }
 
-// ---------------- capture 站点生命周期清理 ----------------
+void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbolIn, uint32_t index) {
+    if (!vtableSymbolIn || !*vtableSymbolIn) {
+        Logger::Log("ResolveByVTable rejected: empty vtable symbol");
+        return nullptr;
+    }
+    // vtableSymbol 是插件内存：锁外抄写（锁内会被 PdataMatch 查表与日志反复读取）。
+    std::string symbolCopy;
+    if (!PluginBoundary::CopyCString(vtableSymbolIn, symbolCopy) || symbolCopy.empty()) {
+        Logger::Log("ResolveByVTable rejected: symbol pointer unreadable");
+        return nullptr;
+    }
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return ResolveByVTableCore(image, symbolCopy.c_str(), index);
+}
+
+// 只给 Loader 内部使用的"无锁取址表"：解析类入口指向不加插件锁的 Core，其余字段保持
+// nullptr —— 这张表【绝不交给插件】。这样 common/HookAPI.h 里的 inline 取址工具
+// （HookCurrentExeImage / ResolveByHookInfo / ResolveDataByAob / HookScanPatternNth /
+//  HookFindSection）可以直接复用，既不经过插件表、也不加插件生命周期锁。
+// 这些 inline 工具实际只用到下面这五个入口。
+// 契约：只读。返回非 const 指针只是为了配合 header 里 HookAPI* 的签名。
+static HookAPI* InternalToolApi() {
+    static const HookAPI api = [] {
+        HookAPI t{};
+        t.apiVersion = CIV6_HOOK_API_VERSION;
+        t.structSize = static_cast<uint32_t>(sizeof(HookAPI));
+        t.GetImageInfo = &ImageAddress::GetInfo;
+        t.ResolveByRva = &ResolveByRvaCore;
+        t.ResolveByName = &ResolveByNameCore;
+        t.ResolveByPattern = &ResolveByPatternCore;
+        t.ResolveByVTable = &ResolveByVTableCore;
+        return t;
+    }();
+    return const_cast<HookAPI*>(&api);
+}
+
+// 当前进程 exe 的映像 id：与 common/HookAPI.h 的 HookCurrentExeImage 同语义
+// （GetImageInfo 是否有效），但直连 ImageAddress，不经过插件表/插件锁。
+HookImageId LoaderCore::CurrentExeImage() {
+    if (ImageAddress::IsLoaded(kHookImageExeDx11)) return kHookImageExeDx11;
+    if (ImageAddress::IsLoaded(kHookImageExeDx12)) return kHookImageExeDx12;
+    return kHookImageInvalid;
+}
+
+// Loader 内部解 exe 全局数据槽：算法与 common/HookAPI.h 的 ResolveDataByAob 完全相同，
+// 只是走无锁内部表。供 LoaderHooks / UiInject 使用。
+void* LoaderCore::ResolveDataByAobCore(HookImageId image, const char* aob, uint32_t index) {
+    return ResolveDataByAob(InternalToolApi(), image, aob, index);
+}
+
+// ---------------- 站点捕获槽退役（只拔插槽，绝不物理脱钩） ----------------
 // 两个失效场景：
-//  1) GameCore 重载：providerFunction 位于旧 GameCore 映像内，重载后地址失效，必须
-//     随重载清掉全部站点（ResetForReload 调用 CleanupAllCaptureSites），等下次
-//     Ready 回调由插件重新注册；
-//  2) 插件卸载：站点 out 槽指向插件内存，卸载后悬空（UnloadPluginByOwnerId 调用
+//  1) GameCore 重载：providerFunction 位于旧 GameCore 映像内，重载后地址失效，清空全部
+//     捕获订阅（ResetForReload 调用 CleanupAllCaptureSites），等下次 Ready 回调由插件
+//     重新注册；
+//  2) 插件卸载：捕获槽的 out 指向插件内存，卸载后悬空（UnloadPluginByOwnerId 调用
 //     CleanupCaptureSitesForOwner）。
-// 锁序约定：g_captureMutex 只保护站点表与 out 槽（CaptureDispatch 也持它写槽）；
-// 注册按 lifecycle→capture→mh 加锁，失败回滚沿用同一顺序。
-// 清理由 g_captureRetireMutex 串行化：capture 锁内移除订阅并收集快照，
-// 释放 capture 锁后才摘钩和等待在途调用，避免与 CaptureDispatch 互等。
-// 摘钩后等待所有已进入 stub 的调用离开，再释放 stub 和站点对象，避免执行中的
-// stub 访问已释放的 JIT 代码或 std::map 节点。CaptureEnter/Leave 由 stub 本身维护计数。
-struct CaptureSiteSnapshot {
-    uintptr_t target = 0;
-    CaptureSite* site = nullptr;
-    void* stub = nullptr;
-};
-
-static bool RemoveCaptureHook(uintptr_t target) {
-    void* addr = reinterpret_cast<void*>(target);
-    lock_guard<mutex> mhLock(Runtime::MinHookMutex());
-    const MH_STATUS disableStatus = MH_DisableHook(addr);
-    if (disableStatus != MH_OK && disableStatus != MH_ERROR_DISABLED &&
-            disableStatus != MH_ERROR_NOT_CREATED) {
-        Logger::Log("RemoveCaptureHook: disable failed target=%p status=%s",
-            addr, MH_StatusToString(disableStatus));
-        return false;
-    }
-    if (disableStatus == MH_ERROR_NOT_CREATED) return true;
-    const MH_STATUS removeStatus = MH_RemoveHook(addr);
-    if (removeStatus != MH_OK && removeStatus != MH_ERROR_NOT_CREATED) {
-        Logger::Log("RemoveCaptureHook: remove failed target=%p status=%s",
-            addr, MH_StatusToString(removeStatus));
-        return false;
-    }
-    return true;
-}
-
-static void WaitForCaptureSiteDrain(CaptureSite* site) {
-    if (!site) return;
-    std::unique_lock<std::mutex> lock(g_captureDrainMutex);
-    g_captureDrainCv.wait(lock, [site] {
-        return site->activeCalls.load(std::memory_order_acquire) == 0;
-    });
-}
-
-static void RetireCaptureSites(const vector<CaptureSiteSnapshot>& snapshot) {
-    for (const auto& item : snapshot) {
-        if (!RemoveCaptureHook(item.target)) {
-            // 不能确认 target 已经不会再跳入 stub 时，保留 site/stub，优先避免 UAF。
-            continue;
-        }
-        WaitForCaptureSiteDrain(item.site);
-        {
-            lock_guard<mutex> lock(g_captureMutex);
-            const auto it = g_captureSites.find(item.target);
-            if (it == g_captureSites.end() || &it->second != item.site ||
-                    it->second.stubCode != item.stub) {
-                continue;
-            }
-            if (item.stub) g_captureRuntime.release(item.stub);
-            g_captureSites.erase(it);
-        }
-    }
-}
+// 硬约束 M1：这里【只】清空 captureOuts / 翻转 hasCapture，绝不 MH_RemoveHook、绝不
+// g_captureRuntime.release、绝不 g_hookSites.erase。站点 / stub / MinHook trampoline
+// 全程存活，只在进程退出时随静态对象回收。本段只取 g_captureMutex（capture 侧），
+// 不取 MinHook 锁，因此不会与「MinHook -> capture」的注册路径成环。
+// CaptureDispatch 在同一把 g_captureMutex 下复查 hasCapture/retiring/空 outs：陈旧读到
+// hasCapture=1 时因 outs 已清空而被兜住。
 
 static void CleanupAllCaptureSites() {
-    lock_guard<mutex> retireLock(g_captureRetireMutex);
-    vector<CaptureSiteSnapshot> snapshot;
+    size_t sites = 0;
+    size_t outs = 0;
     {
+        // 站点表结构由 MinHook 站点锁保护；capture 字段是它内层的派发侧数据。
+        // 锁序恒为 MinHook -> capture，与注册路径一致，不成环。
+        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
         lock_guard<mutex> lock(g_captureMutex);
-        snapshot.reserve(g_captureSites.size());
-        for (auto& [target, site] : g_captureSites) {
+        for (auto& entry : g_hookSites) {
+            HookSite& site = entry.second;
+            if (!site.hasCapture && site.captureOuts.empty()) continue;
             site.retiring = true;
-            snapshot.push_back({ target, &site, site.stubCode });
+            site.hasCapture = false;
+            outs += site.captureOuts.size();
+            site.captureOuts.clear();
+            ++sites;
         }
     }
-    RetireCaptureSites(snapshot);
+    Logger::Log("CleanupAllCaptureSites: unplugged capture on %zu site(s) / %zu out slot(s) "
+                "(no physical unhook)", sites, outs);
 }
 
-// 插件卸载：只摘除该 owner 的 out 槽；还有其它 owner 订阅时保留站点和 hook。
+// 插件卸载：只移除该 owner 的 out 槽；还有其它 owner 订阅时保留站点与 hasCapture。
 static void CleanupCaptureSitesForOwner(const std::wstring& owner) {
     if (owner.empty()) return;
-    lock_guard<mutex> retireLock(g_captureRetireMutex);
-    vector<CaptureSiteSnapshot> snapshot;
+    size_t removed = 0;
+    size_t emptied = 0;
     {
+        // 同 CleanupAllCaptureSites：先站点锁再 capture 锁（MinHook -> capture）。
+        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
         lock_guard<mutex> lock(g_captureMutex);
-        for (auto& [target, site] : g_captureSites) {
-            const auto oldSize = site.outs.size();
-            site.outs.erase(std::remove_if(site.outs.begin(), site.outs.end(),
-                [&owner](const CaptureSite::Out& out) {
+        for (auto& entry : g_hookSites) {
+            HookSite& site = entry.second;
+            if (site.captureOuts.empty()) continue;
+            const size_t oldSize = site.captureOuts.size();
+            site.captureOuts.erase(std::remove_if(site.captureOuts.begin(), site.captureOuts.end(),
+                [&owner](const HookSite::CaptureOut& out) {
                     return out.ownerId == owner;
-                }), site.outs.end());
-            // 同时重试之前摘钩失败、已无订阅者的站点；不访问失败调用者的 out。
-            if (site.outs.empty() && (oldSize != 0 || site.retiring)) {
+                }), site.captureOuts.end());
+            removed += oldSize - site.captureOuts.size();
+            if (site.captureOuts.empty() && site.hasCapture) {
                 site.retiring = true;
-                snapshot.push_back({ target, &site, site.stubCode });
+                site.hasCapture = false;
+                ++emptied;
             }
         }
     }
-    if (snapshot.empty()) return;
-    RetireCaptureSites(snapshot);
-    Logger::Log("CleanupCaptureSitesForOwner: owner=%ls retired=%zu site(s)",
-        owner.c_str(), snapshot.size());
+    Logger::Log("CleanupCaptureSitesForOwner: owner=%ls removed=%zu out(s) emptied=%zu site(s) "
+                "(no physical unhook)", owner.c_str(), removed, emptied);
 }
 
 // ================= GameEvents 桥接（RegisterGameEvent / TriggerGameEvent） =================
@@ -1249,9 +1553,12 @@ static void WarnEngineUtilityUnavailable(const char* name) {
     }
 }
 
-// 内层主体：无 C++ 异常语义（SEH 段 + 资源兜底）。
+// 内层主体：Lua/插件段全部走 SEH 兜底；本函数【不声明 noexcept】。
+// 原因（已用 MSVC 实测确认）：noexcept 函数里逃出的 C++ 异常会直接 std::terminate，
+// 外层 GameEventInvokeLua 的 try/catch 永远看不到 —— 等于死代码。真实的 C++ 异常源是
+// 插件回调 throw 与标准库分配失败；交给外层 catch 隔离，比带崩整个进程好。
 static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
-                                   const void* payload) noexcept {
+                                   const void* payload) {
     if (!name || !*name) return false;
     void* L = GetActiveLuaStateImpl();
     if (!L) {
@@ -1277,36 +1584,59 @@ static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
     // EngineUtility 解析失败 / 取放锁调用异常 = GameCore 锁状态未知：此时不进入 Lua
     //（带锁重入 Lua 可能自死锁或破坏 Lua 状态），本次触发直接拒绝并限次告警。
     void* eu = GetEngineUtilityImpl();
-    bool had = false;
+    void** engineVtable = nullptr;   // 供 __finally 里取回锁使用（必须是 POD 局部）
+    bool had = false;                // HasGameCoreLock 返回 true
+    bool released = false;           // Release【正常返回】——只有这种情况才必须取回
+    bool lockFaulted = false;        // 取放锁调用本身异常：锁状态未知
     if (eu) {
         __try {
-            void** vt = *reinterpret_cast<void***>(eu);
-            had = reinterpret_cast<bool(__fastcall*)(void*)>(vt[6])(eu);  // HasGameCoreLock
-            if (had) reinterpret_cast<void(__fastcall*)(void*)>(vt[7])(eu); // Release
+            engineVtable = *reinterpret_cast<void***>(eu);
+            had = reinterpret_cast<bool(__fastcall*)(void*)>(engineVtable[6])(eu); // HasGameCoreLock
+            if (had) {
+                reinterpret_cast<void(__fastcall*)(void*)>(engineVtable[7])(eu);   // Release
+                released = true;
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Logger::Log("GameEvent: lock protocol fault code=0x%08X name=%s", GetExceptionCode(), name);
+            const DWORD code = GetExceptionCode();
+            if (had) {
+                // HasGameCoreLock 已返回 true，Release 是否真的生效无法判定。这里不盲目取回
+                // （在仍持锁时调 GetGameCoreLock 可能自死锁），但必须醒目留痕。
+                Logger::Log("GameEvent: Release faulted code=0x%08X name=%s "
+                            "- GameCore lock state UNKNOWN", code, name);
+            } else {
+                Logger::Log("GameEvent: lock protocol fault code=0x%08X name=%s", code, name);
+            }
+            lockFaulted = true;
             had = false;
             eu = nullptr;
         }
+    }
+    if (lockFaulted) {
+        // 锁状态未知：不进入 Lua（以"可能仍持锁"的状态重入 Lua 会自死锁或破坏 Lua 状态）。
+        return false;
     }
     if (!eu) {
         WarnEngineUtilityUnavailable(name);
         return false;
     }
 
-    const bool ok = GameEventInvokeLuaSeh(name, pushFn, payload, L, base);
-
-    // ★ 栈清理在 __try 之外——崩溃路径同样执行（资源兜底）
-    GameEventPopToBaseSeh(L, base);
-
-    if (had) {
-        __try {
-            void** vt = *reinterpret_cast<void***>(eu);
-            reinterpret_cast<void(__fastcall*)(void*)>(vt[8])(eu);       // GetGameCoreLock
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // 已释放锁但取回失败：后续 Lua/游戏逻辑将在无锁状态下运行，必须留痕。
-            Logger::Log("GameEvent: failed to re-acquire GameCore lock code=0x%08X name=%s",
-                GetExceptionCode(), name);
+    // ★ 一旦 released = true，无论以什么方式退出都必须把 GameCore 锁取回：
+    //   __finally 在【正常返回 / C++ 异常展开 / 硬件异常展开】三种路径上都会执行。
+    //   （/EHsc 下硬件异常不会执行 C++ 析构，但会执行 __finally —— 这正是这里要的语义。）
+    //   本函数局部变量全是 POD，因此可以合法使用 __try/__finally（MSVC C2712）。
+    bool ok = false;
+    __try {
+        ok = GameEventInvokeLuaSeh(name, pushFn, payload, L, base);
+        GameEventPopToBaseSeh(L, base);   // 栈清理：崩溃路径同样执行（资源兜底）
+    } __finally {
+        if (released) {
+            __try {
+                reinterpret_cast<void(__fastcall*)(void*)>(engineVtable[8])(eu); // GetGameCoreLock
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // 已释放锁但取回失败：后续 Lua/游戏逻辑将在无锁状态下运行，必须留痕。
+                Logger::Log("GameEvent: failed to re-acquire GameCore lock code=0x%08X name=%s",
+                    GetExceptionCode(), name);
+            }
         }
     }
     return ok;
@@ -1326,14 +1656,34 @@ static bool GameEventInvokeLua(const char* name, GameEventPushFn pushFn,
 // 手动触发一次：查找注册记录，仅 Lua 路径（内化）。未注册或 luaPushFn 为 null → false。
 // 查到记录后先取 owner 在途守卫（TryEnterPluginCallback）——插件卸载/隔离期间拒绝触发，
 // 避免在途调用踩到已回滚的注册（与远程对引擎桥路径的加固同款）。
+#pragma intrinsic(_ReturnAddress)
+
+// 调用方归属校验（尽力而为）：
+//   - 正常情况：插件经函数指针表调用本函数，_ReturnAddress() 落在该插件自己的模块里，
+//     可精确判定；事件名若属于另一个插件则拒绝（挡住"抢注名字 + 用自己的 payload 触发
+//     别人的 pushFn"这条跨插件路径）。
+//   - 判定不出（尾调用 / 经第三方 wrapper 转发 / 调用方不是被跟踪插件）：只放行，保持旧行为。
+//     与 Patch 用 _ReturnAddress() 的 caveat 相同 —— 所以这里必须 fail-open，不能 fail-closed。
+__declspec(noinline)
 bool TriggerGameEventImpl(const char* name, const void* payload) {
     if (!name || !*name) return false;
+    const void* callerAddress = _ReturnAddress();
+
+    // name 是插件内存：锁外抄写。原实现在锁内做 strcmp(ev.name, name)，一个悬垂的
+    // 事件名指针就会在持锁状态下访存失败 -> lock_guard 不析构 -> 锁永久泄漏。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(name, nameCopy) || nameCopy.empty()) {
+        Logger::Log("TriggerGameEvent rejected: name pointer unreadable");
+        return false;
+    }
+
     GameEventPushFn luaPushFn = nullptr;
     std::wstring owner;
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        PluginBoundary::LoaderLockScope pbLockScope;
         for (const auto& ev : g_gameEvents) {
-            if (ev.name[0] && strcmp(ev.name, name) == 0) {
+            if (ev.name[0] && nameCopy == ev.name) {
                 luaPushFn = ev.luaPushFn;
                 owner = ev.ownerId;
                 break;
@@ -1341,29 +1691,49 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
         }
     }
     if (!luaPushFn) {
-        Logger::Log("TriggerGameEvent: \"%s\" not registered (or non-Lua path)", name);
+        Logger::Log("TriggerGameEvent: \"%s\" not registered (or non-Lua path)",
+            nameCopy.c_str());
         return false;
+    }
+    // 事件名只归注册它的那个 owner；调用方（若能判定）必须是同一个 owner。
+    if (const auto callerOwner = ResolvePluginOwnerForAddress(callerAddress)) {
+        if (*callerOwner != owner) {
+            Logger::Log("TriggerGameEvent rejected: \"%s\" is owned by %ls, triggered by %ls",
+                nameCopy.c_str(), owner.c_str(), callerOwner->c_str());
+            return false;
+        }
     }
     auto callbackGuard = TryEnterPluginCallback(owner);
     if (!callbackGuard) {
         Logger::Log("TriggerGameEvent: rejected for inactive owner=%ls name=%s",
-            owner.c_str(), name);
+            owner.c_str(), nameCopy.c_str());
         return false;
     }
-    return GameEventInvokeLua(name, luaPushFn, payload);
+    return GameEventInvokeLua(nameCopy.c_str(), luaPushFn, payload);
 }
 
 // 注册 Lua 路径事件：owner/幂等/空槽登记（触发时走 GameEventInvokeLua 内化路径）。
 bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
     if (!name || !*name) return false;
-    const size_t nameLength = strlen(name);
+
+    // name 是插件内存：锁外做有界抄写。原实现用裸 strlen 读它，而且下面还有锁内
+    // 的 strcmp / memcpy —— 一个没有结尾符的指针会一路读到出错为止。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(name, nameCopy) || nameCopy.empty()) {
+        Logger::Log("RegisterGameEvent rejected: name pointer unreadable");
+        return false;
+    }
+    const size_t nameLength = nameCopy.size();
     if (nameLength >= kGameEventNameMax) {
         Logger::Log("RegisterGameEvent: name too long (%zu bytes, max %zu)",
             nameLength, kGameEventNameMax - 1);
         return false;
     }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
 
+    // owner 探针：优先插件提供的 pushFn 地址；为空时退回插件的 name 指针。
+    // 两者都只做模块归属查询（RequirePluginOwner 不解引用）。
     const void* ownerProbe = reinterpret_cast<const void*>(pushFn);
     if (!ownerProbe) ownerProbe = name;
     auto owner = RequirePluginOwner(ownerProbe, "RegisterGameEvent");
@@ -1371,8 +1741,15 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
         Logger::Log("RegisterGameEvent: no plugin owner");
         return false;
     }
+    // 键 = (owner, name)。同一插件重复注册幂等；**不同插件抢同名必须拒绝**。
+    // 原实现不比较 owner 就 return true：调用方以为注册成功，实际它的 pushFn 被丢弃，
+    // 之后它触发该名字时拿到的是【别人】的 pushFn，payload 布局不一致 -> 越界/类型混淆。
     for (const auto& ev : g_gameEvents) {
-        if (ev.name[0] && strcmp(ev.name, name) == 0) return true;   // 同名幂等
+        if (!ev.name[0] || nameCopy != ev.name) continue;
+        if (ev.ownerId == *owner) return true;               // 同 owner 重复注册：幂等
+        Logger::Log("RegisterGameEvent rejected: name \"%s\" already owned by another plugin "
+                    "(requested by %ls)", nameCopy.c_str(), owner->c_str());
+        return false;
     }
     RegisteredGameEvent* slot = nullptr;
     for (auto& ev : g_gameEvents) {
@@ -1384,9 +1761,9 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
     }
     slot->luaPushFn = pushFn;
     slot->ownerId = *owner;
-    memcpy(slot->name, name, nameLength);
+    memcpy(slot->name, nameCopy.c_str(), nameLength);
     slot->name[nameLength] = '\0';
-    Logger::Log("GameEvent: registered Lua-event \"%s\" pushFn=%p", name, pushFn);
+    Logger::Log("GameEvent: registered Lua-event \"%s\" pushFn=%p", nameCopy.c_str(), pushFn);
     return true;
 }
 
@@ -1428,10 +1805,45 @@ static bool MergeLuaMethods(vector<StoredLuaMethod>& candidate,
 HookApiPushMethodsResult PushLuaMethodsImpl(
         const char* name, const LuaMethodInfo* methods, uint32_t count) {
     if (!name || !*name || !methods || count == 0) return kHookApiPushMethodsFailed;
+    if (count > PluginBoundary::kMaxLuaMethodsPerCall) {
+        Logger::Log("PushLuaMethods rejected: count=%u over limit", count);
+        return kHookApiPushMethodsFailed;
+    }
+
+    // ===== 阶段 1：不持任何 Loader 锁，先把插件内存抄进 Loader 自有存储 =====
+    // name、methods 数组、每个 LuaMethodInfo 本身、以及它指向的两个字符串，全都是
+    // 插件内存。任何一处是坏地址都在这里失败 —— 此刻没有锁被持有，失败是干净的。
+    std::string targetName;
+    if (!PluginBoundary::CopyCString(name, targetName) || targetName.empty()) {
+        Logger::Log("PushLuaMethods rejected: name pointer unreadable");
+        return kHookApiPushMethodsFailed;
+    }
+    std::vector<StoredLuaMethod> copies;
+    copies.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        LuaMethodInfo raw{};                       // POD：结构体本身也是插件内存
+        if (!PluginBoundary::CopyPod(&methods[i], raw)) {
+            Logger::Log("PushLuaMethods rejected: LuaMethodInfo[%u] unreadable", i);
+            return kHookApiPushMethodsFailed;
+        }
+        StoredLuaMethod method;
+        method.luaMethodFunc = raw.luaMethodFunc;
+        if (!PluginBoundary::CopyCString(raw.internalName, method.internalName) ||
+            !PluginBoundary::CopyCString(raw.exposedName, method.exposedName)) {
+            Logger::Log("PushLuaMethods rejected: method names[%u] unreadable", i);
+            return kHookApiPushMethodsFailed;
+        }
+        copies.push_back(std::move(method));
+    }
+
+    // ===== 阶段 2：持锁，此后只碰 copies / targetName（Loader 自有） =====
     // owner 校验、候选合并和安装提交共用生命周期锁，停用不能插入中间。
+    // owner 探针用插件提供的函数地址（值拷贝；RequirePluginOwner 只做模块归属查询，
+    // 不解引用该地址）。
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
     auto owner = RequirePluginOwner(
-        reinterpret_cast<const void*>(methods[0].luaMethodFunc), "PushLuaMethods");
+        reinterpret_cast<const void*>(copies[0].luaMethodFunc), "PushLuaMethods");
     if (!owner) return kHookApiPushMethodsFailed;
     const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
         [&owner](const PluginEntry& entry) {
@@ -1440,7 +1852,10 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         });
     if (plugin == g_plugins.end()) return kHookApiPushMethodsFailed;
 
-    const std::string targetName(name);
+    // owner 回填：StoredLuaMethod::owner 为空会被 MergeLuaMethod 首行直接判非法，
+    // 必须在合并之前补齐（否则整批 PushLuaMethods 都会失败）。
+    for (auto& method : copies) method.owner = *owner;
+
     PushTargetConfig config;
     const auto ownerConfigs = g_pluginPushTargetConfigs.find(*owner);
     if (ownerConfigs != g_pluginPushTargetConfigs.end()) {
@@ -1452,7 +1867,7 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         if (builtIn != g_defaultPushTargetConfigs.end()) config = builtIn->second;
     }
     if (config.symbolName.empty()) {
-        Logger::Log("PushLuaMethods: unknown target %s", name);
+        Logger::Log("PushLuaMethods: unknown target %s", targetName.c_str());
         return kHookApiPushMethodsFailed;
     }
 
@@ -1472,12 +1887,13 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         }
     }
     for (uint32_t i = 0; i < count; ++i) {
+        // 每个方法都必须属于同一个插件（owner 一致）；名字为空由 MergeLuaMethod 判非法。
         auto methodOwner = RequirePluginOwner(
-            reinterpret_cast<const void*>(methods[i].luaMethodFunc), "PushLuaMethods");
-        if (!methodOwner || *methodOwner != *owner || !methods[i].internalName ||
-                !methods[i].exposedName || !MergeLuaMethod(candidate.methods, StoredLuaMethod{
-                    methods[i].luaMethodFunc, methods[i].internalName, methods[i].exposedName, *owner })) {
-            Logger::Log("PushLuaMethods rejected: invalid or conflicting method for %s", name);
+            reinterpret_cast<const void*>(copies[i].luaMethodFunc), "PushLuaMethods");
+        if (!methodOwner || *methodOwner != *owner ||
+                !MergeLuaMethod(candidate.methods, copies[i])) {
+            Logger::Log("PushLuaMethods rejected: invalid or conflicting method for %s",
+                targetName.c_str());
             return kHookApiPushMethodsFailed;
         }
     }
@@ -1490,7 +1906,7 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
                         return existing.exposedName == method.exposedName;
                     })) {
                 Logger::Log("PushLuaMethods rejected: field %s of %s belongs to another owner",
-                    method.exposedName.c_str(), name);
+                    method.exposedName.c_str(), targetName.c_str());
                 return kHookApiPushMethodsFailed;
             }
         }
@@ -1644,6 +2060,9 @@ static void EnsureScriptHooksInstalled() {
                        reinterpret_cast<void**>(&g_origRegisterScriptData), &g_scriptHookTarget)) {
             g_scriptHookInstalled = true;
             Logger::Log("EnsureScriptHooksInstalled: hooked RegisterScriptData at %p", target);
+        } else {
+            Logger::Log("EnsureScriptHooksInstalled: RegisterScriptData hook install failed "
+                        "(target held by a hook site?)");
         }
     }
     if (!g_scriptUIHookInstalled && !g_scriptGlobalsUI.empty()) {
@@ -1654,6 +2073,9 @@ static void EnsureScriptHooksInstalled() {
                        reinterpret_cast<void**>(&g_origRegisterScriptDataForUI), &g_scriptUIHookTarget)) {
             g_scriptUIHookInstalled = true;
             Logger::Log("EnsureScriptHooksInstalled: hooked RegisterScriptDataForUI at %p", target);
+        } else {
+            Logger::Log("EnsureScriptHooksInstalled: RegisterScriptDataForUI hook install failed "
+                        "(target held by a hook site?)");
         }
     }
 }
@@ -1894,24 +2316,29 @@ static void FireGameCoreCallbacks(std::vector<GameCoreCallbackPtr>& reg,
 
 void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
     if (!fn) return;
-    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
-                                    "RegisterScriptGlobals");
-    if (!owner) return;
+    // owner 校验与登记必须在同一把生命周期锁内完成。原实现先 RequirePluginOwner（内部取锁
+    // 后释放）、再单独取锁 push_back：这中间若插件被停用并跑完 RemovePluginOwnedRegistrations，
+    // 本次登记就永远清不掉（停用期间被守卫挡住，重新启用后又随新 generation 复活 ->
+    // 每次"禁用->启用"都多注册一份）。RequirePluginOwner 内部取的是同一把递归锁，重入安全。
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
+                                        "RegisterScriptGlobals");
+        if (!owner) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobals.push_back(ScriptGlobalsEntry{ *owner, fn });
     }
-    EnsureScriptHooksInstalled();  // 检查+安装整体在锁内（含并发首装与重载后重装）
+    EnsureScriptHooksInstalled();  // 内部自带生命周期锁（含并发首装与重载后重装）
 }
 
 void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
     if (!fn) return;
-    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
-                                    "RegisterScriptGlobalsForUI");
-    if (!owner) return;
+    // 同 RegisterScriptGlobalsImpl：校验与登记同锁，避免"校验后、登记前"被卸载插入。
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+        auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
+                                        "RegisterScriptGlobalsForUI");
+        if (!owner) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobalsUI.push_back(ScriptGlobalsEntry{ *owner, fn });
     }
@@ -1939,6 +2366,25 @@ struct WithManagerHookSlot {
 NoManagerHookSlot g_noManagerSlots[kMaxPushHooks];
 WithManagerHookSlot g_withManagerSlots[kMaxPushHooks];
 
+// 注入一个插件登记的 Lua 方法：owner 已进入停用/隔离流程时跳过。
+//
+// 为什么必须加这道守卫：detour 先在 g_pushStateMutex 内快照 slot.methods，再在锁外逐个
+// 注入。若快照之后该插件开始停用，RemovePluginOwnedRegistrations 会清空 slot，而本 detour
+// 仍会把已快照的函数指针重新塞回 Lua 表（闭包一旦注册进 Lua 表就没有撤销路径）。
+// 加上守卫后：停用流程里的 WaitForPluginCallbacks 会等待在途注入结束，之后才清空登记；
+// 之后的调用因 owner 非 Loading/Active 被拒绝，不会再有新注入。
+// 边界：这只防"卸载后又被重新注入"。已进入 Lua 表的闭包仍然存在（backlog，未解决）。
+static bool PushStoredMethodIfActive(hks::lua_State* L, const StoredLuaMethod& method,
+                                     int stackOffset) {
+    if (!method.owner.empty()) {
+        auto guard = TryEnterPluginCallback(method.owner);
+        if (!guard) return false;
+    }
+    PushLuaMethod(L, reinterpret_cast<hks::luaFunc>(method.luaMethodFunc),
+        method.internalName.c_str(), stackOffset, method.exposedName.c_str());
+    return true;
+}
+
 template<int I>
 void __fastcall DetourPushNoManager(hks::lua_State* L, int stackOffset) {
     SharedDetourActivity activity;
@@ -1952,8 +2398,10 @@ void __fastcall DetourPushNoManager(hks::lua_State* L, int stackOffset) {
         base = g_noManagerSlots[I].base;
     }
     for (auto& method : methods) {
-        PushLuaMethod(L, reinterpret_cast<hks::luaFunc>(method.luaMethodFunc),
-            method.internalName.c_str(), stackOffset, method.exposedName.c_str());
+        if (!PushStoredMethodIfActive(L, method, stackOffset)) {
+            Logger::Log("DetourPushNoManager<%d>: skipped %s (owner=%ls inactive)",
+                I, method.exposedName.c_str(), method.owner.c_str());
+        }
     }
     if (base) {
         base(L, stackOffset);
@@ -1971,8 +2419,10 @@ void __fastcall DetourPushWithManager(void* manager, hks::lua_State* L, int stac
         base = g_withManagerSlots[I].base;
     }
     for (auto& method : methods) {
-        PushLuaMethod(L, reinterpret_cast<hks::luaFunc>(method.luaMethodFunc),
-            method.internalName.c_str(), stackOffset, method.exposedName.c_str());
+        if (!PushStoredMethodIfActive(L, method, stackOffset)) {
+            Logger::Log("DetourPushWithManager<%d>: skipped %s (owner=%ls inactive)",
+                I, method.exposedName.c_str(), method.owner.c_str());
+        }
     }
     if (base) {
         base(manager, L, stackOffset);
@@ -2617,11 +3067,30 @@ uint32_t MakeHashImpl(const char* str) {
 
 int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pushMethodsSymbol) {
     if (!name || !*name) return 0;
-    if (sigType != kHookApiPushNoManager && sigType != kHookApiPushWithManager) {
-        Logger::Log("RegisterPushMethodsTarget: bad sigType %d for %s", sigType, name);
+
+    // name / pushMethodsSymbol 都是插件内存：锁外抄写（含早期日志读到的 name）。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(name, nameCopy) || nameCopy.empty()) {
+        Logger::Log("RegisterPushMethodsTarget rejected: name pointer unreadable");
         return 0;
     }
+    if (sigType != kHookApiPushNoManager && sigType != kHookApiPushWithManager) {
+        Logger::Log("RegisterPushMethodsTarget: bad sigType %d for %s",
+            sigType, nameCopy.c_str());
+        return 0;
+    }
+    std::string symbolCopy;
+    if (pushMethodsSymbol && *pushMethodsSymbol) {
+        if (!PluginBoundary::CopyCString(pushMethodsSymbol, symbolCopy)) {
+            Logger::Log("RegisterPushMethodsTarget rejected: pushMethodsSymbol unreadable");
+            return 0;
+        }
+    }
+
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    // owner 探针仍用插件自己的 name 指针：RequirePluginOwner 只做模块归属查询，
+    // 不解引用；换成 Loader 副本会被判成 Loader 自身而全部拒绝。
     auto owner = RequirePluginOwner(reinterpret_cast<const void*>(name),
                                     "RegisterPushMethodsTarget");
     if (!owner) return 0;
@@ -2630,34 +3099,32 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
         sigType == kHookApiPushWithManager
         ? PushMethodSigType::WithManager
         : PushMethodSigType::NoManager,
-        pushMethodsSymbol && *pushMethodsSymbol
-        ? pushMethodsSymbol
-        : (std::string(name) + "::PushMethods")
+        !symbolCopy.empty() ? symbolCopy : (nameCopy + "::PushMethods")
     };
 
     auto& ownerConfigs = g_pluginPushTargetConfigs[*owner];
-    const auto existing = ownerConfigs.find(name);
+    const auto existing = ownerConfigs.find(nameCopy);
     if (existing != ownerConfigs.end()) {
         if (existing->second.signature != config.signature ||
                 existing->second.symbolName != config.symbolName) {
             Logger::Log("RegisterPushMethodsTarget: conflicting redefinition owner=%ls target=%s",
-                owner->c_str(), name);
+                owner->c_str(), nameCopy.c_str());
             return 0;
         }
         return 1;
     }
     const bool hasRegistration = std::any_of(g_pushRegistrations.begin(),
-        g_pushRegistrations.end(), [&owner, name](const PushRegistration& registration) {
-            return registration.owner == *owner && registration.targetName == name;
+        g_pushRegistrations.end(), [&owner, &nameCopy](const PushRegistration& registration) {
+            return registration.owner == *owner && registration.targetName == nameCopy;
         });
     if (hasRegistration) {
         Logger::Log("RegisterPushMethodsTarget: cannot change config after registration owner=%ls target=%s",
-            owner->c_str(), name);
+            owner->c_str(), nameCopy.c_str());
         return 0;
     }
-    ownerConfigs.emplace(name, config);
+    ownerConfigs.emplace(nameCopy, config);
     Logger::Log("RegisterPushMethodsTarget: owner=%ls target=%s sig=%d sym=%s",
-        owner->c_str(), name, sigType, config.symbolName.c_str());
+        owner->c_str(), nameCopy.c_str(), sigType, config.symbolName.c_str());
     return 1;
 }
 
@@ -2666,19 +3133,43 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
 #pragma intrinsic(_ReturnAddress)
 
 __declspec(noinline) static bool HookPatch(void* target, const void* bytes, size_t len) {
+    if (!target || !bytes || len == 0) return false;
+    if (len > PluginBoundary::kMaxPluginRawBytes) {
+        Logger::Log("Patch rejected: len=%zu over limit (%zu)",
+            len, PluginBoundary::kMaxPluginRawBytes);
+        return false;
+    }
+    // bytes 是插件内存，而 PatchRegistry::Apply 会在自己的临界区内 memcpy 读它。
+    // 锁外先抄一份：坏指针在这里失败，此时生命周期锁与补丁临界区都没被持有。
+    std::vector<uint8_t> bytesCopy(len);
+    if (!PluginBoundary::CopyRawBytes(bytes, bytesCopy.data(), len,
+            PluginBoundary::kMaxPluginRawBytes)) {
+        Logger::Log("Patch rejected: bytes pointer unreadable %p", bytes);
+        return false;
+    }
+
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
     if (TargetInTearingDownGameCore(target)) return false;
+    if (OverlapsHookPrologue(target, len)) {
+        Logger::Log("Patch rejected: %p overlaps a hooked prologue window (%zu bytes); "
+                    "InstallHook/Unpatch it first", target, kHookPrologueWindow);
+        return false;
+    }
     auto owner = RequirePluginOwner(_ReturnAddress(), "Patch");
-    return owner && PatchRegistry::Apply(target, bytes, len, owner->c_str());
+    return owner && PatchRegistry::Apply(target, bytesCopy.data(), len, owner->c_str());
 }
 
 __declspec(noinline) static bool HookUnpatch(void* target) {
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
     auto owner = RequirePluginOwner(_ReturnAddress(), "Unpatch");
     return owner && PatchRegistry::RevertOwned(target, owner->c_str());
 }
 
-static HookAPI g_hookApi = {
+// 只读契约：Loader 初始化后从不写它（全是取地址/读取），插件也只该读。
+// const 让它落到 .rdata（PAGE_READONLY）——插件写它会当场 AV，被 CallOnLoadSafe 接住。
+static const HookAPI g_hookApi = {
     CIV6_HOOK_API_VERSION,
     static_cast<uint32_t>(sizeof(HookAPI)),
 
@@ -2776,9 +3267,31 @@ static HookAPI g_hookApi = {
     &LuaPushNilImpl,
 };
 
-// loader 内部复用 common/HookAPI.h 的 HookInfo 取址工具时的入口（LoaderHooks/UiInject 用）。
+// loader 内部复用 common/HookAPI.h 的 HookInfo 取址工具时的入口（LoaderHooks/UiInject 用），
+// 也是把这张表交给插件（OnLoad）的唯一出口。
+// 契约：只读。const_cast 只是为了配合既有 HookAPI* 签名（common/HookAPI.h 里的 inline
+// 工具函数都吃 HookAPI*）；任何调用方都不得写入。
 HookAPI* LoaderCore::RuntimeHookApi() {
-    return &g_hookApi;
+    return const_cast<HookAPI*>(&g_hookApi);
+}
+
+// 启动自检：确认这张表真的落在只读页。MSVC 一般会把常量初始化的 const 对象放进 .rdata，
+// 但那是实现细节而非语言保证 —— 一旦落到可写段，"插件改表"就不会被拦，必须能在日志里看见。
+void LoaderCore::VerifyHookApiTableProtection() {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(&g_hookApi, &mbi, sizeof(mbi)) == 0) {
+        Logger::Log("[WARN] HookAPI 表: VirtualQuery 失败 err=%lu", GetLastError());
+        return;
+    }
+    const DWORD protect = mbi.Protect;
+    const bool writable = (protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                      PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+    if (writable) {
+        Logger::Log("[WARN] HookAPI 表落在可写页 (Protect=0x%lX base=%p)：插件写入不会被拦截，"
+                    "请检查 const 与段归属", protect, static_cast<const void*>(&g_hookApi));
+    } else {
+        Logger::Log("HookAPI 表只读保护已验证 (Protect=0x%lX)", protect);
+    }
 }
 
 // exe 版本锚（SizeOfImage + FileHeader.TimeDateStamp）：无符号库时判断"能否直接信任原始 RVA"。
@@ -2810,12 +3323,13 @@ static bool ExeMatchesAnchor(HookImageId image) {
 }
 
 void* LoaderCore::ResolveExeTarget(const HookInfoExe& info, size_t span) {
-    const HookImageId image = HookCurrentExeImage(&g_hookApi);
+    // 走内部无锁表：游戏线程在 LoadDLL detour 里解析自家 hook 目标，不拿插件生命周期锁。
+    const HookImageId image = CurrentExeImage();
     if (image == kHookImageInvalid) return nullptr;
     const HookInfo& entry = (image == kHookImageExeDx12) ? info.dx12 : info.dx11;
     const bool haveContext = PdataMatch::HasContext(image);
     if (haveContext || ExeMatchesAnchor(image)) {
-        if (void* p = ResolveByHookInfo(&g_hookApi, image, entry, span)) return p;
+        if (void* p = ResolveByHookInfo(InternalToolApi(), image, entry, span)) return p;
         Logger::Log("ResolveExeTarget: image=%u kind=%d unresolved (rva=0x%llX aob=%s)",
             static_cast<unsigned>(image), static_cast<int>(entry.kind),
             static_cast<unsigned long long>(entry.kind == kHookInfoRva ? entry.u.rva : 0),
@@ -2825,7 +3339,7 @@ void* LoaderCore::ResolveExeTarget(const HookInfoExe& info, size_t span) {
     Logger::Log("ResolveExeTarget: [WARN] image=%u no symbol DB and PE identity != anchor; "
                 "RVA path skipped, AOB fallback only", static_cast<unsigned>(image));
     if (entry.aob && *entry.aob) {
-        return g_hookApi.ResolveByPattern(image, entry.aob, kSectionText);
+        return InternalToolApi()->ResolveByPattern(image, entry.aob, kSectionText);
     }
     return nullptr;
 }
@@ -2877,7 +3391,7 @@ bool AttachGameCore(HMODULE gameCore) {
 
 static bool CallOnLoadSafe(OnLoadFunc onLoad, const char* name) {
     __try {
-        onLoad(&g_hookApi);
+        onLoad(LoaderCore::RuntimeHookApi());
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("OnLoad crashed in plugin %s code=0x%08X", name, GetExceptionCode());
@@ -3033,11 +3547,17 @@ bool InitializeLoader(HMODULE hModule) {
 
 // ================= LoaderCore 实现（S3c：插件生命周期 v2） =================
 
-// 撤销某插件通过 HookAPI.InstallHook 注册的全部 MinHook 钩子（Disable + Remove）。
-// 在卸载插件的 FreeLibrary 之前调用；owner 为插件 stem（空串代表 Loader 自身，不在此撤销）。
+// 退役某插件通过 HookAPI.InstallHook 注册的 detour 槽（只拔插槽，绝不物理脱钩）：
+//  - 统一站点：清空该 owner 的 activeDetour / detourOwner，nextTarget 回落到
+//    minhookTrampoline（stub 与 MinHook 钩保持存活，纯透传）。不这样做的话，插件
+//    卸载后再 OnLoad 会因站点 activeDetour 非空而无法重新挂钩。
+//  - g_hookRecords：保留原有 SharedScript / PushMethods 语义（这些共享钩 owner 恒为空，
+//    正常不会命中插件 owner）。
+// 在卸载插件的 FreeLibrary 之前调用；owner 为插件 stem（空串代表 Loader 自身，不在此退役）。
 static void RemovePluginHooks(const wchar_t* owner) {
     if (!owner || !*owner) return;
     lock_guard<mutex> lock(Runtime::MinHookMutex());
+    RetireHookSiteDetoursForOwnerLocked(std::wstring(owner));
     for (auto it = g_hookRecords.begin(); it != g_hookRecords.end(); ) {
         if (it->second.owner == owner) {
             void* target = it->first;
@@ -3453,11 +3973,14 @@ static void ResetSharedGameCoreHooks(
     Logger::Log("ResetSharedGameCoreHooks: script/UI hooks + push slots reset");
 }
 
-// 按代际撤销所有 GameCore 域的插件钩（调用方持生命周期锁）。
-// Global 插件在对局中经 Ready 回调装的 GameCore 域钩无人摘：同基址重载可靠
-// recoverStalePlugin 自愈（前提插件重装），异基址重载则旧记录指向未映射内存
-// 永远无法回收——统一在旧映像卸载前按 generation 清掉。exe 域钩
-// （generation == 0）不受影响。
+// 按代际退役所有 GameCore 域的插件 detour（调用方持生命周期锁）。
+// Global 插件在对局中经 Ready 回调装的 GameCore 域钩无人摘；异基址重载后旧站点
+// 目标指向未映射内存。统一在旧映像卸载前处理：
+//  - 统一站点：只拔 detour 槽（activeDetour=nullptr，nextTarget=minhookTrampoline），
+//    绝不物理脱钩——stub / trampoline 保持存活，重载后按代际重建（M4）；
+//  - g_hookRecords：保留原有 Plugin 域物理 Disable 语义（统一站点接管插件 detour 后
+//    该类记录已不再产生，循环作为兼容兜底）。
+// exe 域（generation == 0）不受影响。
 static void DisableGameCoreGenerationHooks(uint64_t generation) {
     lock_guard<mutex> hookLock(Runtime::MinHookMutex());
     size_t disabled = 0;
@@ -3474,7 +3997,9 @@ static void DisableGameCoreGenerationHooks(uint64_t generation) {
             }
         }
     }
-    Logger::Log("DisableGameCoreGenerationHooks: disabled=%zu", disabled);
+    const size_t retiredSites = RetireHookSiteDetoursForGenerationLocked(generation);
+    Logger::Log("DisableGameCoreGenerationHooks: disabled=%zu siteDetoursRetired=%zu",
+        disabled, retiredSites);
 }
 
 static void RemoveGameCoreGenerationHooks(uint64_t generation) {
@@ -3500,8 +4025,9 @@ static void RemoveGameCoreGenerationHooks(uint64_t generation) {
             ++it;
         }
     }
-    Logger::Log("RemoveGameCoreGenerationHooks: removed=%zu remainingRecords=%zu",
-        removed, g_hookRecords.size());
+    const size_t retiredSites = RetireHookSiteDetoursForGenerationLocked(generation);
+    Logger::Log("RemoveGameCoreGenerationHooks: removed=%zu siteDetoursRetired=%zu remainingRecords=%zu",
+        removed, retiredSites, g_hookRecords.size());
 }
 
 void LoaderCore::ResetForReload() {
@@ -3534,9 +4060,9 @@ void LoaderCore::ResetForReload() {
     // 钩上维护的数据）；旧映像此刻仍存活。
     FireGameCoreCallbacks(g_gameCoreTeardownCallbacks, "GameCoreTeardown");
 
-    // capture 站点的 providerFunction 位于旧 GameCore 映像内，重载后地址失效，
-    // 必须随重载清掉全部站点。此刻旧映像仍存活（尚未 detach），MH_RemoveHook
-    // 能干净摘除；等下次 Ready 回调由插件重新注册。
+    // capture 站点的 providerFunction 位于旧 GameCore 映像内，重载后地址失效，必须随
+    // 重载清空全部捕获订阅。站点/stub/trampoline 不释放（M1），只拔插槽；等下次 Ready
+    // 回调由插件重新注册（注册时按代际重建，见 GetOrCreateHookSiteLocked）。
     CleanupAllCaptureSites();
 
     // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。

@@ -80,11 +80,78 @@ bool RangesOverlap(uintptr_t aBegin, uintptr_t aEnd,
     return aBegin < bEnd && bBegin < aEnd;
 }
 
+// 单次补丁字节数上限。Apply 会按 len 分配原始字节存档并跨内存区域改保护属性，
+// 没有上限时一个坏参数就能造成大分配/长时间改保护。口径与 HookAPI 层的
+// PluginBoundary::kMaxPluginRawBytes 一致（1 MiB）。
+constexpr size_t kMaxPatchBytes = 1u << 20;
+
+// 逐区域保存的页保护属性。
+struct SavedProtection {
+    void* base;
+    size_t size;
+    DWORD protect;
+};
+
+// 由原始保护属性推导"带写权限"的等价属性。
+// 不再一律用 PAGE_EXECUTE_READWRITE：那会把纯数据页临时变成可执行，破坏 W^X。
+DWORD WritableVariant(DWORD protect) {
+    switch (protect & 0xFFu) {
+        case PAGE_EXECUTE:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return PAGE_EXECUTE_READWRITE;
+        case PAGE_READONLY:
+        case PAGE_READWRITE:
+        case PAGE_WRITECOPY:
+            return PAGE_READWRITE;
+        default:
+            return PAGE_READWRITE;
+    }
+}
+
+// 按【内存区域】逐段改保护，并记录每段各自的旧属性。
+// 为什么不能一次 VirtualProtect(target, len, ...)：跨页/跨区域时 oldProtect 只会返回
+// 第一页的旧属性；用它恢复整个区间会把后续区域的保护属性写错（例如把 .rdata 的
+// PAGE_READONLY 恢复成 .text 的 PAGE_EXECUTE_READ）。
+bool MakeWritableRecording(void* target, size_t len, std::vector<SavedProtection>& saved) {
+    auto* p = static_cast<uint8_t*>(target);
+    size_t remain = len;
+    while (remain > 0) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return false;
+        const auto* regionBase = static_cast<const uint8_t*>(mbi.BaseAddress);
+        const size_t regionLeft = static_cast<size_t>(mbi.RegionSize)
+            - static_cast<size_t>(p - regionBase);
+        if (regionLeft == 0) return false;   // 防御：RegionSize 解析异常，避免死循环
+        const size_t chunk = (std::min)(regionLeft, remain);
+        DWORD old = 0;
+        if (!VirtualProtect(p, chunk, WritableVariant(mbi.Protect), &old)) return false;
+        saved.push_back(SavedProtection{ p, chunk, old });
+        p += chunk;
+        remain -= chunk;
+    }
+    return true;
+}
+
+// 恢复 MakeWritableRecording 记录的全部区域（尽力恢复，失败忽略）。
+void RestoreProtections(const std::vector<SavedProtection>& saved) {
+    for (const auto& s : saved) {
+        DWORD ignored = 0;
+        VirtualProtect(s.base, s.size, s.protect, &ignored);
+    }
+}
+
 }  // namespace
 
 bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     if (!target || !bytes || len == 0) {
         Logger::Log("PatchRegistry::Apply: invalid args target=%p len=%zu", target, len);
+        return false;
+    }
+    if (len > kMaxPatchBytes) {
+        Logger::Log("PatchRegistry::Apply: len=%zu over limit (%zu) target=%p",
+            len, kMaxPatchBytes, target);
         return false;
     }
     const uintptr_t targetBegin = reinterpret_cast<uintptr_t>(target);
@@ -140,15 +207,17 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     std::vector<uint8_t> original(len);
     const auto* src = reinterpret_cast<const uint8_t*>(bytes);
 
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    std::vector<SavedProtection> saved;
+    if (!MakeWritableRecording(target, len, saved)) {
+        RestoreProtections(saved);         // 部分成功也要恢复，别留下可写/可执行的页
         LeaveCriticalSection(&Cs());
-        Logger::Log("PatchRegistry::Apply: VirtualProtect failed target=%p err=%lu", target, GetLastError());
+        Logger::Log("PatchRegistry::Apply: protect failed target=%p len=%zu err=%lu",
+            target, len, GetLastError());
         return false;
     }
     memcpy(original.data(), target, len);  // 存档原始字节（写入前读取）
     memcpy(target, src, len);              // 写入新字节
-    VirtualProtect(target, len, oldProtect, &oldProtect);
+    RestoreProtections(saved);             // 逐区域恢复各自的原保护属性
     FlushInstructionCache(GetCurrentProcess(), target, len);
 
     if (isFirst) {
@@ -159,6 +228,26 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     }
     LeaveCriticalSection(&Cs());
     return true;
+}
+
+bool OverlapsRegistered(const void* target, size_t len) {
+    if (!target || len == 0) return false;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
+    const uintptr_t end = begin + len;
+    if (end < begin) return true;   // 地址回绕：按冲突处理
+
+    EnterCriticalSection(&Cs());
+    for (const auto& kv : Registry()) {
+        const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(kv.first);
+        uintptr_t otherEnd = 0;
+        if (RangeEnd(otherBegin, kv.second.original.size(), otherEnd) &&
+                RangesOverlap(begin, end, otherBegin, otherEnd)) {
+            LeaveCriticalSection(&Cs());
+            return true;
+        }
+    }
+    LeaveCriticalSection(&Cs());
+    return false;
 }
 
 bool Revert(void* target) {
@@ -175,14 +264,15 @@ bool Revert(void* target) {
 
     const size_t origSize = it->second.original.size();
     const std::wstring owner = it->second.owner;
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(target, origSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    std::vector<SavedProtection> saved;
+    if (!MakeWritableRecording(target, origSize, saved)) {
+        RestoreProtections(saved);
         LeaveCriticalSection(&Cs());
-        Logger::Log("PatchRegistry::Revert: VirtualProtect failed target=%p err=%lu", target, GetLastError());
+        Logger::Log("PatchRegistry::Revert: protect failed target=%p err=%lu", target, GetLastError());
         return false;
     }
     memcpy(target, it->second.original.data(), origSize);
-    VirtualProtect(target, origSize, oldProtect, &oldProtect);
+    RestoreProtections(saved);
     FlushInstructionCache(GetCurrentProcess(), target, origSize);
 
     Registry().erase(it);
@@ -203,15 +293,16 @@ bool RevertOwned(void* target, const wchar_t* owner) {
     }
 
     const size_t origSize = it->second.original.size();
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(target, origSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    std::vector<SavedProtection> saved;
+    if (!MakeWritableRecording(target, origSize, saved)) {
+        RestoreProtections(saved);
         LeaveCriticalSection(&Cs());
-        Logger::Log("PatchRegistry::RevertOwned: VirtualProtect failed target=%p err=%lu",
+        Logger::Log("PatchRegistry::RevertOwned: protect failed target=%p err=%lu",
                     target, GetLastError());
         return false;
     }
     memcpy(target, it->second.original.data(), origSize);
-    VirtualProtect(target, origSize, oldProtect, &oldProtect);
+    RestoreProtections(saved);
     FlushInstructionCache(GetCurrentProcess(), target, origSize);
     Registry().erase(it);
     LeaveCriticalSection(&Cs());
@@ -240,13 +331,14 @@ size_t RevertAllFor(const wchar_t* owner) {
             continue;
         }
         const size_t origSize = it->second.original.size();
-        DWORD oldProtect = 0;
-        if (!VirtualProtect(t, origSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            Logger::Log("PatchRegistry::RevertAllFor: VirtualProtect failed target=%p err=%lu", t, GetLastError());
+        std::vector<SavedProtection> saved;
+        if (!MakeWritableRecording(t, origSize, saved)) {
+            RestoreProtections(saved);
+            Logger::Log("PatchRegistry::RevertAllFor: protect failed target=%p err=%lu", t, GetLastError());
             continue;
         }
         memcpy(t, it->second.original.data(), origSize);
-        VirtualProtect(t, origSize, oldProtect, &oldProtect);
+        RestoreProtections(saved);
         FlushInstructionCache(GetCurrentProcess(), t, origSize);
         Registry().erase(it);
         ++reverted;
@@ -284,15 +376,16 @@ size_t RevertAllInRange(uintptr_t base, uintptr_t size) {
             continue;
         }
         const size_t origSize = it->second.original.size();
-        DWORD oldProtect = 0;
-        if (VirtualProtect(t, origSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        std::vector<SavedProtection> saved;
+        if (MakeWritableRecording(t, origSize, saved)) {
             memcpy(t, it->second.original.data(), origSize);
-            VirtualProtect(t, origSize, oldProtect, &oldProtect);
+            RestoreProtections(saved);
             FlushInstructionCache(GetCurrentProcess(), t, origSize);
             ++reverted;
         } else {
+            RestoreProtections(saved);
             // 回滚失败（如重载兜底路径映像已卸载）：字节随映射消失，同样丢弃。
-            Logger::Log("PatchRegistry::RevertAllInRange: VirtualProtect failed target=%p err=%lu (dropping record)",
+            Logger::Log("PatchRegistry::RevertAllInRange: protect failed target=%p err=%lu (dropping record)",
                 t, GetLastError());
         }
         Registry().erase(it);

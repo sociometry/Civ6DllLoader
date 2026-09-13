@@ -43,7 +43,7 @@ namespace {
 
 // 当前进程 exe 的镜像 id（未识别 = kHookImageInvalid）。
 HookImageId ExeImage() {
-    return HookCurrentExeImage(LoaderCore::RuntimeHookApi());
+    return LoaderCore::CurrentExeImage();
 }
 
 // RCDATA 资源 id（103=lua / 104=xml；102 已被 sidecar 占用）
@@ -642,7 +642,7 @@ void InjectFrontEndUi(void* state) {
     void* mgr = nullptr;
     void* frontEnd = nullptr;
     {
-        void* slot = ResolveDataByAob(LoaderCore::RuntimeHookApi(), ExeImage(), kAob_UIManager);
+        void* slot = LoaderCore::ResolveDataByAobCore(ExeImage(), kAob_UIManager);
         if (!slot || !Runtime::IsReadableSpan(slot, sizeof(void*))) {
             Logger::Log("UiInject: UIManager 全局不可读，放弃注入");
             if (refresh) g_refreshRequested.store(true, std::memory_order_release);

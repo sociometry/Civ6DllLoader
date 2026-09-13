@@ -5,9 +5,22 @@
 #include <stddef.h>
 #include <string.h>
 
-// Plugin <-> Runtime HookAPI ABI generation.
-// This pre-release ABI is defined by the current field order; plugins must be rebuilt when it changes.
-// Keep the generation at 1 for the unpublished 1.0.0 line.
+// Plugin <-> Runtime HookAPI ABI.
+//
+// FROZEN PREFIX RULES (the backward-compatibility contract - read before touching HookAPI):
+//  1. Fields may only be APPENDED at the end of the HookAPI struct. Never reorder,
+//     never remove, never change the type or meaning of an existing field.
+//  2. A pure append does NOT bump CIV6_HOOK_API_VERSION. This is what keeps the loader
+//     forward compatible: an old plugin keeps using its prefix and never needs a rebuild
+//     just because the loader was updated.
+//  3. Bump CIV6_HOOK_API_VERSION only when the prefix must break (reorder / removal /
+//     semantic change). That is a deliberate breaking change and cannot be made compatible.
+//  4. Compatibility is decided by structSize (see HookAPI_IsCompatible), not by the version
+//     number: a plugin built from a newer header observes runtime structSize < its own
+//     sizeof(HookAPI) and must refuse to run. apiVersion only covers rule 3.
+//  5. New plugins should call HookAPI_IsCompatible(api) at the top of OnLoad - see the
+//     example at the bottom of this header. Old plugins that never call it keep working,
+//     because they only ever touch fields that existed when they were built.
 #ifndef CIV6_HOOK_API_VERSION
 #define CIV6_HOOK_API_VERSION 1u
 #endif
@@ -130,7 +143,7 @@ typedef enum HookApiPushMethodsResult {
 } HookApiPushMethodsResult;
 
 typedef struct HookAPI {
-    uint32_t apiVersion;   // CIV6_HOOK_API_VERSION (generation; not bumped for appends)
+    uint32_t apiVersion;   // rule 2/3: appends do NOT bump this; only a breaking prefix change does.
     uint32_t structSize;   // sizeof(HookAPI) of the *runtime*; plugins compare against their sizeof
 
     bool (*InstallHook)(void* targetFunc, void* detour, void** original);
@@ -305,8 +318,11 @@ typedef struct HookAPI {
     void (*LuaPushNil)(void* L);
 } HookAPI;
 
-// True if this runtime can serve a plugin built against the current pre-release header.
-// Plugins must be rebuilt after a field reorder; apiVersion remains 1 for the unpublished line.
+// True if this runtime can serve a plugin built from this header.
+// Call it once at the top of OnLoad and abort if it returns 0: the second test is the
+// append-only case (runtime table shorter than this plugin's header), the first is the
+// breaking-change case (rule 3). Plugins that never call it are still safe as long as the
+// prefix rules were respected when the loader was updated.
 static inline int HookAPI_IsCompatible(const HookAPI* api) {
     if (!api) return 0;
     if (api->apiVersion != CIV6_HOOK_API_VERSION) return 0;
@@ -632,3 +648,11 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
 // extern "C" __declspec(dllexport) void OnLoad(HookAPI* api);
 // extern "C" __declspec(dllexport) void OnUnload();
 // extern "C" __declspec(dllexport) void OnMessage(const char* topic, const void* data, size_t len);
+//
+// ABI guard (do this first thing in OnLoad):
+//   if (!HookAPI_IsCompatible(api)) {
+//       if (api) api->Log("Civ6DllLoader is older than this plugin; please update the loader.");
+//       return;
+//   }
+// This is how a plugin built from a newer header detects an older runtime instead of
+// reading past the end of the table. The table itself is read-only - writing to it faults.

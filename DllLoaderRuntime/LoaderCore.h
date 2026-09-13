@@ -20,15 +20,30 @@ void InitEarly();
 // 返回 0 表示尚未初始化（DllMain 休眠检测未通过，理论不会走到扫描）。
 HMODULE RuntimeModuleHandle();
 
-// 进程内 HookAPI 实例（实现于 Civ6DLLHookLoaderAPI.cpp）。loader 内部复用
-// common/HookAPI.h 里的 HookInfo 取址工具时用它，避免重复实现。
+// 进程内 HookAPI 实例（实现于 Civ6DLLHookLoaderAPI.cpp）。
+// 用途只剩一个：把这张【只读表】交给插件（OnLoad）。Loader 自身的内部取址一律走下面的
+// CurrentExeImage / ResolveDataByAobCore 与 Civ6DLLHookLoaderAPI.cpp 里的 *Core，
+// 不经过插件 ABI、也不拿插件生命周期锁。
 HookAPI* RuntimeHookApi();
 
+// 当前进程 exe 的映像 id（DX11/DX12；未识别 = kHookImageInvalid）。
+// 与 common/HookAPI.h 的 HookCurrentExeImage 同语义，但直连 ImageAddress。
+HookImageId CurrentExeImage();
+
+// Loader 内部解 exe 全局数据槽（AOB 相对寻址）。算法与 common/HookAPI.h 的
+// ResolveDataByAob 相同，但走无锁内部表。失败返回 nullptr。
+void* ResolveDataByAobCore(HookImageId image, const char* aob, uint32_t index = 1);
+
+// 启动自检（实现于 Civ6DLLHookLoaderAPI.cpp）：确认 HookAPI 表位于只读页
+// （.rdata）。不是只读就告警 —— 否则"插件写表"不会被拦截。
+void VerifyHookApiTableProtection();
+
 // exe 域目标解析（loader 自身 hook 用；实现于 Civ6DLLHookLoaderAPI.cpp）：
-//  1) 变体由 HookCurrentExeImage 判定；未识别 -> nullptr；
+//  1) 变体由 CurrentExeImage 判定；未识别 -> nullptr；
 //  2) 有该变体 PdataMatch 上下文，或 exe PE 身份与版本锚一致 -> 走 HookInfo 主路径
 //     （RVA+pdata 矫正 / 名称 / vtable；AOB 兜底在 HookInfo 内部）；
 //  3) 无上下文且身份与锚不一致 -> 跳过 RVA 路径，只用 AOB 兜底；再失败 -> nullptr。
+//  全程走内部无锁工具表，不经过插件 HookAPI 表、不拿插件生命周期锁。
 void* ResolveExeTarget(const HookInfoExe& info, size_t span = 1);
 
 // 工作线程事件：EnableMod/DisableMod detour（S4）调用本函数置标志并唤醒工作线程，
