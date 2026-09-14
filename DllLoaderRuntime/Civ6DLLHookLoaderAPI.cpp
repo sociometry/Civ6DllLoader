@@ -99,20 +99,6 @@ static void ClearActivePluginContext() {
     g_activePluginModule = nullptr;
 }
 
-enum class HookKind {
-    Plugin,
-    SharedScript,
-    PushMethods,
-};
-
-struct HookRecord {
-    std::wstring owner;  // 空 = Loader 共享钩
-    HookKind kind = HookKind::Plugin;
-    uint64_t gameCoreGeneration = 0;
-};
-
-static std::unordered_map<void*, HookRecord> g_hookRecords;
-
 // ================= 统一挂钩站点（Unified Hook Site） =================
 // 对同一个 target，MinHook 只挂一次，挂到 Loader 自己 asmjit 生成的「中转 stub」。
 // 一个站点把 Detour 槽、Capture 槽与 MinHook 侧合并到同一节点：
@@ -354,46 +340,8 @@ static bool TargetInTearingDownGameCore(void* target) {
 }
 
 // ---------------- HookAPI ??? ----------------
-static bool SafeRemoveHookLocked(void* target, bool eraseRecord);
-// 调用方必须持有 Runtime::MinHookMutex()。
-static MH_STATUS InstallHookOwnedByLocked(void* target, void* detour, void** original,
-                                          const wchar_t* owner, HookKind kind) {
-    MH_STATUS status = MH_CreateHook(target, detour, original);
-    const auto existing = g_hookRecords.find(target);
-    const bool recoverStalePlugin =
-        status == MH_ERROR_ALREADY_CREATED &&
-        kind == HookKind::Plugin &&
-        existing != g_hookRecords.end() &&
-        existing->second.kind == HookKind::Plugin &&
-        existing->second.owner == (owner ? owner : L"") &&
-        existing->second.gameCoreGeneration != 0 &&
-        existing->second.gameCoreGeneration < ImageAddress::GameCoreGeneration() &&
-        TargetInCurrentGameCore(target);
-    if (recoverStalePlugin && SafeRemoveHookLocked(target, false)) {
-        status = MH_CreateHook(target, detour, original);
-    }
-    if (status != MH_OK) {
-        Logger::Log("InstallHook: create failed %s", MH_StatusToString(status));
-        return status;
-    }
-
-    if ((status = MH_EnableHook(target)) != MH_OK) {
-        Logger::Log("InstallHook: enable failed %s", MH_StatusToString(status));
-        // 回滚残留的 MinHook 记录：否则该 target 永远 ALREADY_CREATED，再无重试机会。
-        MH_RemoveHook(target);
-        return status;
-    }
-
-    g_hookRecords[target] = HookRecord{
-        owner ? owner : L"",
-        kind,
-        TargetInCurrentGameCore(target) ? ImageAddress::GameCoreGeneration() : 0,
-    };
-    return MH_OK;
-}
-
 // 站点的域代际：GameCore 域目标取当前映像代际；exe / 非 GameCore 域恒为 0
-// （与 HookRecord 的口径一致，避免代际比较把 exe 域站点误判为陈旧）。
+// （exe 域站点不参与代际比较，免得被误判为陈旧）。
 static uint64_t SiteGenerationForTarget(const void* target) {
     return TargetInCurrentGameCore(const_cast<void*>(target))
         ? ImageAddress::GameCoreGeneration()
@@ -535,20 +483,17 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
 
     MH_STATUS status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
     if (status == MH_ERROR_ALREADY_CREATED) {
-        // 只有「本站节点已存在（!created）且该目标没有 Loader 共享钩登记」才可能是本站
-        // 自己的残留 MinHook 记录（例如上一次代际 MH_RemoveHook 失败）。对全新站点，
-        // #ALREADY_CREATED 只可能是别人的钩子 —— 尤其是 InstallSharedHook 装的
-        // ScriptData / ForUI / PushMethods。无条件摘除会释放共享钩的 trampoline，使
-        // g_origRegisterScriptData 等悬垂并静默顶掉 Lua 脚本全局注册，因此必须拒绝。
-        const bool heldBySharedHook = g_hookRecords.find(target) != g_hookRecords.end();
-        const bool ourStaleRecord = !created && !heldBySharedHook;
-        if (ourStaleRecord && Runtime::IsReadableSpan(target, 1)) {
+        // 只有「本站节点已存在（!created）」才可能是本站自己的残留 MinHook 记录
+        // （例如上一次代际 MH_RemoveHook 失败）。对全新站点，ALREADY_CREATED 只可能
+        // 是别人的钩子；无条件摘除会释放对方的 trampoline（可能让跳板指针悬垂并静默
+        // 顶掉 Lua 脚本全局注册），因此必须拒绝。Loader 共享钩并入站点表后，
+        // target 上不会再存在独立于本站的第三方记录需要在这里避让。
+        if (!created && Runtime::IsReadableSpan(target, 1)) {
             MH_RemoveHook(target);
             status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
         } else {
-            Logger::Log("HookSite: target %p already hooked by %s; refusing to replace (%s)",
-                target, heldBySharedHook ? "a loader shared hook" : "another owner",
-                why ? why : "");
+            Logger::Log("HookSite: target %p already hooked by another owner; refusing to replace (%s)",
+                target, why ? why : "");
             if (created) g_hookSites.erase(it);
             return nullptr;
         }
@@ -575,6 +520,44 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
         target, site->stubCode, site->minhookTrampoline,
         static_cast<unsigned long long>(generation), why ? why : "");
     return site;
+}
+
+// 把 Loader 共享钩（ScriptData / ForUI / PushMethods）挂到 target 的统一站点上。
+// 共享钩在站点里的表现：activeDetour = detour、detourOwner 恒为空、nextTarget = detour。
+// 调用方不得持 Runtime::MinHookMutex()：内部自取（站点取/建要求持锁）。
+// 幂等：同一 detour 已在站点上时直接返回当前跳板。
+// 独占：站点已有别的 detour（插件或另一个共享钩）时拒绝，构成双向互斥。
+//
+// 【顺序约束】屏障是「nextTarget = detour 之前必须备好 origSlot」，不是 MH_EnableHook
+// 之前——站点首次建立后 MinHook 侧已经 Enable，但此刻 nextTarget 只是 trampoline
+// （纯透传）；detour 只有靠把 nextTarget 置为 detour 才被真正激活。因此必须先把
+// origSlot 写成 trampoline，再发布 activeDetour/nextTarget，否则并发的首次调用会从
+// stub 跳到 nullptr（只可能发生在站点刚建好、还没赋 nextTarget 的窗口，见
+// GetOrCreateHookSiteLocked 里同一条约束）。
+static bool InstallLoaderDetourOnSite(void* target, void* detour, void** origSlot, const char* why) {
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    HookSite* site = GetOrCreateHookSiteLocked(target, why);
+    if (!site) {
+        Logger::Log("InstallLoaderDetourOnSite: hook site unavailable target=%p (%s)",
+            target, why ? why : "");
+        return false;
+    }
+    if (site->activeDetour == detour) {
+        if (origSlot) *origSlot = site->minhookTrampoline;
+        return true;   // 幂等
+    }
+    if (site->activeDetour) {
+        Logger::Log("InstallLoaderDetourOnSite: target %p already has detour=%p (owner=%ls) (%s)",
+            target, site->activeDetour, site->detourOwner.c_str(), why ? why : "");
+        return false;
+    }
+    if (origSlot) *origSlot = site->minhookTrampoline;
+    site->activeDetour = detour;
+    site->detourOwner.clear();
+    site->nextTarget = detour;
+    Logger::Log("InstallLoaderDetourOnSite: target=%p detour=%p trampoline=%p (%s)",
+        target, detour, site->minhookTrampoline, why ? why : "");
+    return true;
 }
 
 // 退役站点 detour 槽：只拔插槽（M1），绝不 MH_RemoveHook / g_hookSites.erase。
@@ -616,20 +599,15 @@ static size_t RetireHookSiteDetoursForGenerationLocked(uint64_t generation) {
 // 窗口取与"可读探测"同一口径（32 字节，保守）。
 constexpr size_t kHookPrologueWindow = PluginBoundary::kMinHookTargetSpan;
 
-// 调用方不得持 Runtime::MinHookMutex()（内部自己取）。同时遍历两套登记：
-//   - g_hookRecords：Loader 共享钩（ScriptData / PushMethods）；
-//   - g_hookSites：统一站点的 MinHook 侧（hookInstalled 才会改写前导字节）。
+// 调用方不得持 Runtime::MinHookMutex()（内部自己取）。只看统一的站点表：
+// Loader 共享钩（ScriptData / ForUI / PushMethods）与插件 detour 都是站点，
+// 只有站点的 MinHook 侧（hookInstalled）才改写过目标前导字节。
 static bool OverlapsHookPrologue(const void* target, size_t len) {
     if (!target || len == 0) return false;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
     const uintptr_t end = begin + len;
     if (end < begin) return true;   // 地址回绕：按冲突处理
     lock_guard<mutex> lock(Runtime::MinHookMutex());
-    for (const auto& record : g_hookRecords) {
-        const uintptr_t hookBegin = reinterpret_cast<uintptr_t>(record.first);
-        const uintptr_t hookEnd = hookBegin + kHookPrologueWindow;
-        if (begin < hookEnd && hookBegin < end) return true;
-    }
     for (const auto& [siteTarget, site] : g_hookSites) {
         if (!site.hookInstalled) continue;   // 未 Enable 的站点尚未改写前导字节
         const uintptr_t hookBegin = reinterpret_cast<uintptr_t>(siteTarget);
@@ -694,23 +672,41 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
     return true;
 }
 
-// 摘除单个 MinHook 钩子；目标内存不可读（GameCore 映像已卸载，重载兜底路径会出现）
-// 时跳过 RemoveHook——对未映射地址恢复原字节会失败甚至出错。残留的 MinHook 记录
-// 由 InstallSharedHook 的 ALREADY_CREATED 恢复路径在新映像 attach 后清理复用。
+// 物理摘除某个站点自己的 MinHook 记录（释放跳板），并把站点还原为「未挂钩」。
 // 调用方必须持有 Runtime::MinHookMutex()。
-static bool SafeRemoveHookLocked(void* target, bool eraseRecord = true) {
+//
+// a -> b -> c 的顺序不可交换：
+//   a) MH_DisableHook(target)：先把目标入口字节还原回原函数（幂等；MH_ERROR_DISABLED
+//      说明本来就已停用，按成功处理）。这一步失败就整体放弃：入口没还原时 b/c 都
+//      不成立；
+//   b) site.nextTarget = target：入口字节已还原，此刻仍在 stub 里的在途调用者改去
+//      执行原函数——安全且语义正确，且此后不会再有人引用这块跳板；
+//   c) MH_RemoveHook(target)：释放跳板。必须排在 b 之后，否则在途线程会从 stub 直接
+//      跳进已释放的跳板（UAF）。
+// 摘除失败时保留站点记账（hookInstalled 等不动），交给下次代际重建处理。
+static bool RemoveHookSiteRecordLocked(void* target, HookSite& site) {
     if (!target) return false;
-    if (!Runtime::IsReadableSpan(target, 1)) {
-        Logger::Log("SafeRemoveHook: target %p unreadable (module unmapped); skip MinHook removal", target);
+    const MH_STATUS disable = MH_DisableHook(target);
+    if (disable != MH_OK && disable != MH_ERROR_DISABLED) {
+        // 入口字节没能还原（例如映像已卸载 → MinHook 的 VirtualProtect 失败返回
+        // MH_ERROR_MEMORY_PROTECT）：此时【绝不能】把 nextTarget 指向 target——入口
+        // 仍跳本站 stub，stub 再跳 target 就成了死循环；记录与跳板原样保留，交给下次
+        // 代际重建清理。
+        Logger::Log("RemoveHookSiteRecord: MH_DisableHook(%p) -> %s; record retained",
+            target, MH_StatusToString(disable));
         return false;
     }
-    MH_DisableHook(target);
-    const MH_STATUS st = MH_RemoveHook(target);
-    if (st != MH_OK) {
-        Logger::Log("SafeRemoveHook: MH_RemoveHook(%p) -> %s", target, MH_StatusToString(st));
+    site.nextTarget = target;   // 入口已还原：在途调用走原函数，不再碰跳板
+    const MH_STATUS remove = MH_RemoveHook(target);
+    if (remove != MH_OK && remove != MH_ERROR_NOT_CREATED) {
+        Logger::Log("RemoveHookSiteRecord: MH_RemoveHook(%p) -> %s", target, MH_StatusToString(remove));
         return false;
     }
-    if (eraseRecord) g_hookRecords.erase(target);
+    site.hookInstalled = false;
+    site.minhookTrampoline = nullptr;
+    site.activeDetour = nullptr;
+    site.detourOwner.clear();
+    Logger::Log("RemoveHookSiteRecord: removed MinHook record target=%p", target);
     return true;
 }
 
@@ -2026,11 +2022,9 @@ std::vector<ScriptGlobalsEntry> g_scriptGlobals;
 std::vector<ScriptGlobalsEntry> g_scriptGlobalsUI;
 ProxyTypes::RegisterScriptData g_origRegisterScriptData = nullptr;
 ProxyTypes::RegisterScriptDataForUI g_origRegisterScriptDataForUI = nullptr;
-bool g_scriptHookInstalled = false;
-bool g_scriptUIHookInstalled = false;
-// 共享钩子的目标地址（GameCore 域）：GameCore 重载时据此摘钩。
-void* g_scriptHookTarget = nullptr;
-void* g_scriptUIHookTarget = nullptr;
+// 上述两个跳板由统一站点的 MH_CreateHook 回填（尾跳原函数），detour 用它们调原实现；
+// 站点退役（ResetSharedGameCoreHooks）时随站点记录一并清空。是否已挂钩不再需要标志：
+// 站点表本身就是唯一账本，重复安装幂等。
 
 static void CallScriptGlobalsSafe(ScriptGlobalsFn fn, void* L) {
     if (!fn) return;
@@ -2093,68 +2087,41 @@ void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State
     }
 }
 
-// 装共享钩（owner 固定 = Loader）。ALREADY_CREATED = 旧 GameCore 映像残留的
-// MinHook 记录（地址复用）：摘除后重装一次，强制按新映像重打补丁。
-// g_*HookTarget 记录目标地址，供 GameCore 重载时摘钩。
-static bool InstallSharedHook(void* target, void* detour, void** orig, void** targetSlot) {
-    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-    MH_STATUS status = InstallHookOwnedByLocked(
-        target, detour, orig, L"", HookKind::SharedScript);
-    if (status == MH_OK) {
-        *targetSlot = target;
-        return true;
-    }
-
-    const auto it = g_hookRecords.find(target);
-    const bool isOurStaleHook =
-        status == MH_ERROR_ALREADY_CREATED &&
-        it != g_hookRecords.end() &&
-        it->second.owner.empty() &&
-        it->second.gameCoreGeneration < ImageAddress::GameCoreGeneration() &&
-        g_activeSharedDetours.load(std::memory_order_acquire) == 0;
-    if (isOurStaleHook && SafeRemoveHookLocked(target) &&
-        InstallHookOwnedByLocked(target, detour, orig, L"",
-                                 HookKind::SharedScript) == MH_OK) {
-        *targetSlot = target;
-        return true;
-    }
-    return false;
-}
-
 // 确保已注册回调对应的共享钩子已装上。三条调用路径：
 //  1) 插件 RegisterScriptGlobals 首次注册（原有路径）；
 //  2) GameCore 重载后 InitializeGameCorePhase 再调（钩子已随 ResetForReload 摘除，
 //     回调列表跨重载保留——Global 插件仍加载着，其注册项不丢）；
 //  3) 阶段 B 首次进入时列表已非空（Global 插件在阶段 A 注册过）。
-// 检查+安装整体持锁，消除并发首装的重复创建竞态。
+// 检查+安装整体持锁，消除并发首装的重复创建竞态。安装走统一站点表，天然幂等，
+// 因此不需要「已装就早退」标志：重复调用只是复用同一站点、刷新 g_orig* 跳板。
 static void EnsureScriptHooksInstalled() {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     if (!g_gameCorePhaseReady) return;
 
-    if (!g_scriptHookInstalled && !g_scriptGlobals.empty()) {
+    if (!g_scriptGlobals.empty()) {
         void* target = ResolveCurrentGameCoreByName("GameCore::Lua::Utility::RegisterScriptData");
         if (!target) {
             Logger::Log("EnsureScriptHooksInstalled: RegisterScriptData address missing");
-        } else if (InstallSharedHook(target, reinterpret_cast<void*>(&Hook_RegisterScriptData),
-                       reinterpret_cast<void**>(&g_origRegisterScriptData), &g_scriptHookTarget)) {
-            g_scriptHookInstalled = true;
+        } else if (InstallLoaderDetourOnSite(target,
+                       reinterpret_cast<void*>(&Hook_RegisterScriptData),
+                       reinterpret_cast<void**>(&g_origRegisterScriptData), "ScriptData")) {
             Logger::Log("EnsureScriptHooksInstalled: hooked RegisterScriptData at %p", target);
         } else {
             Logger::Log("EnsureScriptHooksInstalled: RegisterScriptData hook install failed "
-                        "(target held by a hook site?)");
+                        "(target held by another detour?)");
         }
     }
-    if (!g_scriptUIHookInstalled && !g_scriptGlobalsUI.empty()) {
+    if (!g_scriptGlobalsUI.empty()) {
         void* target = ResolveCurrentGameCoreByName("GameCore::Lua::Utility::RegisterScriptDataForUI");
         if (!target) {
             Logger::Log("EnsureScriptHooksInstalled: RegisterScriptDataForUI address missing");
-        } else if (InstallSharedHook(target, reinterpret_cast<void*>(&Hook_RegisterScriptDataForUI),
-                       reinterpret_cast<void**>(&g_origRegisterScriptDataForUI), &g_scriptUIHookTarget)) {
-            g_scriptUIHookInstalled = true;
+        } else if (InstallLoaderDetourOnSite(target,
+                       reinterpret_cast<void*>(&Hook_RegisterScriptDataForUI),
+                       reinterpret_cast<void**>(&g_origRegisterScriptDataForUI), "ScriptDataForUI")) {
             Logger::Log("EnsureScriptHooksInstalled: hooked RegisterScriptDataForUI at %p", target);
         } else {
             Logger::Log("EnsureScriptHooksInstalled: RegisterScriptDataForUI hook install failed "
-                        "(target held by a hook site?)");
+                        "(target held by another detour?)");
         }
     }
 }
@@ -2627,19 +2594,6 @@ int FindOrAllocWithManagerSlot(void* target) {
 
 }  // namespace
 
-static bool RecoverStalePushHookLocked(void* target, MH_STATUS status) {
-    if (status != MH_ERROR_ALREADY_CREATED) return false;
-    const auto it = g_hookRecords.find(target);
-    if (it == g_hookRecords.end() ||
-        it->second.kind != HookKind::PushMethods ||
-        !it->second.owner.empty() ||
-        it->second.gameCoreGeneration >= ImageAddress::GameCoreGeneration() ||
-        g_activeSharedDetours.load(std::memory_order_acquire) != 0) {
-        return false;
-    }
-    return SafeRemoveHookLocked(target);
-}
-
 void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMethod>& methods,
                                   const std::wstring& owner) {
     if (!target || methods.empty() || owner.empty() || std::any_of(methods.begin(), methods.end(),
@@ -2649,7 +2603,8 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
         return nullptr;
     }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    // 不持 MinHook 锁：InstallLoaderDetourOnSite 内部自己取。锁序因而是
+    // lifecycle -> pushState -> MinHook（没有反向路径：无人持 MinHook 锁再取 pushState）。
     lock_guard<mutex> stateLock(g_pushStateMutex);
     const int slot = FindOrAllocNoManagerSlot(target);
     if (slot < 0) {
@@ -2672,27 +2627,15 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
         return reinterpret_cast<void*>(state.base);
     }
 
-    // 新槽：先建钩启用，全部成功后才登记方法；任一步失败完整回滚槽位与
-    // MinHook 记录——否则半初始化槽位会让重试重复追加方法或返回失效 trampoline。
-    MH_STATUS status = MH_CreateHook(target, NoManagerDetourTable[slot], reinterpret_cast<void**>(&state.base));
-    if (RecoverStalePushHookLocked(target, status)) {
-        status = MH_CreateHook(target, NoManagerDetourTable[slot],
-                               reinterpret_cast<void**>(&state.base));
-    }
-    if (status != MH_OK) {
-        Logger::Log("InstallPushMethodsNoManager: create hook failed %s", MH_StatusToString(status));
+    // 新槽：先把 detour 装上统一站点，成功后才登记方法；失败完整回滚槽位——否则
+    // 半初始化槽位会让重试重复追加方法或返回失效跳板。共享钩不再自带 MinHook 记录：
+    // 站点持有唯一记录，state.base = 站点跳板（origSlot）。
+    if (!InstallLoaderDetourOnSite(target, NoManagerDetourTable[slot],
+                                   reinterpret_cast<void**>(&state.base), "PushMethods")) {
+        Logger::Log("InstallPushMethodsNoManager: install detour failed (target held by another owner?)");
         state = NoManagerHookSlot{};
         return nullptr;
     }
-    if ((status = MH_EnableHook(target)) != MH_OK) {
-        Logger::Log("InstallPushMethodsNoManager: enable hook failed %s", MH_StatusToString(status));
-        MH_RemoveHook(target);
-        state = NoManagerHookSlot{};
-        return nullptr;
-    }
-    g_hookRecords[target] = HookRecord{
-        L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
-    };
     state.methods.swap(merged);
     state.methodOwners.swap(mergedOwners);
     return reinterpret_cast<void*>(state.base);
@@ -2707,7 +2650,7 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
         return nullptr;
     }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    // 不持 MinHook 锁：InstallLoaderDetourOnSite 内部自己取（同 NoManager 路径的锁序）。
     lock_guard<mutex> stateLock(g_pushStateMutex);
     const int slot = FindOrAllocWithManagerSlot(target);
     if (slot < 0) {
@@ -2729,25 +2672,13 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
         return reinterpret_cast<void*>(state.base);
     }
 
-    MH_STATUS status = MH_CreateHook(target, WithManagerDetourTable[slot], reinterpret_cast<void**>(&state.base));
-    if (RecoverStalePushHookLocked(target, status)) {
-        status = MH_CreateHook(target, WithManagerDetourTable[slot],
-                               reinterpret_cast<void**>(&state.base));
-    }
-    if (status != MH_OK) {
-        Logger::Log("InstallPushMethodsWithManager: create hook failed %s", MH_StatusToString(status));
+    // 同 NoManager：站点是唯一的 MinHook 账本，state.base = 站点跳板（origSlot）。
+    if (!InstallLoaderDetourOnSite(target, WithManagerDetourTable[slot],
+                                   reinterpret_cast<void**>(&state.base), "PushMethods")) {
+        Logger::Log("InstallPushMethodsWithManager: install detour failed (target held by another owner?)");
         state = WithManagerHookSlot{};
         return nullptr;
     }
-    if ((status = MH_EnableHook(target)) != MH_OK) {
-        Logger::Log("InstallPushMethodsWithManager: enable hook failed %s", MH_StatusToString(status));
-        MH_RemoveHook(target);
-        state = WithManagerHookSlot{};
-        return nullptr;
-    }
-    g_hookRecords[target] = HookRecord{
-        L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
-    };
     state.methods.swap(merged);
     state.methodOwners.swap(mergedOwners);
     return reinterpret_cast<void*>(state.base);
@@ -3694,32 +3625,15 @@ bool InitializeLoader(HMODULE hModule) {
 // ================= LoaderCore 实现（S3c：插件生命周期 v2） =================
 
 // 退役某插件通过 HookAPI.InstallHook 注册的 detour 槽（只拔插槽，绝不物理脱钩）：
-//  - 统一站点：清空该 owner 的 activeDetour / detourOwner，nextTarget 回落到
-//    minhookTrampoline（stub 与 MinHook 钩保持存活，纯透传）。不这样做的话，插件
-//    卸载后再 OnLoad 会因站点 activeDetour 非空而无法重新挂钩。
-//  - g_hookRecords：保留原有 SharedScript / PushMethods 语义（这些共享钩 owner 恒为空，
-//    正常不会命中插件 owner）。
+// 清空该 owner 的 activeDetour / detourOwner，nextTarget 回落到 minhookTrampoline
+// （stub 与 MinHook 钩保持存活，纯透传）。不这样做的话，插件卸载后再 OnLoad 会因
+// 站点 activeDetour 非空而无法重新挂钩。
+// 站点表是唯一的挂钩账本：Loader 共享钩的 detourOwner 恒为空，不会被这里命中。
 // 在卸载插件的 FreeLibrary 之前调用；owner 为插件 stem（空串代表 Loader 自身，不在此退役）。
 static void RemovePluginHooks(const wchar_t* owner) {
     if (!owner || !*owner) return;
     lock_guard<mutex> lock(Runtime::MinHookMutex());
     RetireHookSiteDetoursForOwnerLocked(std::wstring(owner));
-    for (auto it = g_hookRecords.begin(); it != g_hookRecords.end(); ) {
-        if (it->second.owner == owner) {
-            void* target = it->first;
-            if (SafeRemoveHookLocked(target, false)) {
-                it = g_hookRecords.erase(it);
-                Logger::Log("RemovePluginHooks: removed hook at %p (owner=%ls)",
-                            target, owner);
-            } else {
-                Logger::Log("RemovePluginHooks: retained failed hook record at %p (owner=%ls)",
-                            target, owner);
-                ++it;
-            }
-        } else {
-            ++it;
-        }
-    }
 }
 
 // 撤销某插件注册的全部回调类条目（禁用/隔离时调用）：脚本全局、PushMethods
@@ -3966,37 +3880,40 @@ bool LoaderCore::IsInitialized() {
 }
 
 // GameCore 重载时的共享钩子复位（G1）：RegisterScriptData/ForUI 共享钩与全部
-// PushMethods 槽位钩的目标都在旧 GameCore 映像内——映像卸载后补丁字节随映射消失，
-// 而 MinHook 记录、g_scriptHookInstalled 标志、trampoline 指针全部残留：
+// PushMethods 槽位钩现在都只是站点表里「detourOwner 为空、带 detour」的站点——目标都
+// 在旧 GameCore 映像内，映像卸载后补丁字节随映射消失，而 MinHook 记录与 trampoline
+// 指针全部残留：
 //  - 若不复位：重进游戏后 detour 不再被调用（新映像是未打补丁的原始字节），
-//    且 g_scriptHookInstalled=true 让重注册早退 → Lua 注入本会话永久失效；
+//    Lua 注入本会话永久失效；
 //  - PushMethods 槽位还会按重载次数泄漏（上限 16 个）。
-// 在 UnloadDllDetour 路径调用时旧映像仍存活，可干净摘钩；在 LoadDllDetour 重入
-// 兜底路径调用时映像可能已卸载，SafeRemoveHook 自动跳过（残留记录由
-// InstallSharedHook 的 ALREADY_CREATED 恢复路径处理）。
+// 脱钩完全由站点表驱动。在 UnloadDllDetour 路径调用时旧映像仍存活，可干净摘钩。
+// 在 LoadDllDetour 重入兜底路径调用时映像可能已卸载（ImageAddress 仍记着旧基址，
+// 域过滤照样命中）：此时 MinHook 侧 VirtualProtect 失败并返回 MEMORY_PROTECT，既不
+// 复制备份字节也不释放跳板，站点记录原样保留——不会踩未映射内存，留给站点按代际
+// 重建（GetOrCreateHookSiteLocked）时清理。
 // 已注册的 ScriptGlobals 回调列表跨重载保留（Global 插件仍加载着），
 // 由 EnsureScriptHooksInstalled 在新 GameCore attach 后重新装钩。
 static void ResetSharedGameCoreHooks(
         unique_lock<std::recursive_mutex>& lifecycleLock) {
-    std::vector<void*> pushTargets;
-    {
-        lock_guard<mutex> stateLock(g_pushStateMutex);
-        for (int i = 0; i < kMaxPushHooks; ++i) {
-            if (g_noManagerSlots[i].used) {
-                pushTargets.push_back(g_noManagerSlots[i].target);
-            }
-            if (g_withManagerSlots[i].used) {
-                pushTargets.push_back(g_withManagerSlots[i].target);
-            }
-        }
-    }
-
+    // 先收集「目标属于当前 GameCore 域（已加载域 或 正在拆除的区间）+ 无 owner +
+    // 有 detour」的共享钩站点，并逐个 MH_DisableHook（入口字节还原为原函数）。
+    // 必须趁 ImageAddress 尚未 detach、teardown 窗口仍有效时收集，之后再按 target
+    // 列表物理摘除。
+    std::vector<void*> sharedTargets;
     {
         lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-        if (g_scriptHookTarget) MH_DisableHook(g_scriptHookTarget);
-        if (g_scriptUIHookTarget) MH_DisableHook(g_scriptUIHookTarget);
-        for (void* target : pushTargets) {
-            if (target) MH_DisableHook(target);
+        const HookImageId gcId = ImageAddress::LoadedGameCore();
+        for (auto& [target, site] : g_hookSites) {
+            if (!site.activeDetour || !site.detourOwner.empty()) continue;   // 只取 Loader 共享钩
+            if (!ImageAddress::Contains(gcId, target) && !TargetInTearingDownGameCore(target)) {
+                continue;
+            }
+            const MH_STATUS status = MH_DisableHook(target);
+            if (status != MH_OK && status != MH_ERROR_DISABLED) {
+                Logger::Log("ResetSharedGameCoreHooks: MH_DisableHook(%p) -> %s",
+                    target, MH_StatusToString(status));
+            }
+            sharedTargets.push_back(target);
         }
     }
 
@@ -4018,19 +3935,17 @@ static void ResetSharedGameCoreHooks(
     }
     lifecycleLock.lock();
 
+    // 排空后才真正摘除站点记录（释放跳板）；顺序理由见 RemoveHookSiteRecordLocked。
     {
         lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-        if (g_scriptHookTarget) SafeRemoveHookLocked(g_scriptHookTarget);
-        if (g_scriptUIHookTarget) SafeRemoveHookLocked(g_scriptUIHookTarget);
-        for (void* target : pushTargets) {
-            if (target) SafeRemoveHookLocked(target);
+        for (void* target : sharedTargets) {
+            const auto it = g_hookSites.find(target);
+            if (it != g_hookSites.end()) {
+                RemoveHookSiteRecordLocked(target, it->second);
+            }
         }
     }
 
-    g_scriptHookTarget = nullptr;
-    g_scriptUIHookTarget = nullptr;
-    g_scriptHookInstalled = false;
-    g_scriptUIHookInstalled = false;
     g_origRegisterScriptData = nullptr;
     g_origRegisterScriptDataForUI = nullptr;
     {
@@ -4042,64 +3957,27 @@ static void ResetSharedGameCoreHooks(
     }
     g_gameCoreTeardownAddress = 0;
     g_gameCoreTeardownSizeOfImage = 0;
-    Logger::Log("ResetSharedGameCoreHooks: script/UI hooks + push slots reset");
+    Logger::Log("ResetSharedGameCoreHooks: script/UI detour sites + push slots reset");
 }
 
 // 按代际退役所有 GameCore 域的插件 detour（调用方持生命周期锁）。
-// Global 插件在对局中经 Ready 回调装的 GameCore 域钩无人摘；异基址重载后旧站点
-// 目标指向未映射内存。统一在旧映像卸载前处理：
-//  - 统一站点：只拔 detour 槽（activeDetour=nullptr，nextTarget=minhookTrampoline），
-//    绝不物理脱钩——stub / trampoline 保持存活，重载后按代际重建（M4）；
-//  - g_hookRecords：保留原有 Plugin 域物理 Disable 语义（统一站点接管插件 detour 后
-//    该类记录已不再产生，循环作为兼容兜底）。
+// 统一站点表是唯一的挂钩账本：Global 插件在对局中经 Ready 回调装的 GameCore 域钩
+// 无人摘，异基址重载后旧站点目标指向未映射内存，统一在旧映像卸载前处理——只拔
+// detour 槽（activeDetour=nullptr，nextTarget=minhookTrampoline），绝不物理脱钩：
+// stub / trampoline 保持存活，重载后按代际重建（M4）。
 // exe 域（generation == 0）不受影响。
+// 注：Loader 共享钩（ScriptData / ForUI / PushMethods）的退役由 ResetSharedGameCoreHooks
+// 负责，这里只处理有 owner 的插件 detour。
 static void DisableGameCoreGenerationHooks(uint64_t generation) {
     lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-    size_t disabled = 0;
-    for (const auto& [target, record] : g_hookRecords) {
-        if (record.gameCoreGeneration == generation &&
-                record.kind == HookKind::Plugin &&
-                !record.owner.empty()) {
-            const MH_STATUS status = MH_DisableHook(target);
-            if (status == MH_OK || status == MH_ERROR_DISABLED) {
-                ++disabled;
-            } else {
-                Logger::Log("DisableGameCoreGenerationHooks: target=%p status=%s",
-                    target, MH_StatusToString(status));
-            }
-        }
-    }
     const size_t retiredSites = RetireHookSiteDetoursForGenerationLocked(generation);
-    Logger::Log("DisableGameCoreGenerationHooks: disabled=%zu siteDetoursRetired=%zu",
-        disabled, retiredSites);
+    Logger::Log("DisableGameCoreGenerationHooks: siteDetoursRetired=%zu", retiredSites);
 }
 
 static void RemoveGameCoreGenerationHooks(uint64_t generation) {
     lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-    size_t removed = 0;
-    for (auto it = g_hookRecords.begin(); it != g_hookRecords.end(); ) {
-        const HookRecord& record = it->second;
-        const bool gameCoreDomainPluginHook =
-            record.gameCoreGeneration == generation &&
-            record.kind == HookKind::Plugin &&
-            !record.owner.empty();
-        if (gameCoreDomainPluginHook) {
-            void* target = it->first;
-            if (SafeRemoveHookLocked(target, false)) {
-                it = g_hookRecords.erase(it);
-                ++removed;
-            } else {
-                // 摘除失败（兜底路径映像已卸载等）：保留记录，待地址复用时由
-                // recoverStalePlugin 路径或下次 teardown 处理。
-                ++it;
-            }
-        } else {
-            ++it;
-        }
-    }
     const size_t retiredSites = RetireHookSiteDetoursForGenerationLocked(generation);
-    Logger::Log("RemoveGameCoreGenerationHooks: removed=%zu siteDetoursRetired=%zu remainingRecords=%zu",
-        removed, retiredSites, g_hookRecords.size());
+    Logger::Log("RemoveGameCoreGenerationHooks: siteDetoursRetired=%zu", retiredSites);
 }
 
 void LoaderCore::ResetForReload() {
