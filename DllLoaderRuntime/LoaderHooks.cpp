@@ -1,11 +1,9 @@
 // LoaderHooks.cpp — Civ6DllLoader v2 游戏内 hook 安装（S4）。
 //
-// 安装 4 个 MinHook detour（详见 docs/LoadDLL_analysis.md、docs/ModToggle_analysis.md 与
-// 设计文档 §3.1 阶段 B/C、§4.1 阶段 B）：
+// 安装 2 个 MinHook detour（详见 docs/LoadDLL_analysis.md 与设计文档 §3.1 阶段 B、§4.1 阶段 B）：
 //   - GameCore::LoadDLL            （阶段 B：接管 GameCore 加载）
 //   - GameCore::UnloadDLL          （阶段 B 收尾：卸 GameCore 前先卸插件）
-//   - AppLuaModdingLibrary::lEnableMod  （阶段 C：主菜单开关 Mod → RequestReconcile）
-//   - AppLuaModdingLibrary::lDisableMod （阶段 C，同上）
+// Global 插件仅启动时加载一次；主菜单开关 Mod 需重启才生效（不再挂 lEnableMod/lDisableMod 钩）。
 // 一切失败仅日志 + 静默降级；安装按事务处理，任一步失败都会回滚本次已装 hook。
 //
 // exe 域取址：双版本 HookInfoExe（DX11 / DX12 各自的 RVA + 唯一 AOB），运行时按当前 exe
@@ -19,7 +17,6 @@
 #include "LoaderCore.h"
 #include "ImageAddress.h"
 #include "Runtime.h"
-#include "UiInject.h"
 #include "../common/Logger.h"
 #include "MinHook.h"
 
@@ -40,14 +37,10 @@ namespace {
 constexpr char kAob_LoadDLL[] = "48 81 EC 48 02 00 00 48 83 3D ?? ?? ?? ?? 00 74 ?? 32 C0 48 81 C4 48 02 00 00 C3 48 8D 44 24 2C 48 89 AC 24 58 02 00 00 48 89 44 24 20 48 8D 54 24 2C 0F B7 05 ?? ?? ?? ?? 33 ED 41 B8 04 01 00";
 constexpr char kAob_UnloadDLL_Dx11[] = "48 83 EC 28 48 83 3D ?? ?? ?? ?? 00 74 ?? 48 89 5C 24 20 E8 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? FF D0 48 8B 0D ?? ?? ?? ?? 33 DB 48 89 1D 4E D2";
 constexpr char kAob_UnloadDLL_Dx12[] = "48 83 EC 28 48 83 3D ?? ?? ?? ?? 00 74 ?? 48 89 5C 24 20 E8 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? FF D0 48 8B 0D ?? ?? ?? ?? 33 DB 48 89 1D 8E 45";
-constexpr char kAob_lEnableMod[] = "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 40 48 8B 51 50 48 8B F9 45 33 FF 0F 57 C0 41 8B CF 4C 89 7C 24 30 F3 0F 7F 44 24 20 48 3B 57 48 48 0F 42 CA 0F 83 C6 00 00 00 8B 09 41 B8 06 00 00 00 83 E1 0F 8D 41 F7 83 F8 01 44 0F 47 C1 41 83 F8 03 0F 85 2B";
-constexpr char kAob_lDisableMod[] = "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 40 48 8B 51 50 48 8B F9 45 33 FF 0F 57 C0 41 8B CF 4C 89 7C 24 30 F3 0F 7F 44 24 20 48 3B 57 48 48 0F 42 CA 0F 83 C6 00 00 00 8B 09 41 B8 06 00 00 00 83 E1 0F 8D 41 F7 83 F8 01 44 0F 47 C1 41 83 F8 03 0F 85 15";
 constexpr char kAob_GetConfiguration[] = "48 83 EC 38 48 8B 05 ?? ?? ?? ?? 48 85 C0 75 ?? E8 ?? ?? ?? ?? 8B D0 C7 44 24 28 00 00 00 00 41 B9 F4 07 00 00 C7 44 24 20 13 00 00 00 4C 8D 05 ?? ?? ?? ?? B9 08 13 00 00 E8 ?? ?? ?? ?? 48 85";
 
 constexpr HookInfoExe kExeLoadDLL = { HookRva(0xF8510, kAob_LoadDLL), HookRva(0xF8850, kAob_LoadDLL) };
 constexpr HookInfoExe kExeUnloadDLL = { HookRva(0xF8E30, kAob_UnloadDLL_Dx11), HookRva(0xF9170, kAob_UnloadDLL_Dx12) };
-constexpr HookInfoExe kExelEnableMod = { HookRva(0x4CCFE0, kAob_lEnableMod), HookRva(0x4CD840, kAob_lEnableMod) };
-constexpr HookInfoExe kExelDisableMod = { HookRva(0x4CCD50, kAob_lDisableMod), HookRva(0x4CD5B0, kAob_lDisableMod) };
 constexpr HookInfoExe kExeGetConfiguration = { HookRva(0x100390, kAob_GetConfiguration), HookRva(0x100CE0, kAob_GetConfiguration) };
 // GetRuleSet：函数体（56 字节）内有 5 处机器码完全相同的兄弟函数（差异只在被通配的 disp32 上），
 // 无法用内容唯一区分 -> 用 HookInfo.index 选升序命中表里的第 2 个（两版 exe 都是第 2 个）。
@@ -68,13 +61,10 @@ HookImageId ExeImage() {
 
 // ---- hook 目标函数签名（MinHook 与调用约定无关，x64 下 __fastcall 即默认约定）----
 typedef char(__fastcall* LoadDllFn)(wchar_t* Path);       // GameCore::LoadDLL(wchar_t*)
-typedef __int64(__fastcall* ModToggleFn)(void*);          // lEnableMod/lDisableMod(lua_State* L)
 typedef char(__fastcall* UnloadDllFn)();                  // GameCore::UnloadDLL()
 
 // ---- 匿名命名空间状态 ----
 LoadDllFn g_origLoadDLL = nullptr;
-ModToggleFn g_origEnableMod = nullptr;
-ModToggleFn g_origDisableMod = nullptr;
 UnloadDllFn g_origUnloadDLL = nullptr;
 wchar_t g_officialPath[260] = {};  // Loader 自有缓冲：官方 GameCore 绝对路径（不改调用者栈缓冲）
 
@@ -202,19 +192,6 @@ bool CheckLoadDllSignature(uintptr_t addr) {
         }
     }
     return true;
-}
-
-// lEnableMod/lDisableMod 入口：48 89 5C 24 10 48 89 6C 24 18
-// （mov [rsp+10h],rbx; mov [rsp+18h],rbp —— 两个函数同款入口序言）。
-// 两者共用：入口相同即通过；不匹配 = 游戏 exe 已更新，RVA 集失效，整体跳过 hook。
-bool CheckModToggleSignature(uintptr_t addr) {
-    if (!SignatureSpanReadable(addr, 10)) {
-        return false;
-    }
-    static const unsigned char kSig[10] = {
-        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18
-    };
-    return memcmp(reinterpret_cast<const void*>(addr), kSig, sizeof(kSig)) == 0;
 }
 
 // UnloadDLL 入口：48 83 EC 28 | 48 83 3D ?? ?? ?? ?? 00 | 74 6E | 48 89
@@ -346,21 +323,6 @@ static char __fastcall UnloadDllDetour() {
     return g_origUnloadDLL();
 }
 
-// ---- ModToggle detour（阶段 C：开关 Mod → 原函数执行 → 唤醒工作线程重查启用集）----
-static __int64 __fastcall EnableModDetour(void* L) {
-    __int64 r = g_origEnableMod(L);
-    LoaderCore::RequestReconcile();
-    UiInject::RefreshOnUiThread();
-    return r;
-}
-
-static __int64 __fastcall DisableModDetour(void* L) {
-    __int64 r = g_origDisableMod(L);
-    LoaderCore::RequestReconcile();
-    UiInject::RefreshOnUiThread();
-    return r;
-}
-
 }  // namespace
 
 bool LoaderHooks::InstallAll() {
@@ -403,7 +365,7 @@ bool LoaderHooks::InstallAll() {
     };
 
     // 可选 hook 的统一安装事务：失败只放弃这一个并记日志，**不连坐**已装好的钩子。
-    // 关键点：一个可选 hook（lEnableMod / lDisableMod / UnloadDLL）的签名或启用失败，
+    // 关键点：一个可选 hook（UnloadDLL）的签名或启用失败，
     // 绝不该把核心的 LoadDLL 钩子一起回滚掉 —— 原实现在这里 return rollback(...)，
     // 等于"丢一个可选功能 = 丢全部功能"。
     const auto installOptional = [&](const char* name, uintptr_t addr,
@@ -449,18 +411,6 @@ bool LoaderHooks::InstallAll() {
     }
     Logger::Log("LoadDLL hook installed at 0x%llX",
         static_cast<unsigned long long>(loadDllAddr));
-
-    // ---- lDisableMod（RVA 0x4CCD50 / 0x4CD5B0，AOB 兜底；可选）----
-    installOptional("lDisableMod",
-        reinterpret_cast<uintptr_t>(LoaderCore::ResolveExeTarget(kExelDisableMod, 1)),
-        &CheckModToggleSignature, reinterpret_cast<void*>(&DisableModDetour),
-        reinterpret_cast<void**>(&g_origDisableMod));
-
-    // ---- lEnableMod（RVA 0x4CCFE0 / 0x4CD840，AOB 兜底；可选）----
-    installOptional("lEnableMod",
-        reinterpret_cast<uintptr_t>(LoaderCore::ResolveExeTarget(kExelEnableMod, 1)),
-        &CheckModToggleSignature, reinterpret_cast<void*>(&EnableModDetour),
-        reinterpret_cast<void**>(&g_origEnableMod));
 
     // ---- UnloadDLL（RVA 0xF8E30 / 0xF9170，AOB 兜底；可选）----
     installOptional("UnloadDLL",

@@ -110,11 +110,10 @@ typedef void  (__fastcall* LuaInitFn)(void* ctx, const wchar_t* name);
 typedef void* (__fastcall* LoadUiFn)(void* state);
 
 // ---- 状态 ----
-// UI 对象只能在游戏/UI 线程操作；刷新请求由 Mod toggle detour 设置，
-// 具体销毁与重建只在 LoadUI detour 或明确的 UI 线程刷新点执行。
+// UI 对象只能在游戏/UI 线程操作；刷新请求由 RequestRefresh 设置，
+// 具体销毁与重建只在 LoadUI detour（或明确的 UI 线程刷新点）执行。
 std::atomic<bool> g_refreshRequested{ true };
 std::atomic<bool> g_injectionInProgress{ false };
-void* g_lastLoadUiState = nullptr;
 void* g_frontEndContext = nullptr;
 void* g_rootContext = nullptr;
 LoadUiFn g_origLoadUI = nullptr;
@@ -635,7 +634,6 @@ void* InjectSingleContext(const UiApi& api, void* mgr, void* parent,
 
 // 注入主体：在 LoadUI 原函数返回后调用。state = MainMenuState*。
 void InjectFrontEndUi(void* state) {
-    g_lastLoadUiState = state;
     const bool refresh = g_refreshRequested.exchange(false, std::memory_order_acq_rel);
 
     // 1) 读 UIManager 全局 + FrontEnd context 指针
@@ -776,11 +774,6 @@ void UiInject::ExtractResources() {
 
 void UiInject::RequestRefresh() {
     g_refreshRequested.store(true, std::memory_order_release);
-}
-
-void UiInject::RefreshOnUiThread() {
-    if (!g_lastLoadUiState) return;
-    RunInjectionSafely(g_lastLoadUiState);
 }
 
 bool UiInject::Install() {

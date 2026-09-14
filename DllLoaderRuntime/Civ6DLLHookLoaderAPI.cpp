@@ -69,9 +69,9 @@ static void SetPluginState(PluginEntry& entry, PluginState state) {
 
 // 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
 // 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
-// 游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）与 Loader 工作线程
-// （ReconcileGlobalPlugins）在此串行化。Runtime::MinHookMutex（MinHook 调用 + owner 表）与
-// PatchRegistry 的 CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
+// 唯一写者是游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）。
+// Runtime::MinHookMutex（MinHook 调用 + owner 表）与 PatchRegistry 的
+// CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
 static std::recursive_mutex g_pluginLifecycleMutex;
 
 // 插件回调在途登记 / 排空统一走 PluginInFlight（见 PluginInFlight.h）。
@@ -3885,29 +3885,6 @@ bool LoaderCore::LoadSinglePlugin(const std::wstring& path) {
     return LoadPluginDllInternal(path, ModScan::WideToNarrow(filename), CategoryForPath(path));
 }
 
-void LoaderCore::UnloadSinglePlugin(const std::wstring& path) {
-    const std::wstring norm = NormalizePluginPath(path);
-    std::wstring ownerId;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        for (const auto& entry : g_plugins) {
-            if (NormalizePluginPath(entry.path) != norm) continue;
-            if (entry.state != PluginState::Active) {
-                Logger::Log("UnloadSinglePlugin: inactive plugin remains parked: %s",
-                            ModScan::WideToNarrow(path).c_str());
-                return;
-            }
-            ownerId = entry.ownerId;
-            break;
-        }
-    }
-    if (!ownerId.empty()) {
-        UnloadPluginByOwnerId(ownerId);
-        Logger::Log("UnloadSinglePlugin: %s", ModScan::WideToNarrow(path).c_str());
-    }
-    // 未加载：no-op
-}
-
 bool LoaderCore::InitializeGameCorePhase() {
     lock_guard<std::recursive_mutex> transitionLock(g_gameCoreTransitionMutex);
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
@@ -3946,57 +3923,6 @@ bool LoaderCore::InitializeGameCorePhase() {
     FireGameCoreCallbackSnapshot(readySnapshot, "GameCoreReady");
     Logger::Log("InitializeGameCorePhase: OK");
     return true;
-}
-
-void LoaderCore::ReconcileGlobalPlugins() {
-    // 扫描（文件系统/sqlite）在锁外；下方对 g_plugins 的 diff 与加载/卸载整体持锁，
-    // 与游戏线程的 LoadPluginsOf（LoadDLL detour 内）串行化。
-    const auto expected = ModScan::FindGlobalPluginCandidates(LoaderCore::RuntimeModuleHandle());
-
-    std::unordered_set<std::wstring> expectedNorm;
-    expectedNorm.reserve(expected.size());
-    for (const auto& wpath : expected) {
-        expectedNorm.insert(NormalizePluginPath(wpath));
-    }
-
-    // 先卸载"当前有而期望无"的 Global 插件。
-    std::vector<std::wstring> toUnload;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        for (const auto& entry : g_plugins) {
-            if (entry.category != PluginCategory::Global) continue;
-            if (expectedNorm.count(NormalizePluginPath(entry.path))) continue;
-            toUnload.push_back(entry.path);
-        }
-    }
-    for (const auto& wpath : toUnload) {
-        UnloadSinglePlugin(wpath);
-    }
-
-    // 再加载"期望有而当前无"的 Global 插件。
-    std::unordered_set<std::wstring> currentNorm;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        currentNorm.reserve(g_plugins.size());
-        for (const auto& entry : g_plugins) {
-            if (entry.category == PluginCategory::Global) {
-                currentNorm.insert(NormalizePluginPath(entry.path));
-            }
-        }
-    }
-    size_t loaded = 0;
-    for (const auto& wpath : expected) {
-        if (currentNorm.count(NormalizePluginPath(wpath))) continue;
-        if (LoadSinglePlugin(wpath)) ++loaded;
-    }
-
-    size_t tracked = 0;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        tracked = g_plugins.size();
-    }
-    Logger::Log("ReconcileGlobalPlugins: unloaded=%zu loaded=%zu tracked=%zu",
-        toUnload.size(), loaded, tracked);
 }
 
 bool LoaderCore::IsInitialized() {

@@ -6,10 +6,10 @@
 //     规范化比较）通过才 spawn 工作线程；检测失败（被旧薄壳从 Mod 目录 LoadLibrary
 //     探测）→ 直接返回 TRUE，什么都不做。
 //   - WorkerMain（阶段 A）：LoaderCore::InitEarly → LoaderHooks::InstallAll
-//     → LoaderUpdate::CheckAndApplyUpdate → LoadPluginsOf(Global) → 事件循环。
-//   - 阶段 B（LoadDLL detour）在游戏线程 detour 内同步执行（LoaderCore::InitializeGameCorePhase）；
-//     阶段 C（EnableMod/DisableMod detour）经 LoaderCore::RequestReconcile 置标志 +
-//     SetEvent 唤醒工作线程执行 ReconcileGlobalPlugins（本文件实现两者）。
+//     → LoaderUpdate::CheckAndApplyUpdate → LoadPluginsOf(Global) → 线程退出。
+//   - 阶段 B（LoadDLL detour）在游戏线程 detour 内同步执行（LoaderCore::InitializeGameCorePhase）。
+//   - Global 插件仅启动时加载一次：运行期不再卸载/重装、也不再被 park；
+//     主菜单开关 mod 需要重启才生效。
 
 #include "pch.h"
 
@@ -32,8 +32,6 @@ namespace {
 // ---- 工作线程共享状态（匿名命名空间，避免与 LoaderCore 命名空间符号冲突）----
 
 HMODULE g_runtimeModule = nullptr;               // 本模块句柄（DllMain 休眠检测通过后设置）
-HANDLE g_wakeEvent = nullptr;                    // 手动重置事件：RequestReconcile SetEvent；WorkerMain Wait 返回后 ResetEvent
-std::atomic<bool> g_reconcileRequested{ false }; // 阶段 C 合并去抖标志
 
 // 取模块所在目录（去掉文件名部分）。失败返回空串。
 std::wstring ModuleDirectory(HMODULE hModule) {
@@ -66,17 +64,16 @@ bool LoadedFromExeDirectory(HMODULE hModule) {
     return NormalizeDir(ModuleDirectory(hModule)) == NormalizeDir(ModuleDirectory(nullptr));
 }
 
-// 阶段 A + 事件循环（§4.1）。步骤顺序即设计文档阶段 A 顺序。
+// 阶段 A（§4.1）：跑完启动序列即返回的一次性工作线程。步骤顺序即设计文档阶段 A 顺序。
+// Global 插件仅在此加载一次；之后主菜单开关 mod 只在下次启动生效。
 DWORD WINAPI WorkerMain(LPVOID) {
-    g_wakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // 手动重置事件
-
     // 1) 基础初始化：Logger / PdataMatch / MinHook
     LoaderCore::InitEarly();
 
     // 1.5) 释放内嵌 FrontEnd UI 资源到 exe 目录的 Civ6DllLoader 子目录
     UiInject::ExtractResources();
 
-    // 2) hook 安装（LoadDLL / lEnableMod / lDisableMod；失败静默降级）
+    // 2) hook 安装（LoadDLL / UnloadDLL；失败静默降级）
     if (!LoaderHooks::InstallAll()) {
         Logger::Log("hook 安装降级");
     }
@@ -89,22 +86,10 @@ DWORD WINAPI WorkerMain(LPVOID) {
     // 3) 自更新检查
     LoaderUpdate::CheckAndApplyUpdate();
 
-    // 4) 阶段 A：加载启用 Mod 的 Global 插件
+    // 4) 阶段 A：加载启用 Mod 的 Global 插件（仅此一次；运行期不重查，开关 mod 重启生效）
     LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::Global);
 
-    // 5) 事件循环：阶段 C（主菜单开关 Mod → RequestReconcile）合并去抖后重查启用集
-    for (;;) {
-        if (g_wakeEvent) {
-            WaitForSingleObject(g_wakeEvent, INFINITE);
-            ResetEvent(g_wakeEvent);
-        } else {
-            Sleep(200);  // 事件创建失败兜底，避免忙循环
-        }
-        if (g_reconcileRequested.exchange(false)) {
-            LoaderCore::ReconcileGlobalPlugins();
-        }
-    }
-    return 0;  // unreachable
+    return 0;
 }
 
 }  // namespace
@@ -153,15 +138,6 @@ void LoaderCore::InitEarly() {
     }
     if (!Runtime::InitMinHook()) {
         Logger::Log("InitEarly: Runtime::InitMinHook 失败（hook 功能不可用，继续）");
-    }
-}
-
-// ---- 阶段 C 唤醒请求（S3a，本文件实现；EnableMod/DisableMod detour 调用）----
-void LoaderCore::RequestReconcile() {
-    UiInject::RequestRefresh();
-    g_reconcileRequested.store(true);
-    if (g_wakeEvent) {
-        SetEvent(g_wakeEvent);
     }
 }
 
