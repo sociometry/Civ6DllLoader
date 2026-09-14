@@ -1345,7 +1345,7 @@ static int32_t GameEventReadInt32Safe(const void* addr) {
 static void* GetCurrentGameSlot() {
     if (!g_gameEventContainerHit ||
             !ImageAddress::Contains(kHookImageGameCoreXP2, g_gameEventContainerHit)) {
-        g_gameEventContainerHit = ResolveByPatternImpl(kHookImageGameCoreXP2,
+        g_gameEventContainerHit = ResolveByPatternCore(kHookImageGameCoreXP2,
             kGameEventCurrentGamePattern, kSectionText);
         if (!g_gameEventContainerHit) return nullptr;
     }
@@ -1387,7 +1387,7 @@ void* GetActiveLuaStateImpl() {
             }
         }
         if (!slot) {
-            void* hit = ResolveByPatternImpl(image, kLuaSingletonPattern, kSectionText);
+            void* hit = ResolveByPatternCore(image, kLuaSingletonPattern, kSectionText);
             if (hit) {
                 g_activeLuaStateHit = hit;
                 const int32_t disp = GameEventReadInt32Safe(static_cast<const char*>(hit) + 3);
@@ -1721,7 +1721,7 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
 void* ResolveCurrentGameCoreByName(const char* name) {
     const HookImageId image = ImageAddress::LoadedGameCore();
     if (image == kHookImageInvalid) return nullptr;
-    return ResolveByNameImpl(image, name);
+    return ResolveByNameCore(image, name);
 }
 
 using PushMethodsNoFunc = void(__fastcall*)(hks::lua_State* L, int stackOffset);
