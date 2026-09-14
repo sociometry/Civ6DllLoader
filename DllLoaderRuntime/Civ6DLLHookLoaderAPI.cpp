@@ -20,7 +20,9 @@
 #include "PdataMatch.h"
 #include "ImageAddress.h"
 #include "PluginBoundary.h"
+#include "PluginInFlight.h"
 
+#include <cstdarg>
 #include <cstdarg>
 #include <cstdlib>
 #include <cwchar>
@@ -57,6 +59,14 @@ struct PluginEntry {
 };
 static vector<PluginEntry> g_plugins;
 
+// 插件状态的唯一写入口：state 与 PluginInFlight 的放行镜像必须一起更新，
+// 否则会出现"状态已停用、回调仍被放行"（或反之）的错位。
+static void SetPluginState(PluginEntry& entry, PluginState state) {
+    entry.state = state;
+    PluginInFlight::SetAllowed(PluginInFlight::Resolve(entry.ownerId),
+        state == PluginState::Loading || state == PluginState::Active);
+}
+
 // 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
 // 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
 // 游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）与 Loader 工作线程
@@ -64,82 +74,15 @@ static vector<PluginEntry> g_plugins;
 // PatchRegistry 的 CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
 static std::recursive_mutex g_pluginLifecycleMutex;
 
-// 脚本全局 / GameEvent 的插件回调在快照锁外执行。按 owner 记录在途调用，
-// 卸载先将插件切到 Deactivating/Quarantined，再等待计数归零，避免 OnUnload
-// 释放插件状态后仍有旧快照进入插件代码。
-struct PluginCallbackState {
-    std::atomic<uint32_t> activeCalls{ 0 };
-    std::mutex drainMutex;
-    std::condition_variable drainCv;
-};
-static std::unordered_map<std::wstring, std::shared_ptr<PluginCallbackState>>
-    g_pluginCallbackStates;
-
-class PluginCallbackGuard {
-public:
-    PluginCallbackGuard() = default;
-    explicit PluginCallbackGuard(std::shared_ptr<PluginCallbackState> state)
-        : state_(std::move(state)) {}
-    PluginCallbackGuard(const PluginCallbackGuard&) = delete;
-    PluginCallbackGuard& operator=(const PluginCallbackGuard&) = delete;
-    PluginCallbackGuard(PluginCallbackGuard&& other) noexcept
-        : state_(std::move(other.state_)) {}
-    PluginCallbackGuard& operator=(PluginCallbackGuard&& other) noexcept {
-        if (this != &other) {
-            Release();
-            state_ = std::move(other.state_);
-        }
-        return *this;
-    }
-    ~PluginCallbackGuard() { Release(); }
-
-    explicit operator bool() const { return state_ != nullptr; }
-
-private:
-    void Release() {
-        if (!state_) return;
-        if (state_->activeCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            lock_guard<mutex> lock(state_->drainMutex);
-            state_->drainCv.notify_all();
-        }
-        state_.reset();
-    }
-
-    std::shared_ptr<PluginCallbackState> state_;
-};
-
-static PluginCallbackGuard TryEnterPluginCallback(const std::wstring& owner) {
-    if (owner.empty()) return {};
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
-        [&owner](const PluginEntry& entry) {
-            return entry.ownerId == owner &&
-                (entry.state == PluginState::Loading ||
-                 entry.state == PluginState::Active);
-        });
-    if (plugin == g_plugins.end()) return {};
-
-    auto& state = g_pluginCallbackStates[owner];
-    if (!state) state = std::make_shared<PluginCallbackState>();
-    state->activeCalls.fetch_add(1, std::memory_order_acq_rel);
-    // 表项必须继续持有计数状态；守卫只复制 shared_ptr，不能把表项移空。
-    return PluginCallbackGuard(state);
-}
-
-static void WaitForPluginCallbacks(const std::wstring& owner) {
-    if (owner.empty()) return;
-    std::shared_ptr<PluginCallbackState> state;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        const auto it = g_pluginCallbackStates.find(owner);
-        if (it == g_pluginCallbackStates.end()) return;
-        state = it->second;
-    }
-    unique_lock<mutex> drainLock(state->drainMutex);
-    state->drainCv.wait(drainLock, [&state] {
-        return state->activeCalls.load(std::memory_order_acquire) == 0;
-    });
-}
+// 插件回调在途登记 / 排空统一走 PluginInFlight（见 PluginInFlight.h）。
+// 原先进程里散着几套等价实现（本文件的 PluginCallbackState / PluginCallbackGuard /
+// TryEnterPluginCallback / WaitForPluginCallbacks，以及消息总线自己的
+// enabled + activeCalls + drainCv），本次合并为一套：
+//  - 状态门禁：写 PluginEntry::state 时经 SetPluginState 同步镜像到
+//    PluginInFlight::SetAllowed（唯一写者）；
+//  - 在途记账：四个"加载器 -> 插件"入口（ScriptGlobals / ScriptGlobalsUI /
+//    GameEvent / PushMethods）改走 PluginInFlight::Enter；
+//  - 排空：卸载/隔离与消息总线注销统一调 PluginInFlight::WaitAll。
 
 // OnLoad/OnUnload 的快速 owner 上下文。异步调用不依赖它，而由回调/调用方地址反查
 // 所属插件模块，避免错误归为 Loader 导致插件停用后钩子仍生效。
@@ -1372,6 +1315,8 @@ struct RegisteredGameEvent {
     GameEventPushFn luaPushFn = nullptr;        // Lua 路径：压参数并返回个数
     std::wstring ownerId;                 // 注册者插件 owner（卸载/隔离按 owner 清理）
     char name[kGameEventNameMax] = {};    // 名字副本（对象末尾，长期存活；name[0]==0 即空槽）
+    // 登记时解析一次并常驻：触发路径的守卫不再做宽字符串哈希。
+    PluginInFlight::Owner* inFlight = nullptr;
 };
 static RegisteredGameEvent g_gameEvents[kMaxRegisteredGameEvents];
 
@@ -1480,6 +1425,7 @@ static void CleanupGameEventsForOwner(const std::wstring& owner) {
         if (ev.name[0] == '\0' || ev.ownerId != owner) continue;
         ev.name[0] = '\0';
         ev.ownerId.clear();
+        ev.inFlight = nullptr;
         ++cleaned;
     }
     if (cleaned == 0) return;
@@ -1654,7 +1600,7 @@ static bool GameEventInvokeLua(const char* name, GameEventPushFn pushFn,
 }
 
 // 手动触发一次：查找注册记录，仅 Lua 路径（内化）。未注册或 luaPushFn 为 null → false。
-// 查到记录后先取 owner 在途守卫（TryEnterPluginCallback）——插件卸载/隔离期间拒绝触发，
+// 查到记录后先取 owner 在途守卫（PluginInFlight::Enter）——插件卸载/隔离期间拒绝触发，
 // 避免在途调用踩到已回滚的注册（与远程对引擎桥路径的加固同款）。
 #pragma intrinsic(_ReturnAddress)
 
@@ -1679,6 +1625,7 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
 
     GameEventPushFn luaPushFn = nullptr;
     std::wstring owner;
+    PluginInFlight::Owner* inFlight = nullptr;
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
         PluginBoundary::LoaderLockScope pbLockScope;
@@ -1686,6 +1633,7 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
             if (ev.name[0] && nameCopy == ev.name) {
                 luaPushFn = ev.luaPushFn;
                 owner = ev.ownerId;
+                inFlight = ev.inFlight;
                 break;
             }
         }
@@ -1703,7 +1651,9 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
             return false;
         }
     }
-    auto callbackGuard = TryEnterPluginCallback(owner);
+    // 缓存指针为空（老数据 / 异常路径）时退化为按 owner 字符串解析一次。
+    if (!inFlight) inFlight = PluginInFlight::Resolve(owner);
+    auto callbackGuard = PluginInFlight::Enter(inFlight, PluginInFlight::Kind::GameEvent);
     if (!callbackGuard) {
         Logger::Log("TriggerGameEvent: rejected for inactive owner=%ls name=%s",
             owner.c_str(), nameCopy.c_str());
@@ -1761,6 +1711,7 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
     }
     slot->luaPushFn = pushFn;
     slot->ownerId = *owner;
+    slot->inFlight = PluginInFlight::Resolve(*owner);
     memcpy(slot->name, nameCopy.c_str(), nameLength);
     slot->name[nameLength] = '\0';
     Logger::Log("GameEvent: registered Lua-event \"%s\" pushFn=%p", nameCopy.c_str(), pushFn);
@@ -1947,6 +1898,8 @@ namespace {
 struct ScriptGlobalsEntry {
     std::wstring owner;
     ScriptGlobalsFn fn;
+    // 登记时解析一次并常驻：运行时守卫不再做宽字符串哈希。
+    PluginInFlight::Owner* inFlight = nullptr;
 };
 
 std::vector<ScriptGlobalsEntry> g_scriptGlobals;
@@ -1981,7 +1934,10 @@ void __cdecl Hook_RegisterScriptData(hks::lua_State* L) {
     size_t i = 0;
     for (const auto& entry : snapshot) {
         Logger::Log("RegisterScriptData: registrar[%zu] begin", i);
-        auto callbackGuard = TryEnterPluginCallback(entry.owner);
+        PluginInFlight::Owner* owner = entry.inFlight;
+        if (!owner) owner = PluginInFlight::Resolve(entry.owner);
+        auto callbackGuard =
+            PluginInFlight::Enter(owner, PluginInFlight::Kind::ScriptGlobals);
         if (callbackGuard) {
             CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
         } else {
@@ -2004,7 +1960,10 @@ void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State
     SharedDetourActivity activity;
     const auto snapshot = SnapshotScriptGlobals(g_scriptGlobalsUI);
     for (const auto& entry : snapshot) {
-        auto callbackGuard = TryEnterPluginCallback(entry.owner);
+        PluginInFlight::Owner* owner = entry.inFlight;
+        if (!owner) owner = PluginInFlight::Resolve(entry.owner);
+        auto callbackGuard =
+            PluginInFlight::Enter(owner, PluginInFlight::Kind::ScriptGlobalsUI);
         if (callbackGuard) {
             CallScriptGlobalsSafe(entry.fn, reinterpret_cast<void*>(L));
         }
@@ -2326,7 +2285,8 @@ void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
                                         "RegisterScriptGlobals");
         if (!owner) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
-        g_scriptGlobals.push_back(ScriptGlobalsEntry{ *owner, fn });
+        g_scriptGlobals.push_back(
+            ScriptGlobalsEntry{ *owner, fn, PluginInFlight::Resolve(*owner) });
     }
     EnsureScriptHooksInstalled();  // 内部自带生命周期锁（含并发首装与重载后重装）
 }
@@ -2340,7 +2300,8 @@ void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
                                         "RegisterScriptGlobalsForUI");
         if (!owner) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
-        g_scriptGlobalsUI.push_back(ScriptGlobalsEntry{ *owner, fn });
+        g_scriptGlobalsUI.push_back(
+            ScriptGlobalsEntry{ *owner, fn, PluginInFlight::Resolve(*owner) });
     }
     EnsureScriptHooksInstalled();
 }
@@ -2353,6 +2314,9 @@ struct NoManagerHookSlot {
     void* target = nullptr;
     PushMethodsNoFunc base = nullptr;
     vector<StoredLuaMethod> methods;
+    // 与 methods 平行的 owner 缓存：detour 热路径按索引取，不做宽字符串哈希。
+    // 同一 target 的槽位可容纳多个 owner 的方法，所以必须是逐方法的表。
+    vector<PluginInFlight::Owner*> methodOwners;
     bool used = false;
 };
 
@@ -2360,24 +2324,74 @@ struct WithManagerHookSlot {
     void* target = nullptr;
     PushMethodsWithFunc base = nullptr;
     vector<StoredLuaMethod> methods;
+    vector<PluginInFlight::Owner*> methodOwners;
     bool used = false;
 };
 
 NoManagerHookSlot g_noManagerSlots[kMaxPushHooks];
 WithManagerHookSlot g_withManagerSlots[kMaxPushHooks];
 
+// 合并后重建槽位的 owner 平行表：已存在的方法沿用旧指针（按 exposedName 匹配），
+// 新方法解析一次。只在安装/重放这条冷路径上跑，detour 热路径零哈希。
+template <typename Slot>
+vector<PluginInFlight::Owner*> RebuildSlotOwners(
+        const Slot& slot, const vector<StoredLuaMethod>& merged) {
+    vector<PluginInFlight::Owner*> owners;
+    owners.reserve(merged.size());
+    for (const auto& method : merged) {
+        PluginInFlight::Owner* cached = nullptr;
+        for (size_t k = 0; k < slot.methods.size(); ++k) {
+            if (slot.methods[k].exposedName == method.exposedName) {
+                if (k < slot.methodOwners.size()) cached = slot.methodOwners[k];
+                break;
+            }
+        }
+        if (!cached) cached = PluginInFlight::Resolve(method.owner);
+        owners.push_back(cached);
+    }
+    return owners;
+}
+
+// 槽位方法表与 owner 平行表必须锁步维护：这里按 owner 删除，两张表用同一套
+// 索引压缩，避免错位。
+template <typename Slot>
+size_t RemoveOwnedSlotMethods(Slot& slot, const std::wstring& owner) {
+    size_t removed = 0;
+    size_t write = 0;
+    for (size_t read = 0; read < slot.methods.size(); ++read) {
+        if (slot.methods[read].owner == owner) {
+            ++removed;
+            continue;
+        }
+        if (write != read) {
+            slot.methods[write] = std::move(slot.methods[read]);
+            if (read < slot.methodOwners.size()) {
+                slot.methodOwners[write] = slot.methodOwners[read];
+            }
+        }
+        ++write;
+    }
+    slot.methods.resize(write);
+    if (slot.methodOwners.size() > write) slot.methodOwners.resize(write);
+    return removed;
+}
+
 // 注入一个插件登记的 Lua 方法：owner 已进入停用/隔离流程时跳过。
 //
 // 为什么必须加这道守卫：detour 先在 g_pushStateMutex 内快照 slot.methods，再在锁外逐个
 // 注入。若快照之后该插件开始停用，RemovePluginOwnedRegistrations 会清空 slot，而本 detour
 // 仍会把已快照的函数指针重新塞回 Lua 表（闭包一旦注册进 Lua 表就没有撤销路径）。
-// 加上守卫后：停用流程里的 WaitForPluginCallbacks 会等待在途注入结束，之后才清空登记；
-// 之后的调用因 owner 非 Loading/Active 被拒绝，不会再有新注入。
+// 加上守卫后：停用流程里的 PluginInFlight::WaitAll 会等待在途注入结束，之后才清空登记；
+// 之后的调用因 owner 的 allowed 镜像为 false 被拒绝，不会再有新注入。
 // 边界：这只防"卸载后又被重新注入"。已进入 Lua 表的闭包仍然存在（backlog，未解决）。
 static bool PushStoredMethodIfActive(hks::lua_State* L, const StoredLuaMethod& method,
-                                     int stackOffset) {
+                                     PluginInFlight::Owner* cachedOwner, int stackOffset) {
     if (!method.owner.empty()) {
-        auto guard = TryEnterPluginCallback(method.owner);
+        // 优先用安装时缓存的 owner 条目；为 null（老数据 / 异常路径）退化为按
+        // owner 字符串解析一次，绝不解引用空指针。
+        PluginInFlight::Owner* owner = cachedOwner;
+        if (!owner) owner = PluginInFlight::Resolve(method.owner);
+        auto guard = PluginInFlight::Enter(owner, PluginInFlight::Kind::PushMethods);
         if (!guard) return false;
     }
     PushLuaMethod(L, reinterpret_cast<hks::luaFunc>(method.luaMethodFunc),
@@ -2391,16 +2405,19 @@ void __fastcall DetourPushNoManager(hks::lua_State* L, int stackOffset) {
     // 拷贝快照后在锁外回调：methods 可能被 Loader 工作线程（插件卸载清理）并发修改，
     // 快照同时把函数指针与 internalName/exposedName 字符串一并拷贝，锁外安全使用。
     std::vector<StoredLuaMethod> methods;
+    std::vector<PluginInFlight::Owner*> methodOwners;
     PushMethodsNoFunc base = nullptr;
     {
         lock_guard<mutex> lock(g_pushStateMutex);
         methods = g_noManagerSlots[I].methods;
+        methodOwners = g_noManagerSlots[I].methodOwners;
         base = g_noManagerSlots[I].base;
     }
-    for (auto& method : methods) {
-        if (!PushStoredMethodIfActive(L, method, stackOffset)) {
+    for (size_t i = 0; i < methods.size(); ++i) {
+        PluginInFlight::Owner* owner = i < methodOwners.size() ? methodOwners[i] : nullptr;
+        if (!PushStoredMethodIfActive(L, methods[i], owner, stackOffset)) {
             Logger::Log("DetourPushNoManager<%d>: skipped %s (owner=%ls inactive)",
-                I, method.exposedName.c_str(), method.owner.c_str());
+                I, methods[i].exposedName.c_str(), methods[i].owner.c_str());
         }
     }
     if (base) {
@@ -2412,16 +2429,19 @@ template<int I>
 void __fastcall DetourPushWithManager(void* manager, hks::lua_State* L, int stackOffset) {
     SharedDetourActivity activity;
     std::vector<StoredLuaMethod> methods;
+    std::vector<PluginInFlight::Owner*> methodOwners;
     PushMethodsWithFunc base = nullptr;
     {
         lock_guard<mutex> lock(g_pushStateMutex);
         methods = g_withManagerSlots[I].methods;
+        methodOwners = g_withManagerSlots[I].methodOwners;
         base = g_withManagerSlots[I].base;
     }
-    for (auto& method : methods) {
-        if (!PushStoredMethodIfActive(L, method, stackOffset)) {
+    for (size_t i = 0; i < methods.size(); ++i) {
+        PluginInFlight::Owner* owner = i < methodOwners.size() ? methodOwners[i] : nullptr;
+        if (!PushStoredMethodIfActive(L, methods[i], owner, stackOffset)) {
             Logger::Log("DetourPushWithManager<%d>: skipped %s (owner=%ls inactive)",
-                I, method.exposedName.c_str(), method.owner.c_str());
+                I, methods[i].exposedName.c_str(), methods[i].owner.c_str());
         }
     }
     if (base) {
@@ -2533,9 +2553,12 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
         if (!state.base) state = NoManagerHookSlot{};
         return nullptr;
     }
+    // owner 平行表在 swap 之前按旧表重建（已存在的方法沿用旧指针，新方法解析一次）。
+    auto mergedOwners = RebuildSlotOwners(state, merged);
     if (state.base) {
         // 相同方法重复安装/重放不会重复注入；整批验证成功后才发布。
         state.methods.swap(merged);
+        state.methodOwners.swap(mergedOwners);
         return reinterpret_cast<void*>(state.base);
     }
 
@@ -2561,6 +2584,7 @@ void* InstallPushMethodsNoManager(void* target, const std::vector<StoredLuaMetho
         L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
     };
     state.methods.swap(merged);
+    state.methodOwners.swap(mergedOwners);
     return reinterpret_cast<void*>(state.base);
 }
 
@@ -2587,8 +2611,11 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
         if (!state.base) state = WithManagerHookSlot{};
         return nullptr;
     }
+    // owner 平行表在 swap 之前按旧表重建（已存在的方法沿用旧指针，新方法解析一次）。
+    auto mergedOwners = RebuildSlotOwners(state, merged);
     if (state.base) {
         state.methods.swap(merged);
+        state.methodOwners.swap(mergedOwners);
         return reinterpret_cast<void*>(state.base);
     }
 
@@ -2612,6 +2639,7 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
         L"", HookKind::PushMethods, ImageAddress::GameCoreGeneration()
     };
     state.methods.swap(merged);
+    state.methodOwners.swap(mergedOwners);
     return reinterpret_cast<void*>(state.base);
 }
 
@@ -3468,7 +3496,7 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     entry.name = pluginStem;
     entry.ownerId = NormalizePluginPath(wpath);
     entry.category = category;
-    entry.state = PluginState::Loading;
+    SetPluginState(entry, PluginState::Loading);
     const std::wstring ownerId = entry.ownerId;
     g_plugins.push_back(std::move(entry));
 
@@ -3517,7 +3545,7 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         g_bus.UnregisterOwner(ownerId);
         return false;
     }
-    activate->state = PluginState::Active;
+    SetPluginState(*activate, PluginState::Active);
     return true;
 }
 
@@ -3609,10 +3637,10 @@ static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
     {
         lock_guard<mutex> stateLock(g_pushStateMutex);
         for (auto& slot : g_noManagerSlots) {
-            if (slot.used) methods += removeOwnedBy(slot.methods);
+            if (slot.used) methods += RemoveOwnedSlotMethods(slot, owner);
         }
         for (auto& slot : g_withManagerSlots) {
-            if (slot.used) methods += removeOwnedBy(slot.methods);
+            if (slot.used) methods += RemoveOwnedSlotMethods(slot, owner);
         }
     }
 
@@ -3645,7 +3673,7 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
         lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
         for (auto& entry : g_plugins) {
             if (entry.ownerId == ownerId) {
-                entry.state = PluginState::Quarantined;
+                SetPluginState(entry, PluginState::Quarantined);
                 break;
             }
         }
@@ -3653,7 +3681,7 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
     // 先禁用并排空所有外部入口；等待期间不得持 lifecycle 锁。
     RemoveGameCoreCallbacksFor(ownerId);
     g_bus.UnregisterOwner(ownerId);
-    WaitForPluginCallbacks(ownerId);
+    PluginInFlight::WaitAll(PluginInFlight::Resolve(ownerId), ownerId.c_str());
     PatchRegistry::RevertAllFor(ownerId.c_str());
     RemovePluginHooks(ownerId.c_str());
     // 隔离路径也必须撤销参数捕获站点；否则站点仍会向插件的 out 槽写入数据。
@@ -3678,7 +3706,7 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
         return;
     }
 
-    g_plugins[index].state = PluginState::Deactivating;
+    SetPluginState(g_plugins[index], PluginState::Deactivating);
     PluginEntry entry = g_plugins[index];
 
     // 先阻止并排空消息回调，避免 OnUnload 释放插件状态时旧快照仍在执行。
@@ -3688,7 +3716,7 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
     g_bus.UnregisterOwner(entry.ownerId);
     // 脚本全局/GameEvent 入口使用快照并在锁外执行；先排空 owner 的在途调用，
     // 再进入 OnUnload，避免插件状态被释放后旧回调继续访问。
-    WaitForPluginCallbacks(entry.ownerId);
+    PluginInFlight::WaitAll(PluginInFlight::Resolve(entry.ownerId), entry.ownerId.c_str());
     auto onUnload = (OnUnloadFunc)GetProcAddress(entry.handle, "OnUnload");
     SetActivePluginContext(entry.ownerId, entry.handle);
     if (onUnload) CallOnUnloadSafe(onUnload, nullptr);

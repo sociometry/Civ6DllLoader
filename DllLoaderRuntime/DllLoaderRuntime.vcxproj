@@ -119,6 +119,7 @@
     <ClInclude Include="LoaderUpdate.h" />
     <ClInclude Include="PatchRegistry.h" />
     <ClInclude Include="PluginBoundary.h" />
+    <ClInclude Include="PluginInFlight.h" />
     <ClInclude Include="UiInject.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
@@ -130,6 +131,7 @@
     <ClCompile Include="LoaderHooks.cpp" />
     <ClCompile Include="PatchRegistry.cpp" />
     <ClCompile Include="PluginBoundary.cpp" />
+    <ClCompile Include="PluginInFlight.cpp" />
     <ClCompile Include="UiInject.cpp" />
     <ClCompile Include="..\common\ModScan.cpp" />
     <ClCompile Include="..\common\RuntimePackage.cpp" />

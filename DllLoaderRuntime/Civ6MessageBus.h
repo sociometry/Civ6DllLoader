@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace PluginInFlight { struct Owner; }
+
 class Civ6MessageBus {
 public:
     using MessageHandler = std::function<void(const char* topic, const void* data, size_t len)>;
@@ -41,16 +43,13 @@ private:
     struct HandlerEntry {
         std::wstring owner;
         MessageHandler handler;
-        std::atomic<bool> enabled{ true };
-        std::atomic<uint32_t> activeCalls{ 0 };
-        std::mutex drainMutex;
-        std::condition_variable drainCv;
+        // 在途记账 / 门禁统一走 PluginInFlight（注册时解析一次，见 .cpp）。
+        PluginInFlight::Owner* inFlight = nullptr;
     };
 
     using HandlerPtr = std::shared_ptr<HandlerEntry>;
     static void InvokeEntry(const HandlerPtr& entry, const char* topic,
                             const void* data, size_t len, const char* name);
-    static void DisableAndDrain(const std::vector<HandlerPtr>& entries);
 
     std::mutex mtx_;
     std::unordered_map<std::string, HandlerPtr> handlers_;

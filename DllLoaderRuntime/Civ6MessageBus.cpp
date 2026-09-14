@@ -1,36 +1,14 @@
 #include "pch.h"
 #include "Civ6MessageBus.h"
+#include "PluginInFlight.h"
 #include "../common/Logger.h"
+#include <algorithm>
 #include <unordered_map>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace {
-struct HandlerCallFrame;
-thread_local const HandlerCallFrame* g_handlerCallStack = nullptr;
-
-// 栈上链表记录整个同步回调链，不分配内存；嵌套/递归返回后自动恢复。
-struct HandlerCallFrame {
-    const void* entry;
-    const HandlerCallFrame* previous;
-
-    explicit HandlerCallFrame(const void* handlerEntry) noexcept
-        : entry(handlerEntry), previous(g_handlerCallStack) {
-        g_handlerCallStack = this;
-    }
-    ~HandlerCallFrame() { g_handlerCallStack = previous; }
-    HandlerCallFrame(const HandlerCallFrame&) = delete;
-    HandlerCallFrame& operator=(const HandlerCallFrame&) = delete;
-};
-
-size_t ActiveCallsOnThisThread(const void* entry) {
-    size_t count = 0;
-    for (const auto* frame = g_handlerCallStack; frame; frame = frame->previous) {
-        if (frame->entry == entry) ++count;
-    }
-    return count;
-}
 
 // SEH thunk：__try 不能与带析构的局部对象同函数，独立成 noinline 函数。
 // 工程以 /EHsc 编译，catch(...) 捕不住访问违例等硬件异常——插件 OnMessage
@@ -64,52 +42,52 @@ bool Civ6MessageBus::RegisterHandler(const std::string& name, MessageHandler han
     auto replacement = std::make_shared<HandlerEntry>();
     replacement->owner = owner;
     replacement->handler = std::move(handler);
-    std::vector<HandlerPtr> replaced;
+    // 登记时解析一次：运行时的在途守卫按 owner 记账，不再做宽字符串哈希。
+    replacement->inFlight = PluginInFlight::Resolve(owner);
     {
         std::lock_guard<std::mutex> lock(mtx_);
         if (canRegister && !canRegister()) return false;
         const auto existing = handlers_.find(name);
-        if (existing != handlers_.end()) {
-            if (existing->second->owner != owner) {
-                Logger::Log("Message handler name conflict rejected: %s", name.c_str());
-                return false;
-            }
-            replaced.push_back(existing->second);
+        if (existing != handlers_.end() && existing->second->owner != owner) {
+            Logger::Log("Message handler name conflict rejected: %s", name.c_str());
+            return false;
         }
         handlers_[name] = std::move(replacement);
     }
-    DisableAndDrain(replaced);
+    // 覆盖旧 entry 不单独排空：异 owner 的覆盖已被拒绝，新旧 entry 同 owner，
+    // 在途调用按 owner 记账，由 owner 级 WaitAll 统一等。
     return true;
 }
 
 void Civ6MessageBus::UnregisterHandler(const std::string& name) {
-    std::vector<HandlerPtr> removed;
+    std::wstring owner;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = handlers_.find(name);
-        if (it != handlers_.end()) {
-            removed.push_back(it->second);
-            handlers_.erase(it);
-        }
+        if (it == handlers_.end()) return;
+        owner = it->second->owner;
+        handlers_.erase(it);
     }
-    DisableAndDrain(removed);
+    // 先摘表项，再在总线锁外排空该 owner 的在途回调。
+    PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
 }
 
 void Civ6MessageBus::UnregisterOwner(const std::wstring& owner) {
     if (owner.empty()) return;
-    std::vector<HandlerPtr> removed;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto it = handlers_.begin(); it != handlers_.end(); ) {
             if (it->second->owner == owner) {
-                removed.push_back(it->second);
                 it = handlers_.erase(it);
             } else {
                 ++it;
             }
         }
     }
-    DisableAndDrain(removed);
+    // 先摘表项，再在总线锁外排空该 owner 的在途回调：等待期间绝不能持 mtx_
+    // （回调线程的 Enter / 注册路径都要进总线锁，持锁等待会成环）。
+    // 调用方通常已经 SetAllowed(false)；此处只负责等干净。
+    PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
 }
 
 void Civ6MessageBus::Clear() {
@@ -119,7 +97,15 @@ void Civ6MessageBus::Clear() {
         for (const auto& [name, entry] : handlers_) removed.push_back(entry);
         handlers_.clear();
     }
-    DisableAndDrain(removed);
+    // 摘表项（上面，持锁）与排空（下面，锁外）分开：WaitAll 绝不能在 mtx_ 内调用。
+    std::vector<std::wstring> waited;
+    for (const auto& entry : removed) {
+        if (!entry) continue;
+        const std::wstring& owner = entry->owner;
+        if (std::find(waited.begin(), waited.end(), owner) != waited.end()) continue;
+        waited.push_back(owner);
+        PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
+    }
 }
 
 void Civ6MessageBus::Broadcast(const char* topic, const void* data, size_t len) {
@@ -149,31 +135,10 @@ void Civ6MessageBus::SendTo(const std::string& targetName, const char* topic, co
 
 void Civ6MessageBus::InvokeEntry(const HandlerPtr& entry, const char* topic,
                                  const void* data, size_t len, const char* name) {
-    if (!entry || !entry->enabled.load(std::memory_order_acquire)) return;
-    entry->activeCalls.fetch_add(1, std::memory_order_acq_rel);
-    if (entry->enabled.load(std::memory_order_acquire)) {
-        const HandlerCallFrame frame(entry.get());
-        InvokeHandler(entry->handler, topic, data, len, name);
-    }
-    {
-        std::lock_guard<std::mutex> lock(entry->drainMutex);
-        entry->activeCalls.fetch_sub(1, std::memory_order_acq_rel);
-    }
-    // 嵌套清理可能等的是“只剩本线程的 N 层”，因此每次退出都要通知。
-    entry->drainCv.notify_all();
-}
-
-void Civ6MessageBus::DisableAndDrain(const std::vector<HandlerPtr>& entries) {
-    for (const auto& entry : entries) {
-        entry->enabled.store(false, std::memory_order_release);
-    }
-    for (const auto& entry : entries) {
-        // 本线程整条回调链（含重复递归帧）必须自然返回，不能同步等待自己；
-        // 其它线程的调用仍需排空。InvokeEntry 的 shared_ptr 快照保活旧 entry。
-        const size_t localCalls = ActiveCallsOnThisThread(entry.get());
-        std::unique_lock<std::mutex> lock(entry->drainMutex);
-        entry->drainCv.wait(lock, [&entry, localCalls] {
-            return entry->activeCalls.load(std::memory_order_acquire) <= localCalls;
-        });
-    }
+    if (!entry) return;
+    auto guard = PluginInFlight::Enter(entry->inFlight, PluginInFlight::Kind::Message);
+    // inFlight 为空 = 没有插件 owner（Loader 自身的处理器）：它没有状态机、没有
+    // 放行镜像，直接放行（这不是给 "Loader" 的特判）。非空时门禁由 allowed 镜像决定。
+    if (entry->inFlight && !guard) return;
+    InvokeHandler(entry->handler, topic, data, len, name);
 }
