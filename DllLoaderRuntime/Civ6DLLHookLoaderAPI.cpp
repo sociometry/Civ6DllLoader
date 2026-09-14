@@ -234,7 +234,14 @@ public:
 
 namespace fs = std::filesystem;
 
-static std::optional<std::wstring> ResolvePluginOwnerForAddress(const void* codeAddress) {
+// owner 归属查询的返回：ownerId + 该 owner 的插件类别（Global / GameCore）。
+// 类别在同一次 g_plugins 遍历里带回，不额外加锁、不额外遍历。
+struct CallerPluginInfo {
+    std::wstring ownerId;
+    LoaderCore::PluginCategory category = LoaderCore::PluginCategory::Global;
+};
+
+static std::optional<CallerPluginInfo> ResolvePluginOwnerForAddress(const void* codeAddress) {
     if (!codeAddress) return std::nullopt;
 
     HMODULE module = nullptr;
@@ -250,21 +257,21 @@ static std::optional<std::wstring> ResolvePluginOwnerForAddress(const void* code
         if (!g_activePluginOwner.empty() && module == g_activePluginModule &&
                 entry.ownerId == g_activePluginOwner &&
                 entry.state != PluginState::Quarantined) {
-            return entry.ownerId;
+            return CallerPluginInfo{ entry.ownerId, entry.category };
         }
         if ((entry.state == PluginState::Loading ||
                 entry.state == PluginState::Active) &&
                 entry.handle == module) {
-            return entry.ownerId;
+            return CallerPluginInfo{ entry.ownerId, entry.category };
         }
     }
     return std::nullopt;
 }
 
-static std::optional<std::wstring> RequirePluginOwner(const void* codeAddress,
-                                                       const char* apiName) {
+static std::optional<CallerPluginInfo> RequirePluginOwner(const void* codeAddress,
+                                                           const char* apiName) {
     auto owner = ResolvePluginOwnerForAddress(codeAddress);
-    if (!owner || owner->empty()) {
+    if (!owner || owner->ownerId.empty()) {
         Logger::Log("%s rejected: caller/callback is not an active plugin", apiName);
         return std::nullopt;
     }
@@ -276,13 +283,75 @@ static bool TargetInCurrentGameCore(void* target) {
     return image != kHookImageInvalid && ImageAddress::Contains(image, target);
 }
 
+// CategoryNameForLog 的定义在本文件后部（LoaderCore 实现段），此处前向声明，
+// 供下面的 S1 域校验日志使用。
+static const char* CategoryNameForLog(LoaderCore::PluginCategory cat);
+
+// ================= S1 域校验：调用方类别 × 目标映像域 =================
+// 只对"取地址/给地址"的入口设门。域的划分依据：GameCore 映像是随对局重载的【短命域】，
+// 常驻（Global）插件若跨代持有它的地址就会在重载后悬垂；反之 GameCore 插件只应在自己
+// 这一代映像内活动。三类判定都只读，不改动任何状态、不抛异常；拒绝时按统一格式记日志，
+// 调用方按其原本的失败值返回。
+// 日志正文统一为：<ApiName> rejected: category=<Global|GameCore> <位点> (domain mismatch)
+
+// 单个目标地址：GameCore 类别要求落在【当前 GameCore 映像】内；Global 类别要求【不在】
+// 当前 GameCore 映像内（exe 与其它常驻模块放行）。GameCore 未加载时，Global 无域可犯。
+static bool AllowTargetForCategory(LoaderCore::PluginCategory cat, const void* target, const char* apiName) {
+    const bool inGameCore = TargetInCurrentGameCore(const_cast<void*>(target));
+    const bool ok = (cat == LoaderCore::PluginCategory::GameCore) ? inGameCore : !inGameCore;
+    if (!ok) {
+        Logger::Log("%s rejected: category=%s target=%p (domain mismatch)",
+            apiName, CategoryNameForLog(cat), target);
+    }
+    return ok;
+}
+
+// 解析目标映像：GameCore 类别的 image 必须是 GameCore 系（kHookImageGameCoreBase/XP1/XP2）；
+// Global 类别的 image 不得是 GameCore 系（exe / 其它常驻模块放行）。
+// image 是否已加载不在这里判——交回 *Core（保持原失败路径与日志不变）。
+static bool AllowImageForCategory(LoaderCore::PluginCategory cat, HookImageId image, const char* apiName) {
+    const bool gameCoreFamily = image == kHookImageGameCoreBase ||
+        image == kHookImageGameCoreXP1 || image == kHookImageGameCoreXP2;
+    const bool ok = (cat == LoaderCore::PluginCategory::GameCore) ? gameCoreFamily : !gameCoreFamily;
+    if (!ok) {
+        Logger::Log("%s rejected: category=%s image=%u (domain mismatch)",
+            apiName, CategoryNameForLog(cat), static_cast<unsigned>(image));
+    }
+    return ok;
+}
+
+// 整段范围（Patch 用）：GameCore 类别要求 [target, target+len) 全落在当前 GameCore 映像内；
+// Global 类别要求整段与当前 GameCore 映像【不相交】（GameCore 未加载 = 无交集，放行）。
+// 区间算术一律用无溢出的差值比较（len <= PluginBoundary::kMaxPluginRawBytes，地址为实址）。
+static bool AllowRangeForCategory(LoaderCore::PluginCategory cat, const void* target, size_t len, const char* apiName) {
+    HookImageInfo gcInfo{ sizeof(HookImageInfo) };
+    const HookImageId gcImage = ImageAddress::LoadedGameCore();
+    const bool hasGameCore = gcImage != kHookImageInvalid &&
+        ImageAddress::GetInfo(gcImage, &gcInfo) && gcInfo.imageSize != 0;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
+    bool ok = false;
+    if (cat == LoaderCore::PluginCategory::GameCore) {
+        ok = hasGameCore && begin >= gcInfo.base && len <= gcInfo.imageSize &&
+            (begin - gcInfo.base) <= gcInfo.imageSize - len;
+    } else if (!hasGameCore) {
+        ok = true;
+    } else if (begin >= gcInfo.base) {
+        ok = (begin - gcInfo.base) >= gcInfo.imageSize;
+    } else {
+        ok = (gcInfo.base - begin) >= len;
+    }
+    if (!ok) {
+        Logger::Log("%s rejected: category=%s target=%p len=%zu (domain mismatch)",
+            apiName, CategoryNameForLog(cat), target, len);
+    }
+    return ok;
+}
+
 static bool TargetInTearingDownGameCore(void* target) {
     const uintptr_t p = reinterpret_cast<uintptr_t>(target);
     return g_gameCoreTeardownAddress && p >= g_gameCoreTeardownAddress &&
         p - g_gameCoreTeardownAddress < g_gameCoreTeardownSizeOfImage;
 }
-
-static bool HasGameCoreTeardownCallback(const std::wstring& owner);
 
 // ---------------- HookAPI ??? ----------------
 static bool SafeRemoveHookLocked(void* target, bool eraseRecord);
@@ -599,19 +668,10 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
     }
     auto owner = RequirePluginOwner(detour, "InstallHook");
     if (!owner) return false;
-    if (TargetInCurrentGameCore(target)) {
-        const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
-            [&owner](const PluginEntry& entry) {
-                return entry.ownerId == *owner;
-            });
-        if (plugin != g_plugins.end() &&
-                plugin->category == LoaderCore::PluginCategory::Global &&
-                !HasGameCoreTeardownCallback(*owner)) {
-            Logger::Log("InstallHook rejected: Global owner %ls must register GameCoreTeardown first",
-                owner->c_str());
-            return false;
-        }
-    }
+    // S1 域校验：调用方类别 × 目标映像域。此门取代原先的"Global owner 必须先注册
+    // GameCoreTeardown"门槛——域门之后 Global 已不可能指向当前 GameCore，那段判断
+    // 永远不可达（HasGameCoreTeardownCallback 随之删除）。
+    if (!AllowTargetForCategory(owner->category, target, "InstallHook")) return false;
 
     // 锁序 lifecycle -> MinHook -> capture：站点在 MinHook 站点锁下取/建。
     lock_guard<mutex> hookLock(Runtime::MinHookMutex());
@@ -626,11 +686,11 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
         return false;
     }
     site->activeDetour = detour;
-    site->detourOwner = *owner;
+    site->detourOwner = owner->ownerId;
     site->nextTarget = detour;
     if (original) *original = site->minhookTrampoline;
     Logger::Log("InstallHook: target=%p detour=%p original=%p owner=%ls (hub stub=%p)",
-        target, detour, original ? *original : nullptr, owner->c_str(), site->stubCode);
+        target, detour, original ? *original : nullptr, owner->ownerId.c_str(), site->stubCode);
     return true;
 }
 
@@ -673,7 +733,7 @@ static bool RegisterPluginMessageHandler(const std::wstring& owner, MessageHandl
             return false;
         }
         const auto callbackOwner = ResolvePluginOwnerForAddress(reinterpret_cast<const void*>(handler));
-        if (!callbackOwner || *callbackOwner != owner) {
+        if (!callbackOwner || callbackOwner->ownerId != owner) {
             Logger::Log("RegisterMessageHandler rejected: callback does not belong to plugin");
             return false;
         }
@@ -703,7 +763,7 @@ bool RegisterMessageHandlerImpl(MessageHandlerFn handler) {
     // 优化落在 Loader/引擎内，不能用来可靠识别插件。
     const auto owner = RequirePluginOwner(reinterpret_cast<const void*>(handler),
         "RegisterMessageHandler");
-    return owner && RegisterPluginMessageHandler(*owner, handler);
+    return owner && RegisterPluginMessageHandler(owner->ownerId, handler);
 }
 
 void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len) {
@@ -791,6 +851,9 @@ static void* ResolveByRvaCore(HookImageId image, uintptr_t rva, size_t span) {
 
 // 插件入口：参数全是标量（没有需要锁外抄写的插件内存），只需加锁。
 void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
+    // S1 域校验：调用方类别 × 解析目标映像域（本入口没有 loader 内部调用者，内部走 *Core）。
+    auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByRva");
+    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByRva")) return nullptr;
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     PluginBoundary::LoaderLockScope pbLockScope;
     return ResolveByRvaCore(image, rva, span);
@@ -824,6 +887,9 @@ static void* ResolveByNameCore(HookImageId image, const char* nameSafe) {
 }
 
 void* ResolveByNameImpl(HookImageId image, const char* name) {
+    // S1 域校验（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByName");
+    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByName")) return nullptr;
     if (!name || !*name) return nullptr;
 
     // name 是插件内存：锁外先抄进 Loader 自有 string，锁内只碰副本
@@ -840,6 +906,9 @@ void* ResolveByNameImpl(HookImageId image, const char* name) {
 }
 
 void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImageSection section) {
+    // S1 域校验：调用方类别 × 解析目标映像域。
+    auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByRvaEx");
+    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByRvaEx")) return nullptr;
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     if (section == kSectionImage) {
         // 不修正：镜像相对 RVA 直接解析（供已按新映像坐标算好的调用方使用）。
@@ -973,6 +1042,9 @@ static void* ResolveByPatternCore(HookImageId image, const char* pattern, HookIm
 }
 
 void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSection section) {
+    // S1 域校验（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByPattern");
+    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByPattern")) return nullptr;
     if (!patternIn || !*patternIn) {
         Logger::Log("ResolveByPattern: empty pattern");
         return nullptr;
@@ -1122,7 +1194,17 @@ bool RegisterGlobalCaptureImpl(HookImageId image, const char* providerFunction, 
     PluginBoundary::LoaderLockScope pbLockScope;
     auto owner = RequirePluginOwner(reinterpret_cast<const void*>(out), "RegisterGlobalCapture");
     if (!owner) return false;
-    return RegisterGlobalCaptureCore(image, providerCopy.c_str(), paramIndex, out, *owner);
+    // S1 域校验：capture 订阅在每次 GameCore 重载时被整站清空（CleanupAllCaptureSites），
+    // 登记方必须是随代际重建的 GameCore 类别插件。常驻（Global）插件跨代持有短命 GameCore
+    // 映像里的地址，登记在这里必然留下悬垂 out 槽，直接拒绝。
+    if (owner->category != LoaderCore::PluginCategory::GameCore) {
+        Logger::Log("RegisterGlobalCapture rejected: owner=%ls category=%s "
+                    "(capture subscriptions are cleared on every GameCore reload; "
+                    "only GameCore plugins may register)",
+            owner->ownerId.c_str(), CategoryNameForLog(owner->category));
+        return false;
+    }
+    return RegisterGlobalCaptureCore(image, providerCopy.c_str(), paramIndex, out, owner->ownerId);
 }
 
 // 读 [vtable + index*8] 的槽函数指针。本函数无 C++ 对象（无展开要求），可用 SEH 兜底。
@@ -1168,6 +1250,9 @@ static void* ResolveByVTableCore(HookImageId image, const char* vtableSymbol, ui
 }
 
 void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbolIn, uint32_t index) {
+    // S1 域校验（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByVTable");
+    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByVTable")) return nullptr;
     if (!vtableSymbolIn || !*vtableSymbolIn) {
         Logger::Log("ResolveByVTable rejected: empty vtable symbol");
         return nullptr;
@@ -1645,9 +1730,9 @@ bool TriggerGameEventImpl(const char* name, const void* payload) {
     }
     // 事件名只归注册它的那个 owner；调用方（若能判定）必须是同一个 owner。
     if (const auto callerOwner = ResolvePluginOwnerForAddress(callerAddress)) {
-        if (*callerOwner != owner) {
+        if (callerOwner->ownerId != owner) {
             Logger::Log("TriggerGameEvent rejected: \"%s\" is owned by %ls, triggered by %ls",
-                nameCopy.c_str(), owner.c_str(), callerOwner->c_str());
+                nameCopy.c_str(), owner.c_str(), callerOwner->ownerId.c_str());
             return false;
         }
     }
@@ -1696,9 +1781,9 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
     // 之后它触发该名字时拿到的是【别人】的 pushFn，payload 布局不一致 -> 越界/类型混淆。
     for (const auto& ev : g_gameEvents) {
         if (!ev.name[0] || nameCopy != ev.name) continue;
-        if (ev.ownerId == *owner) return true;               // 同 owner 重复注册：幂等
+        if (ev.ownerId == owner->ownerId) return true;       // 同 owner 重复注册：幂等
         Logger::Log("RegisterGameEvent rejected: name \"%s\" already owned by another plugin "
-                    "(requested by %ls)", nameCopy.c_str(), owner->c_str());
+                    "(requested by %ls)", nameCopy.c_str(), owner->ownerId.c_str());
         return false;
     }
     RegisteredGameEvent* slot = nullptr;
@@ -1710,8 +1795,8 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
         return false;
     }
     slot->luaPushFn = pushFn;
-    slot->ownerId = *owner;
-    slot->inFlight = PluginInFlight::Resolve(*owner);
+    slot->ownerId = owner->ownerId;
+    slot->inFlight = PluginInFlight::Resolve(owner->ownerId);
     memcpy(slot->name, nameCopy.c_str(), nameLength);
     slot->name[nameLength] = '\0';
     Logger::Log("GameEvent: registered Lua-event \"%s\" pushFn=%p", nameCopy.c_str(), pushFn);
@@ -1798,17 +1883,17 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
     if (!owner) return kHookApiPushMethodsFailed;
     const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
         [&owner](const PluginEntry& entry) {
-            return entry.ownerId == *owner &&
+            return entry.ownerId == owner->ownerId &&
                 (entry.state == PluginState::Loading || entry.state == PluginState::Active);
         });
     if (plugin == g_plugins.end()) return kHookApiPushMethodsFailed;
 
     // owner 回填：StoredLuaMethod::owner 为空会被 MergeLuaMethod 首行直接判非法，
     // 必须在合并之前补齐（否则整批 PushLuaMethods 都会失败）。
-    for (auto& method : copies) method.owner = *owner;
+    for (auto& method : copies) method.owner = owner->ownerId;
 
     PushTargetConfig config;
-    const auto ownerConfigs = g_pluginPushTargetConfigs.find(*owner);
+    const auto ownerConfigs = g_pluginPushTargetConfigs.find(owner->ownerId);
     if (ownerConfigs != g_pluginPushTargetConfigs.end()) {
         const auto configured = ownerConfigs->second.find(targetName);
         if (configured != ownerConfigs->second.end()) config = configured->second;
@@ -1824,10 +1909,10 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
 
     // 每个 owner/target 仅有一份登记；请求可以是重复、重排或部分重叠的批次。
     size_t registrationIndex = g_pushRegistrations.size();
-    PushRegistration candidate{ targetName, config.signature, {}, *owner, config.symbolName };
+    PushRegistration candidate{ targetName, config.signature, {}, owner->ownerId, config.symbolName };
     for (size_t i = 0; i < g_pushRegistrations.size(); ++i) {
         const auto& registration = g_pushRegistrations[i];
-        if (registration.owner == *owner && registration.targetName == targetName) {
+        if (registration.owner == owner->ownerId && registration.targetName == targetName) {
             if (registration.signature != candidate.signature ||
                     registration.symbolName != candidate.symbolName) {
                 return kHookApiPushMethodsFailed;
@@ -1841,7 +1926,7 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         // 每个方法都必须属于同一个插件（owner 一致）；名字为空由 MergeLuaMethod 判非法。
         auto methodOwner = RequirePluginOwner(
             reinterpret_cast<const void*>(copies[i].luaMethodFunc), "PushLuaMethods");
-        if (!methodOwner || *methodOwner != *owner ||
+        if (!methodOwner || methodOwner->ownerId != owner->ownerId ||
                 !MergeLuaMethod(candidate.methods, copies[i])) {
             Logger::Log("PushLuaMethods rejected: invalid or conflicting method for %s",
                 targetName.c_str());
@@ -1850,7 +1935,7 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
     }
     // 同一个 Lua 表的字段不允许被另一个 owner 的登记隐式覆盖，延迟阶段也校验。
     for (const auto& registration : g_pushRegistrations) {
-        if (registration.targetName != targetName || registration.owner == *owner) continue;
+        if (registration.targetName != targetName || registration.owner == owner->ownerId) continue;
         for (const auto& method : candidate.methods) {
             if (std::any_of(registration.methods.begin(), registration.methods.end(),
                     [&method](const StoredLuaMethod& existing) {
@@ -1874,8 +1959,8 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
             return kHookApiPushMethodsFailed;
         }
         void* base = candidate.signature == PushMethodSigType::NoManager
-            ? InstallPushMethodsNoManager(target, candidate.methods, *owner)
-            : InstallPushMethodsWithManager(target, candidate.methods, *owner);
+            ? InstallPushMethodsNoManager(target, candidate.methods, owner->ownerId)
+            : InstallPushMethodsWithManager(target, candidate.methods, owner->ownerId);
         if (!base) {
             Logger::Log("PushLuaMethods: install failed: %s", symbolName.c_str());
             return kHookApiPushMethodsFailed;
@@ -2202,22 +2287,12 @@ void RemoveGameCoreCallbacksFor(const std::wstring& owner) {
 
 }  // namespace
 
-static bool HasGameCoreTeardownCallback(const std::wstring& owner) {
-    lock_guard<mutex> cbLock(g_gameCoreCallbackMutex);
-    return std::any_of(g_gameCoreTeardownCallbacks.begin(),
-        g_gameCoreTeardownCallbacks.end(),
-        [&owner](const GameCoreCallbackPtr& entry) {
-            return entry->owner == owner &&
-                entry->enabled.load(std::memory_order_acquire);
-        });
-}
-
 void RegisterGameCoreReadyImpl(GameCoreReadyFn fn, void* context) {
     if (!fn) return;
     auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn), "RegisterGameCoreReady");
     if (!owner) return;
     auto [entry, inserted] = AddGameCoreCallback(
-        g_gameCoreReadyCallbacks, *owner, fn, context, "RegisterGameCoreReady");
+        g_gameCoreReadyCallbacks, owner->ownerId, fn, context, "RegisterGameCoreReady");
     if (!entry) return;
     // 注册即触发：GameCore 已就绪（如对局中 reconcile 新加载的插件）时立即补调，
     // 不必等下一次重载。
@@ -2237,7 +2312,7 @@ void RegisterGameCoreTeardownImpl(GameCoreTeardownFn fn, void* context) {
     if (!fn) return;
     auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn), "RegisterGameCoreTeardown");
     if (!owner) return;
-    AddGameCoreCallback(g_gameCoreTeardownCallbacks, *owner, fn, context,
+    AddGameCoreCallback(g_gameCoreTeardownCallbacks, owner->ownerId, fn, context,
                         "RegisterGameCoreTeardown");
 }
 
@@ -2286,7 +2361,7 @@ void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
         if (!owner) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobals.push_back(
-            ScriptGlobalsEntry{ *owner, fn, PluginInFlight::Resolve(*owner) });
+            ScriptGlobalsEntry{ owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
     }
     EnsureScriptHooksInstalled();  // 内部自带生命周期锁（含并发首装与重载后重装）
 }
@@ -2301,7 +2376,7 @@ void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
         if (!owner) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobalsUI.push_back(
-            ScriptGlobalsEntry{ *owner, fn, PluginInFlight::Resolve(*owner) });
+            ScriptGlobalsEntry{ owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
     }
     EnsureScriptHooksInstalled();
 }
@@ -3130,29 +3205,29 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
         !symbolCopy.empty() ? symbolCopy : (nameCopy + "::PushMethods")
     };
 
-    auto& ownerConfigs = g_pluginPushTargetConfigs[*owner];
+    auto& ownerConfigs = g_pluginPushTargetConfigs[owner->ownerId];
     const auto existing = ownerConfigs.find(nameCopy);
     if (existing != ownerConfigs.end()) {
         if (existing->second.signature != config.signature ||
                 existing->second.symbolName != config.symbolName) {
             Logger::Log("RegisterPushMethodsTarget: conflicting redefinition owner=%ls target=%s",
-                owner->c_str(), nameCopy.c_str());
+                owner->ownerId.c_str(), nameCopy.c_str());
             return 0;
         }
         return 1;
     }
     const bool hasRegistration = std::any_of(g_pushRegistrations.begin(),
         g_pushRegistrations.end(), [&owner, &nameCopy](const PushRegistration& registration) {
-            return registration.owner == *owner && registration.targetName == nameCopy;
+            return registration.owner == owner->ownerId && registration.targetName == nameCopy;
         });
     if (hasRegistration) {
         Logger::Log("RegisterPushMethodsTarget: cannot change config after registration owner=%ls target=%s",
-            owner->c_str(), nameCopy.c_str());
+            owner->ownerId.c_str(), nameCopy.c_str());
         return 0;
     }
     ownerConfigs.emplace(nameCopy, config);
     Logger::Log("RegisterPushMethodsTarget: owner=%ls target=%s sig=%d sym=%s",
-        owner->c_str(), nameCopy.c_str(), sigType, config.symbolName.c_str());
+        owner->ownerId.c_str(), nameCopy.c_str(), sigType, config.symbolName.c_str());
     return 1;
 }
 
@@ -3185,14 +3260,22 @@ __declspec(noinline) static bool HookPatch(void* target, const void* bytes, size
         return false;
     }
     auto owner = RequirePluginOwner(_ReturnAddress(), "Patch");
-    return owner && PatchRegistry::Apply(target, bytesCopy.data(), len, owner->c_str());
+    if (!owner) return false;
+    // S1 域校验（整段）：GameCore 类别要求 [target, target+len) 全落在当前 GameCore 映像内；
+    // Global 类别要求整段与 GameCore 映像不相交。
+    if (!AllowRangeForCategory(owner->category, target, len, "Patch")) return false;
+    return PatchRegistry::Apply(target, bytesCopy.data(), len, owner->ownerId.c_str());
 }
 
 __declspec(noinline) static bool HookUnpatch(void* target) {
     lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     PluginBoundary::LoaderLockScope pbLockScope;
     auto owner = RequirePluginOwner(_ReturnAddress(), "Unpatch");
-    return owner && PatchRegistry::RevertOwned(target, owner->c_str());
+    if (!owner) return false;
+    // S1 域校验：Patch 时已按整段校验过，这里只校验目标点
+    // （PatchRegistry 没有现成的长度访问器，不为此改动别的文件）。
+    if (!AllowTargetForCategory(owner->category, target, "Unpatch")) return false;
+    return PatchRegistry::RevertOwned(target, owner->ownerId.c_str());
 }
 
 // 只读契约：Loader 初始化后从不写它（全是取地址/读取），插件也只该读。
