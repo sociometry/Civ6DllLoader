@@ -168,12 +168,17 @@ typedef struct HookAPI {
     // 每字节两字符：?? 整字节通配，4? / ?F 分别固定高/低半字节；十六进制字母大小写均可。
     // 字节间可用空格、Tab、逗号分隔或直接相连；格式错误或未命中返回 nullptr。
     void* (*ResolveByPattern)(HookImageId image, const char* pattern, HookImageSection section);
-    // 注册全局变量捕获：hook providerFunction，运行时用机器码生成 stub 捕获其第 paramIndex 个
-    // 参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。同一 providerFunction
-    // 只 hook 一次，后续注册的 out 追加到列表，触发时统一赋值。返回 false = 注册失败（providerFunction 解析失败等）。
+    // 注册全局变量捕获：hook providerAddress，运行时用机器码生成 stub 捕获其第 paramIndex 个
+    // 参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。
+    // providerAddress 是【绝对地址】（插件自行用 Resolve* 等入口取址后再传进来），且必须是
+    // 可执行的函数入口：Loader 只探页属性（可读 + 落在可执行页），不做任何名字/符号/映像解析。
+    // 同一 providerAddress 只 hook 一次，后续注册的 out 追加到列表，触发时统一赋值。
+    // 返回 false = 注册失败（地址为空/不可读/不在可执行页、paramIndex > 3、out 槽不可写、
+    // 目标属于正在拆除的 GameCore、或该地址对调用方不开放等）。
     // out 槽须位于注册插件的模块内；卸载/隔离只移除该插件的槽，保留其它插件的共享订阅。
-    // 最后一个订阅移除后才摘钩；GameCore 重载会清除全部订阅，须在下一次 Ready 中重新注册。
-    bool (*RegisterGlobalCapture)(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out);
+    // 最后一个订阅移除后才摘钩；GameCore 重载只清除落在当前 GameCore 映像内的订阅
+    // （exe/常驻模块域上的订阅保留），GameCore 域订阅须在下一次 GameCore 插件加载（OnLoad）时重新注册。
+    bool (*RegisterGlobalCapture)(void* providerAddress, uint32_t paramIndex, void** out);
     // 按 vtable 符号名（demangled/mangled）解析第 index 个虚函数槽位（0 起）：
     // 定位 vtable 地址（版本一致恒等，跨版本走槽位结构匹配），读 [vtable + index*8] 的
     // 槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。

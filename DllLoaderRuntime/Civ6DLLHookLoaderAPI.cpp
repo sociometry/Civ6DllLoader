@@ -284,24 +284,24 @@ static bool TargetInCurrentGameCore(void* target) {
 }
 
 // CategoryNameForLog 的定义在本文件后部（LoaderCore 实现段），此处前向声明，
-// 供下面的 S1 域校验日志使用。
+// 供下面的地址开放性日志使用。
 static const char* CategoryNameForLog(LoaderCore::PluginCategory cat);
 
-// ================= S1 域校验：调用方类别 × 目标映像域 =================
+// ================= 地址开放性门：调用方类别 × 目标地址域 =================
 // 只对"取地址/给地址"的入口设门。域的划分依据：GameCore 映像是随对局重载的【短命域】，
 // 常驻（Global）插件若跨代持有它的地址就会在重载后悬垂；反之 GameCore 插件只应在自己
-// 这一代映像内活动。三类判定都只读，不改动任何状态、不抛异常；拒绝时按统一格式记日志，
-// 调用方按其原本的失败值返回。
-// 日志正文统一为：<ApiName> rejected: category=<Global|GameCore> <位点> (domain mismatch)
+// 这一代映像内活动。三类判定都只读，不改动任何状态、不抛异常；拒绝时按统一格式记日志
+// （地址/映像对调用方不开放），调用方按其原本的失败值返回。
+// 日志正文统一为：<ApiName> rejected: target|image|range <位点> is not open to caller (<Global|GameCore>)
 
 // 单个目标地址：GameCore 类别要求落在【当前 GameCore 映像】内；Global 类别要求【不在】
 // 当前 GameCore 映像内（exe 与其它常驻模块放行）。GameCore 未加载时，Global 无域可犯。
-static bool AllowTargetForCategory(LoaderCore::PluginCategory cat, const void* target, const char* apiName) {
+static bool IsTargetOpenToCaller(LoaderCore::PluginCategory caller, const void* target, const char* apiName) {
     const bool inGameCore = TargetInCurrentGameCore(const_cast<void*>(target));
-    const bool ok = (cat == LoaderCore::PluginCategory::GameCore) ? inGameCore : !inGameCore;
+    const bool ok = (caller == LoaderCore::PluginCategory::GameCore) ? inGameCore : !inGameCore;
     if (!ok) {
-        Logger::Log("%s rejected: category=%s target=%p (domain mismatch)",
-            apiName, CategoryNameForLog(cat), target);
+        Logger::Log("%s rejected: target %p is not open to caller (%s)",
+            apiName, target, CategoryNameForLog(caller));
     }
     return ok;
 }
@@ -309,13 +309,13 @@ static bool AllowTargetForCategory(LoaderCore::PluginCategory cat, const void* t
 // 解析目标映像：GameCore 类别的 image 必须是 GameCore 系（kHookImageGameCoreBase/XP1/XP2）；
 // Global 类别的 image 不得是 GameCore 系（exe / 其它常驻模块放行）。
 // image 是否已加载不在这里判——交回 *Core（保持原失败路径与日志不变）。
-static bool AllowImageForCategory(LoaderCore::PluginCategory cat, HookImageId image, const char* apiName) {
+static bool IsImageOpenToCaller(LoaderCore::PluginCategory caller, HookImageId image, const char* apiName) {
     const bool gameCoreFamily = image == kHookImageGameCoreBase ||
         image == kHookImageGameCoreXP1 || image == kHookImageGameCoreXP2;
-    const bool ok = (cat == LoaderCore::PluginCategory::GameCore) ? gameCoreFamily : !gameCoreFamily;
+    const bool ok = (caller == LoaderCore::PluginCategory::GameCore) ? gameCoreFamily : !gameCoreFamily;
     if (!ok) {
-        Logger::Log("%s rejected: category=%s image=%u (domain mismatch)",
-            apiName, CategoryNameForLog(cat), static_cast<unsigned>(image));
+        Logger::Log("%s rejected: image %u is not open to caller (%s)",
+            apiName, static_cast<unsigned>(image), CategoryNameForLog(caller));
     }
     return ok;
 }
@@ -323,14 +323,14 @@ static bool AllowImageForCategory(LoaderCore::PluginCategory cat, HookImageId im
 // 整段范围（Patch 用）：GameCore 类别要求 [target, target+len) 全落在当前 GameCore 映像内；
 // Global 类别要求整段与当前 GameCore 映像【不相交】（GameCore 未加载 = 无交集，放行）。
 // 区间算术一律用无溢出的差值比较（len <= PluginBoundary::kMaxPluginRawBytes，地址为实址）。
-static bool AllowRangeForCategory(LoaderCore::PluginCategory cat, const void* target, size_t len, const char* apiName) {
+static bool IsRangeOpenToCaller(LoaderCore::PluginCategory caller, const void* target, size_t len, const char* apiName) {
     HookImageInfo gcInfo{ sizeof(HookImageInfo) };
     const HookImageId gcImage = ImageAddress::LoadedGameCore();
     const bool hasGameCore = gcImage != kHookImageInvalid &&
         ImageAddress::GetInfo(gcImage, &gcInfo) && gcInfo.imageSize != 0;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
     bool ok = false;
-    if (cat == LoaderCore::PluginCategory::GameCore) {
+    if (caller == LoaderCore::PluginCategory::GameCore) {
         ok = hasGameCore && begin >= gcInfo.base && len <= gcInfo.imageSize &&
             (begin - gcInfo.base) <= gcInfo.imageSize - len;
     } else if (!hasGameCore) {
@@ -341,8 +341,8 @@ static bool AllowRangeForCategory(LoaderCore::PluginCategory cat, const void* ta
         ok = (gcInfo.base - begin) >= len;
     }
     if (!ok) {
-        Logger::Log("%s rejected: category=%s target=%p len=%zu (domain mismatch)",
-            apiName, CategoryNameForLog(cat), target, len);
+        Logger::Log("%s rejected: range %p len=%zu is not open to caller (%s)",
+            apiName, target, len, CategoryNameForLog(caller));
     }
     return ok;
 }
@@ -668,10 +668,10 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
     }
     auto owner = RequirePluginOwner(detour, "InstallHook");
     if (!owner) return false;
-    // S1 域校验：调用方类别 × 目标映像域。此门取代原先的"Global owner 必须先注册
+    // 地址开放性门：调用方类别 × 目标地址域。此门取代原先的"Global owner 必须先注册
     // GameCoreTeardown"门槛——域门之后 Global 已不可能指向当前 GameCore，那段判断
     // 永远不可达（HasGameCoreTeardownCallback 随之删除）。
-    if (!AllowTargetForCategory(owner->category, target, "InstallHook")) return false;
+    if (!IsTargetOpenToCaller(owner->category, target, "InstallHook")) return false;
 
     // 锁序 lifecycle -> MinHook -> capture：站点在 MinHook 站点锁下取/建。
     lock_guard<mutex> hookLock(Runtime::MinHookMutex());
@@ -851,9 +851,9 @@ static void* ResolveByRvaCore(HookImageId image, uintptr_t rva, size_t span) {
 
 // 插件入口：参数全是标量（没有需要锁外抄写的插件内存），只需加锁。
 void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
-    // S1 域校验：调用方类别 × 解析目标映像域（本入口没有 loader 内部调用者，内部走 *Core）。
+    // 地址开放性门：调用方类别 × 解析目标映像域（本入口没有 loader 内部调用者，内部走 *Core）。
     auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByRva");
-    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByRva")) return nullptr;
+    if (!caller || !IsImageOpenToCaller(caller->category, image, "ResolveByRva")) return nullptr;
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     PluginBoundary::LoaderLockScope pbLockScope;
     return ResolveByRvaCore(image, rva, span);
@@ -887,9 +887,9 @@ static void* ResolveByNameCore(HookImageId image, const char* nameSafe) {
 }
 
 void* ResolveByNameImpl(HookImageId image, const char* name) {
-    // S1 域校验（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    // 地址开放性门（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
     auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByName");
-    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByName")) return nullptr;
+    if (!caller || !IsImageOpenToCaller(caller->category, image, "ResolveByName")) return nullptr;
     if (!name || !*name) return nullptr;
 
     // name 是插件内存：锁外先抄进 Loader 自有 string，锁内只碰副本
@@ -906,9 +906,9 @@ void* ResolveByNameImpl(HookImageId image, const char* name) {
 }
 
 void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImageSection section) {
-    // S1 域校验：调用方类别 × 解析目标映像域。
+    // 地址开放性门：调用方类别 × 解析目标映像域。
     auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByRvaEx");
-    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByRvaEx")) return nullptr;
+    if (!caller || !IsImageOpenToCaller(caller->category, image, "ResolveByRvaEx")) return nullptr;
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     if (section == kSectionImage) {
         // 不修正：镜像相对 RVA 直接解析（供已按新映像坐标算好的调用方使用）。
@@ -1042,9 +1042,9 @@ static void* ResolveByPatternCore(HookImageId image, const char* pattern, HookIm
 }
 
 void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSection section) {
-    // S1 域校验（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    // 地址开放性门（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
     auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByPattern");
-    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByPattern")) return nullptr;
+    if (!caller || !IsImageOpenToCaller(caller->category, image, "ResolveByPattern")) return nullptr;
     if (!patternIn || !*patternIn) {
         Logger::Log("ResolveByPattern: empty pattern");
         return nullptr;
@@ -1105,32 +1105,64 @@ extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr) 
 
 // 捕获站点 stub 生成已合并到 BuildHookHubStub（见文件前部「统一挂钩站点」）。
 
+// providerAddress 必须落在【可执行页】：它是函数入口，不是数据 —— 站点 stub 会尾跳进
+// MinHook trampoline 去执行原函数前导，数据地址在这里没有意义。工程里没有现成的
+// "可执行页"探测 helper（PluginBoundary::IsReadable/IsWritable 只探读/写，Runtime::
+// IsReadableSpan 同源），因此按 LoaderCore::VerifyHookApiTableProtection 的写法走一次
+// VirtualQuery：整段（kMinHookTargetSpan）逐区域要求 MEM_COMMIT、保护不含
+// PAGE_NOACCESS/PAGE_GUARD，且含执行位。VirtualQuery 对任意地址都安全、不产生访问违例，
+// 所以这个探测本身不需要 SEH，也不破坏 PluginBoundary 的"取锁前访存"不变量。
+static bool IsExecutableTargetSpan(const void* p, size_t len) {
+    if (!p || len == 0) return false;
+    constexpr DWORD kExecMask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const uint8_t* cur = static_cast<const uint8_t*>(p);
+    size_t remain = len;
+    while (remain > 0) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(cur, &mbi, sizeof(mbi)) == 0) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        if ((mbi.Protect & kExecMask) == 0) return false;
+        const size_t regionBytes = static_cast<size_t>(mbi.RegionSize)
+            - static_cast<size_t>(cur - static_cast<const uint8_t*>(mbi.BaseAddress));
+        if (regionBytes == 0) return false;   // 防御：RegionSize 解析异常，避免死循环
+        const size_t consumed = regionBytes < remain ? regionBytes : remain;
+        cur += consumed;
+        remain -= consumed;
+    }
+    return true;
+}
+
 // RegisterGlobalCapture 内部核心（无插件 owner 校验）：从插件入口提取的公共核心，
-// 供 RegisterGlobalCaptureImpl 复用。ownerId 空串 = Loader 归属（GameCore 重载
-// 时随 CleanupAllCaptureSites 整站清理；插件卸载清理按 owner 匹配，跳过空串）。
-static bool RegisterGlobalCaptureCore(HookImageId image, const char* providerFunction,
-                                      uint32_t paramIndex, void** out,
+// 供 RegisterGlobalCaptureImpl 复用。ownerId 空串 = Loader 归属（GameCore 重载时随
+// CleanupAllCaptureSites 清理 GameCore 域站点；插件卸载清理按 owner 匹配，跳过空串）。
+// providerAddress 是插件给的【绝对地址】，必须是可执行的函数入口：Loader 只探页属性
+// （可读 + 落在可执行页），不做任何名字 / 符号 / 映像解析。
+static bool RegisterGlobalCaptureCore(void* providerAddress, uint32_t paramIndex, void** out,
                                       const std::wstring& ownerId) {
-    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
-    if (image != kHookImageGameCoreXP2 || !providerFunction || !*providerFunction ||
-            paramIndex > 3 || !out) {
-        Logger::Log("RegisterGlobalCapture rejected: bad args image=%u provider=%s param=%u",
-            static_cast<unsigned>(image),
-            providerFunction ? providerFunction : "(null)",
-            static_cast<unsigned>(paramIndex));
+    if (!providerAddress || !out || paramIndex > 3) {
+        Logger::Log("RegisterGlobalCapture rejected: bad args provider=%p param=%u out=%p",
+            providerAddress, static_cast<unsigned>(paramIndex), static_cast<void*>(out));
+        return false;
+    }
+    // 页属性探测放在取生命周期锁【之前】（PluginBoundary 不变量）；探测本身是纯
+    // VirtualQuery，不会产生访问违例。
+    if (!PluginBoundary::IsReadable(providerAddress, PluginBoundary::kMinHookTargetSpan)) {
+        Logger::Log("RegisterGlobalCapture rejected: provider not readable %p (span=%zu)",
+            providerAddress, PluginBoundary::kMinHookTargetSpan);
+        return false;
+    }
+    if (!IsExecutableTargetSpan(providerAddress, PluginBoundary::kMinHookTargetSpan)) {
+        Logger::Log("RegisterGlobalCapture rejected: provider not in an executable page %p (span=%zu)",
+            providerAddress, PluginBoundary::kMinHookTargetSpan);
         return false;
     }
 
-    // CorrectByName 返回旧→新矫正后的 RVA（非地址），须经 ResolveByRva 换算为当前映像地址。
-    const uintptr_t corrected = PdataMatch::CorrectByName(kHookImageGameCoreXP2, providerFunction);
-    void* target = corrected ? ImageAddress::ResolveByRva(kHookImageGameCoreXP2, corrected, 1) : nullptr;
-    if (!target) {
-        Logger::Log("RegisterGlobalCapture: no pdata correction for provider=%s", providerFunction);
-        return false;
-    }
-    if (TargetInTearingDownGameCore(target)) {
-        Logger::Log("RegisterGlobalCapture: target belongs to tearing-down GameCore provider=%s",
-            providerFunction);
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (TargetInTearingDownGameCore(providerAddress)) {
+        Logger::Log("RegisterGlobalCapture: target belongs to tearing-down GameCore provider=%p",
+            providerAddress);
         return false;
     }
 
@@ -1139,10 +1171,10 @@ static bool RegisterGlobalCaptureCore(HookImageId image, const char* providerFun
     HookSite* site = nullptr;
     {
         lock_guard<std::mutex> hookLock(Runtime::MinHookMutex());
-        site = GetOrCreateHookSiteLocked(target, "RegisterGlobalCapture");
+        site = GetOrCreateHookSiteLocked(providerAddress, "RegisterGlobalCapture");
     }
     if (!site) {
-        Logger::Log("RegisterGlobalCapture: hook site unavailable provider=%s", providerFunction);
+        Logger::Log("RegisterGlobalCapture: hook site unavailable provider=%p", providerAddress);
         return false;
     }
 
@@ -1150,8 +1182,8 @@ static bool RegisterGlobalCaptureCore(HookImageId image, const char* providerFun
     {
         lock_guard<std::mutex> captureLock(g_captureMutex);
         if (site->hasCapture && site->captureParamIndex != paramIndex) {
-            Logger::Log("RegisterGlobalCapture: paramIndex conflict provider=%s have=%u want=%u",
-                providerFunction, static_cast<unsigned>(site->captureParamIndex),
+            Logger::Log("RegisterGlobalCapture: paramIndex conflict provider=%p have=%u want=%u",
+                providerAddress, static_cast<unsigned>(site->captureParamIndex),
                 static_cast<unsigned>(paramIndex));
             return false;
         }
@@ -1162,28 +1194,21 @@ static bool RegisterGlobalCaptureCore(HookImageId image, const char* providerFun
         site->hasCapture = true;
         slotCount = site->captureOuts.size();
     }
-    Logger::Log("RegisterGlobalCapture: installed provider=%s target=%p param=%u owner=%ls "
+    Logger::Log("RegisterGlobalCapture: installed provider=%p param=%u owner=%ls "
                 "(hub stub=%p outs=%zu)",
-        providerFunction, target, static_cast<unsigned>(paramIndex), ownerId.c_str(),
+        providerAddress, static_cast<unsigned>(paramIndex), ownerId.c_str(),
         site->stubCode, slotCount);
     return true;
 }
 
 // 插件入口：owner 校验后走核心（out 槽须位于插件模块内）。
-bool RegisterGlobalCaptureImpl(HookImageId image, const char* providerFunction, uint32_t paramIndex, void** out) {
-    if (!providerFunction || !*providerFunction) return false;
-
-    // out 是宿主【写】的目标（CaptureDispatch 会往它写），providerFunction 是宿主
-    // 【读】的字符串名 —— 两者都是插件内存，处理一律放在取锁之前。
-    // CaptureDispatch 侧另有叶子 SEH 兜底（防插件注册后自行释放该地址 / 改页保护）。
+bool RegisterGlobalCaptureImpl(void* providerAddress, uint32_t paramIndex, void** out) {
+    // out 是宿主【写】的目标（CaptureDispatch 会往它写），是插件内存 —— 处理放在取锁之前。
+    // providerAddress 只探页属性（VirtualQuery，不解引用）。CaptureDispatch 侧另有叶子
+    // SEH 兜底（防插件注册后自行释放该地址 / 改页保护）。
     if (!PluginBoundary::IsWritable(out, sizeof(void*))) {
         Logger::Log("RegisterGlobalCapture rejected: out slot not writable %p",
             static_cast<const void*>(out));
-        return false;
-    }
-    std::string providerCopy;
-    if (!PluginBoundary::CopyCString(providerFunction, providerCopy) || providerCopy.empty()) {
-        Logger::Log("RegisterGlobalCapture rejected: providerFunction unreadable");
         return false;
     }
 
@@ -1194,17 +1219,13 @@ bool RegisterGlobalCaptureImpl(HookImageId image, const char* providerFunction, 
     PluginBoundary::LoaderLockScope pbLockScope;
     auto owner = RequirePluginOwner(reinterpret_cast<const void*>(out), "RegisterGlobalCapture");
     if (!owner) return false;
-    // S1 域校验：capture 订阅在每次 GameCore 重载时被整站清空（CleanupAllCaptureSites），
-    // 登记方必须是随代际重建的 GameCore 类别插件。常驻（Global）插件跨代持有短命 GameCore
-    // 映像里的地址，登记在这里必然留下悬垂 out 槽，直接拒绝。
-    if (owner->category != LoaderCore::PluginCategory::GameCore) {
-        Logger::Log("RegisterGlobalCapture rejected: owner=%ls category=%s "
-                    "(capture subscriptions are cleared on every GameCore reload; "
-                    "only GameCore plugins may register)",
-            owner->ownerId.c_str(), CategoryNameForLog(owner->category));
-        return false;
-    }
-    return RegisterGlobalCaptureCore(image, providerCopy.c_str(), paramIndex, out, owner->ownerId);
+    // 地址开放性门：capture 现在是"取地址型"入口（providerAddress 由插件自己解析后传入），
+    // 因此统一按地址开放性口径判：GameCore 类别 -> 目标须在当前 GameCore 映像内；Global
+    // 类别 -> 不得落在 GameCore 映像内（exe / 常驻模块放行）。原先"调用方类别必须是
+    // GameCore"那道特例门随之删除：它要防的悬垂已由本门 + CleanupAllCaptureSites 的
+    // GameCore 域过滤共同覆盖，而 Global 插件挂在常驻模块上的 capture 不再被误拒。
+    if (!IsTargetOpenToCaller(owner->category, providerAddress, "RegisterGlobalCapture")) return false;
+    return RegisterGlobalCaptureCore(providerAddress, paramIndex, out, owner->ownerId);
 }
 
 // 读 [vtable + index*8] 的槽函数指针。本函数无 C++ 对象（无展开要求），可用 SEH 兜底。
@@ -1250,9 +1271,9 @@ static void* ResolveByVTableCore(HookImageId image, const char* vtableSymbol, ui
 }
 
 void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbolIn, uint32_t index) {
-    // S1 域校验（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    // 地址开放性门（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
     auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByVTable");
-    if (!caller || !AllowImageForCategory(caller->category, image, "ResolveByVTable")) return nullptr;
+    if (!caller || !IsImageOpenToCaller(caller->category, image, "ResolveByVTable")) return nullptr;
     if (!vtableSymbolIn || !*vtableSymbolIn) {
         Logger::Log("ResolveByVTable rejected: empty vtable symbol");
         return nullptr;
@@ -1305,9 +1326,9 @@ void* LoaderCore::ResolveDataByAobCore(HookImageId image, const char* aob, uint3
 
 // ---------------- 站点捕获槽退役（只拔插槽，绝不物理脱钩） ----------------
 // 两个失效场景：
-//  1) GameCore 重载：providerFunction 位于旧 GameCore 映像内，重载后地址失效，清空全部
-//     捕获订阅（ResetForReload 调用 CleanupAllCaptureSites），等下次 Ready 回调由插件
-//     重新注册；
+//  1) GameCore 重载：目标位于旧 GameCore 映像内，重载后地址失效，清空落在当前 GameCore
+//     映像内的捕获订阅（ResetForReload 调用 CleanupAllCaptureSites），等下次 Ready 回调
+//     由插件重新注册；exe / 常驻模块域上的订阅与重载无关，保留；
 //  2) 插件卸载：捕获槽的 out 指向插件内存，卸载后悬空（UnloadPluginByOwnerId 调用
 //     CleanupCaptureSitesForOwner）。
 // 硬约束 M1：这里【只】清空 captureOuts / 翻转 hasCapture，绝不 MH_RemoveHook、绝不
@@ -1317,17 +1338,30 @@ void* LoaderCore::ResolveDataByAobCore(HookImageId image, const char* aob, uint3
 // CaptureDispatch 在同一把 g_captureMutex 下复查 hasCapture/retiring/空 outs：陈旧读到
 // hasCapture=1 时因 outs 已清空而被兜住。
 
+// 只清 GameCore 域：GameCore 映像随对局重载而换地址，它的站点订阅必须随代际重注册；
+// exe / 其它常驻模块域上的站点（例如 Global 插件挂在 user32 上的 capture）永不失效，
+// 必须保留 —— 这也正是原先「只允许 GameCore 插件注册 capture」那道特例门删除之后，
+// Global 插件的常驻域订阅赖以存活的地方。
+// ResetForReload 调用本函数时旧 GameCore 映像仍 attached（detach 更晚），因此
+// ImageAddress::Contains(LoadedGameCore(), siteTarget) 的判定成立；GameCore 未加载
+// （无效 id）时 Contains 恒 false，等于"无 GameCore 域可清"。
 static void CleanupAllCaptureSites() {
     size_t sites = 0;
     size_t outs = 0;
+    size_t kept = 0;
     {
         // 站点表结构由 MinHook 站点锁保护；capture 字段是它内层的派发侧数据。
         // 锁序恒为 MinHook -> capture，与注册路径一致，不成环。
         lock_guard<mutex> hookLock(Runtime::MinHookMutex());
         lock_guard<mutex> lock(g_captureMutex);
+        const HookImageId gcImage = ImageAddress::LoadedGameCore();
         for (auto& entry : g_hookSites) {
             HookSite& site = entry.second;
             if (!site.hasCapture && site.captureOuts.empty()) continue;
+            if (!ImageAddress::Contains(gcImage, entry.first)) {
+                ++kept;   // 非当前 GameCore 域（exe / 常驻模块）：捕获订阅保留
+                continue;
+            }
             site.retiring = true;
             site.hasCapture = false;
             outs += site.captureOuts.size();
@@ -1336,7 +1370,8 @@ static void CleanupAllCaptureSites() {
         }
     }
     Logger::Log("CleanupAllCaptureSites: unplugged capture on %zu site(s) / %zu out slot(s) "
-                "(no physical unhook)", sites, outs);
+                "inside the GameCore image (kept %zu site(s) outside by domain; no physical unhook)",
+        sites, outs, kept);
 }
 
 // 插件卸载：只移除该 owner 的 out 槽；还有其它 owner 订阅时保留站点与 hasCapture。
@@ -3261,9 +3296,9 @@ __declspec(noinline) static bool HookPatch(void* target, const void* bytes, size
     }
     auto owner = RequirePluginOwner(_ReturnAddress(), "Patch");
     if (!owner) return false;
-    // S1 域校验（整段）：GameCore 类别要求 [target, target+len) 全落在当前 GameCore 映像内；
+    // 地址开放性门（整段）：GameCore 类别要求 [target, target+len) 全落在当前 GameCore 映像内；
     // Global 类别要求整段与 GameCore 映像不相交。
-    if (!AllowRangeForCategory(owner->category, target, len, "Patch")) return false;
+    if (!IsRangeOpenToCaller(owner->category, target, len, "Patch")) return false;
     return PatchRegistry::Apply(target, bytesCopy.data(), len, owner->ownerId.c_str());
 }
 
@@ -3272,9 +3307,9 @@ __declspec(noinline) static bool HookUnpatch(void* target) {
     PluginBoundary::LoaderLockScope pbLockScope;
     auto owner = RequirePluginOwner(_ReturnAddress(), "Unpatch");
     if (!owner) return false;
-    // S1 域校验：Patch 时已按整段校验过，这里只校验目标点
+    // 地址开放性门：Patch 时已按整段校验过，这里只校验目标点
     // （PatchRegistry 没有现成的长度访问器，不为此改动别的文件）。
-    if (!AllowTargetForCategory(owner->category, target, "Unpatch")) return false;
+    if (!IsTargetOpenToCaller(owner->category, target, "Unpatch")) return false;
     return PatchRegistry::RevertOwned(target, owner->ownerId.c_str());
 }
 
@@ -4097,9 +4132,10 @@ void LoaderCore::ResetForReload() {
     // 钩上维护的数据）；旧映像此刻仍存活。
     FireGameCoreCallbacks(g_gameCoreTeardownCallbacks, "GameCoreTeardown");
 
-    // capture 站点的 providerFunction 位于旧 GameCore 映像内，重载后地址失效，必须随
-    // 重载清空全部捕获订阅。站点/stub/trampoline 不释放（M1），只拔插槽；等下次 Ready
-    // 回调由插件重新注册（注册时按代际重建，见 GetOrCreateHookSiteLocked）。
+    // capture 站点的目标位于旧 GameCore 映像内，重载后地址失效，必须随重载清空落在
+    // GameCore 域内的捕获订阅；exe / 常驻模块域上的订阅保留。站点/stub/trampoline 不释放
+    // （M1），只拔插槽；等下次 Ready 回调由插件重新注册（注册时按代际重建，见
+    // GetOrCreateHookSiteLocked）。
     CleanupAllCaptureSites();
 
     // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。
