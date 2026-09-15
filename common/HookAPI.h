@@ -38,10 +38,11 @@
 #define CIV6_PLUGIN_KIND_VALUE 2u
 #endif
 
-// 2u：删掉了 3 个入口成员（文明描述查询、GameCore Ready/Teardown 注册）—— 前缀破坏
-// （rule 3），因此必须 bump。此后回到"纯 append 不 bump"。
+
+// 预发布阶段（从未对外发布过任何插件）：删改前缀不升版本号，1 是唯一出现过的值。
+// 首次对外发布之后再破坏前缀，才按规则 3 递增。
 #ifndef CIV6_HOOK_API_VERSION
-#define CIV6_HOOK_API_VERSION 2u
+#define CIV6_HOOK_API_VERSION 1u
 #endif
 
 // Opaque Localization::String storage size for stack buffers (bytes). Prefer LocCreate/LocDestroy.
