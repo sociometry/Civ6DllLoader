@@ -18,11 +18,30 @@
 //  4. Compatibility is decided by structSize (see HookAPI_IsCompatible), not by the version
 //     number: a plugin built from a newer header observes runtime structSize < its own
 //     sizeof(HookAPI) and must refuse to run. apiVersion only covers rule 3.
-//  5. New plugins should call HookAPI_IsCompatible(api) at the top of OnLoad - see the
-//     example at the bottom of this header. Old plugins that never call it keep working,
-//     because they only ever touch fields that existed when they were built.
+//  5. Every plugin MUST call HookAPI_IsCompatible(api) at the top of OnLoad - see the example
+//     at the bottom of this header. Besides the version/size check it also declares the plugin
+//     kind (Global / GameCore) to the loader. A plugin that never declares is rejected at load
+//     time, and the kind gate at the bottom makes GameCore-only entries uncompilable in a
+//     Global plugin.
+/* Loader 侧（非插件 TU）：Loader 自己的两个工程在 vcxproj 预处理宏里【显式】定义
+   CIV6_HOOKAPI_BUILD_IMPL（DllLoaderRuntime.vcxproj / DllLoader.vcxproj 两侧的
+   PreprocessorDefinitions）。没有它，Loader 那些包含 HookAPI.h 的 TU 会命中文件尾部的
+   "必须声明插件类别" #error；插件工程不得定义它。 */
+
+// 插件类别取值（1=Global，2=GameCore；3 预留给未来的 Frontend）。
+// HookAPI_IsCompatible 位于本文件中段，扫描到它时文件尾部的门禁块还没有定义该值，
+// 因此这里先按插件宏定值；文件尾部的门禁块用 #ifndef 兜底定义同样的值。
+// Loader 侧（CIV6_HOOKAPI_BUILD_IMPL）不定义该值。
+#if defined(CIV6_PLUGIN_GLOBAL)
+#define CIV6_PLUGIN_KIND_VALUE 1u
+#elif defined(CIV6_PLUGIN_GAMECORE)
+#define CIV6_PLUGIN_KIND_VALUE 2u
+#endif
+
+// 2u：删掉了 3 个入口成员（文明描述查询、GameCore Ready/Teardown 注册）—— 前缀破坏
+// （rule 3），因此必须 bump。此后回到"纯 append 不 bump"。
 #ifndef CIV6_HOOK_API_VERSION
-#define CIV6_HOOK_API_VERSION 1u
+#define CIV6_HOOK_API_VERSION 2u
 #endif
 
 // Opaque Localization::String storage size for stack buffers (bytes). Prefer LocCreate/LocDestroy.
@@ -55,11 +74,6 @@ typedef void (*MessageHandlerFn)(const char* topic, const void* data, size_t len
 typedef int (*GameEventPushFn)(void* L, const void* payload);
 typedef void (*ScriptGlobalsFn)(void* L);
 
-// GameCore 生命周期回调（Global 插件延迟挂钩的标准姿势）。
-// context 原样回传，插件可放自己的状态指针。
-typedef void (*GameCoreReadyFn)(void* context);
-typedef void (*GameCoreTeardownFn)(void* context);
-
 // 可被插件寻址的具体 PE 映像。同一时刻一个 exe 与一个 GameCore 可以共存。
 typedef enum HookImageId {
     kHookImageInvalid = 0,
@@ -84,7 +98,6 @@ typedef struct HookImageInfo {
     HookImageId image;
     uintptr_t base;
     size_t imageSize;
-    uint64_t generation;  // exe 恒为 1；GameCore 每次 attach 递增
 } HookImageInfo;
 
 // ---- 通用取址描述（不限映像；exe 域配 HookInfoExe 二选一）----
@@ -184,13 +197,13 @@ typedef struct HookAPI {
     // 槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。
     void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
 
-    // Failed：本次没有新增登记/方法，先前已接受的登记保留。
-    // Deferred：已接受登记，GameCore 就绪时自动尝试安装；Installed：本次已安装。
+    // Failed：本次没有安装任何方法（GameCore 未就绪、符号解析失败，或与同一 target 上
+    //   的既有定义冲突）；Installed：本次已安装。Deferred 取值保留但不再产生 —— Loader
+    //   不再为下一代 GameCore 保存登记表，登记只在当次安装内生效。
     // 同 owner + target + exposedName 的相同定义重复调用幂等；同 target 的同名
     // 不同定义（包括不同 owner）整批拒绝。函数和 internalName/exposedName 均须非空。
-    // 参数由 Loader 复制，登记保留到插件停用；Global 插件跨 GameCore 重载自动重装。
-    // 延迟安装失败会记日志并保留登记，可用相同参数重试。原 PushMethods 由 Loader
-    // 自动调用，本接口不再返回其 trampoline；预发布插件须按当前头文件重新编译。
+    // 参数由 Loader 复制。原 PushMethods 由 Loader 自动调用，本接口不再返回其
+    // trampoline；预发布插件须按当前头文件重新编译。
     HookApiPushMethodsResult (*PushLuaMethods)(const char* name, const LuaMethodInfo* methods, uint32_t count);
 
     void (*RegisterScriptGlobals)(ScriptGlobalsFn fn);
@@ -257,35 +270,19 @@ typedef struct HookAPI {
     const char* (*LocToUtf8)(void* loc);
 
     void* (*EditPlayer)(int playerId);
-    const char* (*GetCivilizationDescription)(void* player);
+    // 字符串哈希：不再解析 GameCore 符号，改为 Loader 内部实现的原生 CRC32（raw，
+    // 无最终异或，与官方 GameCore::Utilities::MakeHash 逐位一致）。对局前/重载后都能算。
     uint32_t (*MakeHash)(const char* str);
 
     // 注册插件自己的 PushMethods 目标配置。pushMethodsSymbol 为空时使用 name + "::PushMethods"；
-    // 非空时该完整符号名会同时用于首次解析和 GameCore 重载后的重装。
+    // 非空时该完整符号名用于解析本次安装的目标。
     // 配置按调用插件 owner 隔离，不能覆盖 Loader 内置目标或其他插件配置；同 owner 重复配置
-    // 必须完全一致，已有该目标登记后也不能修改配置。name 指针必须来自调用插件模块。
+    // 必须完全一致。name 指针必须来自调用插件模块。
     int (*RegisterPushMethodsTarget)(const char* name, int sigType, const char* pushMethodsSymbol);
 
     // v2: 原始字节补丁（单层存档，见 patch registry）。由运行时在初始化时填表。
     bool (*Patch)(void* target, const void* bytes, size_t len);
     bool (*Unpatch)(void* target);
-
-    // v2.1: GameCore 生命周期回调 —— Global 插件延迟挂钩的标准姿势：
-    //   OnLoad → 先 RegisterGameCoreTeardown(teardown) → 再 RegisterGameCoreReady(ready)
-    //   → ready 内 ResolveByName/ResolveByRva + InstallHook/Patch。
-    // 语义要点：
-    //  - Ready 回调在游戏线程、新 GameCore attach 后触发（早于 GameCore 插件加载）；
-    //    注册时若 GameCore 已就绪（如对局中加载的插件），回调立即补调一次。
-    //  - Teardown 回调在旧 GameCore 映像卸载前触发；该代插件钩已被禁用，仍可
-    //    解析符号读数据收尾，但禁止再对旧映像装钩/打补丁（会被拒绝）。
-    //    Global 插件若要 InstallHook 到 GameCore，必须先注册 Teardown，否则拒绝。
-    //  - 每次重载为一"代"：teardown 后该代 GameCore 域的钩与补丁会被运行时统一
-    //    撤销——插件须在 Teardown 返回前排空自身在途 detour 并置空 original
-    //    trampoline；下一次 Ready 回调重新安装并取得新 trampoline。
-    //  - 回调应保持短小（持运行时生命周期锁执行，重活自行开线程）；崩溃的回调
-    //    会被 SEH 捕获，插件随之被隔离（其全部注册被回滚）。
-    void (*RegisterGameCoreReady)(GameCoreReadyFn fn, void* context);
-    void (*RegisterGameCoreTeardown)(GameCoreTeardownFn fn, void* context);
 
     // GameEvents：纯登记 + 插件端手动触发。name 为 GameEvent 名（如 "MyCustomEvent"），
     // 最长 95 个字节（不含结尾 NUL）；超长名称直接返回 false，不会截断或占用槽位。
@@ -321,15 +318,30 @@ typedef struct HookAPI {
 
     // Lua nil 入栈（hks ?hksi_lua_pushnil 导出）。参数打包回调里构造 nil 参数用。
     void (*LuaPushNil)(void* L);
+
+    // 插件把"编译期类别 + 头文件版本 + 自己的 sizeof(HookAPI)"报给 Loader（由 HookAPI_IsCompatible 代调）。
+    // Loader 据此与"安装路径推出的类别/当前 apiVersion"对账，并在 OnLoad 结束时强制要求声明过。
+    bool (*DeclarePluginKind)(const HookAPI* api, uint32_t kind, uint32_t apiVersion, uint32_t pluginStructSize);
 } HookAPI;
 
 // True if this runtime can serve a plugin built from this header.
 // Call it once at the top of OnLoad and abort if it returns 0: the second test is the
 // append-only case (runtime table shorter than this plugin's header), the first is the
-// breaking-change case (rule 3). Plugins that never call it are still safe as long as the
-// prefix rules were respected when the loader was updated.
+// breaking-change case (rule 3). It also declares this plugin kind/version to the loader
+// (DeclarePluginKind), so calling it is mandatory: the loader rejects a plugin that never
+// declares.
 static inline int HookAPI_IsCompatible(const HookAPI* api) {
     if (!api) return 0;
+#if defined(CIV6_PLUGIN_GLOBAL) || defined(CIV6_PLUGIN_GAMECORE)
+    // 插件侧：先向 Loader 声明"编译期类别 + 头文件版本 + 自己的 sizeof(HookAPI)"；
+    // 声明失败（类别与安装路径推出的不符 / apiVersion 不符）直接返回 0。
+    // 表短到没有该字段（旧 Loader）时不读越界，交给下面的版本检查拒绝。
+    const uint32_t declareMinSize = static_cast<uint32_t>(
+        offsetof(HookAPI, DeclarePluginKind) + sizeof(api->DeclarePluginKind));
+    if (api->structSize >= declareMinSize && api->DeclarePluginKind &&
+        !api->DeclarePluginKind(api, CIV6_PLUGIN_KIND_VALUE,
+                                CIV6_HOOK_API_VERSION, (uint32_t)sizeof(HookAPI))) return 0;
+#endif
     if (api->apiVersion != CIV6_HOOK_API_VERSION) return 0;
     if (api->structSize < sizeof(HookAPI)) return 0;
     return 1;
@@ -661,3 +673,29 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
 //   }
 // This is how a plugin built from a newer header detects an older runtime instead of
 // reading past the end of the table. The table itself is read-only - writing to it faults.
+/* ---- 插件类别门禁（纯编译期语法门：不改结构体、不改布局） ---- */
+#if !defined(CIV6_PLUGIN_GLOBAL) && !defined(CIV6_PLUGIN_GAMECORE) && !defined(CIV6_HOOKAPI_BUILD_IMPL)
+#error "CIV6: 必须声明插件类别：在工程预处理宏里定义 CIV6_PLUGIN_GLOBAL 或 CIV6_PLUGIN_GAMECORE"
+#endif
+
+#if defined(CIV6_PLUGIN_GLOBAL)
+#ifndef CIV6_PLUGIN_KIND_VALUE
+#define CIV6_PLUGIN_KIND_VALUE 1u
+#endif
+/* GameCore 专属入口：对象式宏重命名 -> 调用或取地址都在编译期报"不是 HookAPI 的成员"。
+   结构体字段一个没少、偏移一个没变，只是这些名字在本 TU 里指向了不存在的成员。 */
+#define GetEngineUtility           CIV6_ERROR_GetEngineUtility_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define EditPlayer                 CIV6_ERROR_EditPlayer_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define RegisterGameEvent          CIV6_ERROR_RegisterGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define TriggerGameEvent           CIV6_ERROR_TriggerGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define RegisterScriptGlobals      CIV6_ERROR_RegisterScriptGlobals_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define RegisterScriptGlobalsForUI CIV6_ERROR_RegisterScriptGlobalsForUI_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define PushLuaMethods             CIV6_ERROR_PushLuaMethods_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define RegisterPushMethodsTarget  CIV6_ERROR_RegisterPushMethodsTarget_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#elif defined(CIV6_PLUGIN_GAMECORE)
+#ifndef CIV6_PLUGIN_KIND_VALUE
+#define CIV6_PLUGIN_KIND_VALUE 2u
+#endif
+/* GameCore 类别：当前没有"只给 Global 用"的入口，无需重命名任何成员。 */
+#endif
+

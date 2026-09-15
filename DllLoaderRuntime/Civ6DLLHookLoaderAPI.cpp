@@ -56,6 +56,12 @@ struct PluginEntry {
     std::wstring ownerId;
     LoaderCore::PluginCategory category = LoaderCore::PluginCategory::Global;
     PluginState state = PluginState::Active;
+    // 插件经 DeclarePluginKind 自述的类别/版本（OnLoad 返回前必须已声明，
+    // 见 LoadPluginDllInternal 的强制校验）。kindDeclared=false = 未声明，拒载。
+    bool kindDeclared = false;
+    uint32_t declaredKind = 0;
+    uint32_t declaredApiVersion = 0;
+    uint32_t declaredStructSize = 0;
 };
 static vector<PluginEntry> g_plugins;
 
@@ -73,6 +79,10 @@ static void SetPluginState(PluginEntry& entry, PluginState state) {
 // Runtime::MinHookMutex（MinHook 调用 + owner 表）与 PatchRegistry 的
 // CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
 static std::recursive_mutex g_pluginLifecycleMutex;
+
+// GameCore 阶段切换互斥（InitializeGameCorePhase / ResetForReload 与插件加载/卸载互斥）：
+// 保证 "attach -> 装钩 -> 加载 GameCore 插件" 与 "teardown -> 卸载" 两段不会交错。
+static std::recursive_mutex g_gameCoreTransitionMutex;
 
 // 插件回调在途登记 / 排空统一走 PluginInFlight（见 PluginInFlight.h）。
 // 原先进程里散着几套等价实现（本文件的 PluginCallbackState / PluginCallbackGuard /
@@ -192,15 +202,6 @@ static const unordered_map<string, PushTargetConfig> g_defaultPushTargetConfigs 
 static unordered_map<std::wstring, unordered_map<string, PushTargetConfig>>
     g_pluginPushTargetConfigs;
 
-struct PushRegistration {
-    std::string targetName;
-    PushMethodSigType signature = PushMethodSigType::NoManager;
-    std::vector<StoredLuaMethod> methods;
-    std::wstring owner;
-    std::string symbolName;
-};
-static std::vector<PushRegistration> g_pushRegistrations;
-
 // Symbol RVAs live in Civ6DllLoader.symdb.bin (see PdataMatch.cpp).
 
 static mutex g_scriptStateMutex;
@@ -276,6 +277,19 @@ static bool TargetInCurrentGameCore(void* target) {
 // CategoryNameForLog 的定义在本文件后部（LoaderCore 实现段），此处前向声明，
 // 供下面的地址开放性日志使用。
 static const char* CategoryNameForLog(LoaderCore::PluginCategory cat);
+
+// GameCore 专属入口的运行期兜底门：编译期门禁（HookAPI.h 的宏重命名）之外的第二道门，
+// 防的是不带 HookAPI.h、按结构体偏移直接调这些入口的插件。owner 缺失或不是 GameCore
+// 类别一律拒绝，调用方按各自原失败值返回。
+static bool RequireGameCoreOwner(const void* codeAddress, const char* apiName) {
+    const auto owner = ResolvePluginOwnerForAddress(codeAddress);
+    if (!owner || owner->category != LoaderCore::PluginCategory::GameCore) {
+        Logger::Log("%s rejected: GameCore-only API called by %s", apiName,
+            owner ? CategoryNameForLog(owner->category) : "unknown");
+        return false;
+    }
+    return true;
+}
 
 // ================= 地址开放性门：调用方类别 × 目标地址域 =================
 // 只对"取地址/给地址"的入口设门。域的划分依据：GameCore 映像是随对局重载的【短命域】，
@@ -1300,8 +1314,8 @@ void* LoaderCore::ResolveDataByAobCore(HookImageId image, const char* aob, uint3
 // ---------------- 站点捕获槽退役（只拔插槽，绝不物理脱钩） ----------------
 // 两个失效场景：
 //  1) GameCore 重载：目标位于旧 GameCore 映像内，重载后地址失效，清空落在当前 GameCore
-//     映像内的捕获订阅（ResetForReload 调用 CleanupAllCaptureSites），等下次 Ready 回调
-//     由插件重新注册；exe / 常驻模块域上的订阅与重载无关，保留；
+//     映像内的捕获订阅（ResetForReload 调用 CleanupAllCaptureSites），等插件下次 OnLoad
+//     自行重新注册；exe / 常驻模块域上的订阅与重载无关，保留；
 //  2) 插件卸载：捕获槽的 out 指向插件内存，卸载后悬空（UnloadPluginByOwnerId 调用
 //     CleanupCaptureSitesForOwner）。
 // 硬约束 M1：这里【只】清空 captureOuts / 翻转 hasCapture，绝不 MH_RemoveHook、绝不
@@ -1449,11 +1463,20 @@ static void* GetCurrentGameSlot() {
 }
 
 // GameCore::EngineUtility 全局（ms_pkCurrentGame 槽 +0x18，与 scriptSystem +0x20 同族）。
-// 锁协议（官方 Utility::CallHook 同款）：插件在持锁上下文做 Lua 工作前调用。
-void* GetEngineUtilityImpl() {
+// 锁协议（官方 Utility::CallHook 同款）。内部无门版本：Loader 自己的 Lua 锁协议路径
+// （GameEventInvokeLuaImpl）必须能取到它 —— 那里 _ReturnAddress() 会落在 Loader 模块，
+// 若走带门的 GetEngineUtilityImpl 会被 GameCore 门拒绝而误伤 TriggerGameEvent。
+static void* GetEngineUtilityCore() {
     void* currentGameSlot = GetCurrentGameSlot();
     if (!currentGameSlot) return nullptr;
     return GameEventReadPtrSafe(static_cast<const char*>(currentGameSlot) + 0x18, 0);
+}
+
+// 插件可见入口：只对 GameCore 类别插件开放（调用方由返回地址反查）。
+#pragma intrinsic(_ReturnAddress)
+void* GetEngineUtilityImpl() {
+    if (!RequireGameCoreOwner(_ReturnAddress(), "GetEngineUtility")) return nullptr;
+    return GetEngineUtilityCore();
 }
 
 // 当前活跃游戏 Lua 状态——官方 GameCore::ScriptSystem::CallHook 同款（IDA 实证）：
@@ -1622,7 +1645,7 @@ static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
     // 锁协议（官方 Utility::CallHook 同款）：持锁则先释放，Lua 工作完成后恢复。
     // EngineUtility 解析失败 / 取放锁调用异常 = GameCore 锁状态未知：此时不进入 Lua
     //（带锁重入 Lua 可能自死锁或破坏 Lua 状态），本次触发直接拒绝并限次告警。
-    void* eu = GetEngineUtilityImpl();
+    void* eu = GetEngineUtilityCore();
     void** engineVtable = nullptr;   // 供 __finally 里取回锁使用（必须是 POD 局部）
     bool had = false;                // HasGameCoreLock 返回 true
     bool released = false;           // Release【正常返回】——只有这种情况才必须取回
@@ -1707,6 +1730,7 @@ __declspec(noinline)
 bool TriggerGameEventImpl(const char* name, const void* payload) {
     if (!name || !*name) return false;
     const void* callerAddress = _ReturnAddress();
+    if (!RequireGameCoreOwner(callerAddress, "TriggerGameEvent")) return false;
 
     // name 是插件内存：锁外抄写。原实现在锁内做 strcmp(ev.name, name)，一个悬垂的
     // 事件名指针就会在持锁状态下访存失败 -> lock_guard 不析构 -> 锁永久泄漏。
@@ -1784,6 +1808,7 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
         Logger::Log("RegisterGameEvent: no plugin owner");
         return false;
     }
+    if (!RequireGameCoreOwner(ownerProbe, "RegisterGameEvent")) return false;
     // 键 = (owner, name)。同一插件重复注册幂等；**不同插件抢同名必须拒绝**。
     // 原实现不比较 owner 就 return true：调用方以为注册成功，实际它的 pushFn 被丢弃，
     // 之后它触发该名字时拿到的是【别人】的 pushFn，payload 布局不一致 -> 越界/类型混淆。
@@ -1889,6 +1914,10 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
     auto owner = RequirePluginOwner(
         reinterpret_cast<const void*>(copies[0].luaMethodFunc), "PushLuaMethods");
     if (!owner) return kHookApiPushMethodsFailed;
+    if (!RequireGameCoreOwner(
+            reinterpret_cast<const void*>(copies[0].luaMethodFunc), "PushLuaMethods")) {
+        return kHookApiPushMethodsFailed;
+    }
     const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
         [&owner](const PluginEntry& entry) {
             return entry.ownerId == owner->ownerId &&
@@ -1915,72 +1944,42 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         return kHookApiPushMethodsFailed;
     }
 
-    // 每个 owner/target 仅有一份登记；请求可以是重复、重排或部分重叠的批次。
-    size_t registrationIndex = g_pushRegistrations.size();
-    PushRegistration candidate{ targetName, config.signature, {}, owner->ownerId, config.symbolName };
-    for (size_t i = 0; i < g_pushRegistrations.size(); ++i) {
-        const auto& registration = g_pushRegistrations[i];
-        if (registration.owner == owner->ownerId && registration.targetName == targetName) {
-            if (registration.signature != candidate.signature ||
-                    registration.symbolName != candidate.symbolName) {
-                return kHookApiPushMethodsFailed;
-            }
-            candidate = registration;
-            registrationIndex = i;
-            break;
-        }
-    }
+    // 同一批内的去重/冲突预检：整批验证通过后才安装。安装侧（InstallPushMethods*）会再
+    // 与槽位上已有的定义合并一次，跨 owner 抢占同一 exposedName 在那里被整批拒绝。
+    vector<StoredLuaMethod> batch;
     for (uint32_t i = 0; i < count; ++i) {
         // 每个方法都必须属于同一个插件（owner 一致）；名字为空由 MergeLuaMethod 判非法。
         auto methodOwner = RequirePluginOwner(
             reinterpret_cast<const void*>(copies[i].luaMethodFunc), "PushLuaMethods");
         if (!methodOwner || methodOwner->ownerId != owner->ownerId ||
-                !MergeLuaMethod(candidate.methods, copies[i])) {
+                !MergeLuaMethod(batch, copies[i])) {
             Logger::Log("PushLuaMethods rejected: invalid or conflicting method for %s",
                 targetName.c_str());
             return kHookApiPushMethodsFailed;
         }
     }
-    // 同一个 Lua 表的字段不允许被另一个 owner 的登记隐式覆盖，延迟阶段也校验。
-    for (const auto& registration : g_pushRegistrations) {
-        if (registration.targetName != targetName || registration.owner == owner->ownerId) continue;
-        for (const auto& method : candidate.methods) {
-            if (std::any_of(registration.methods.begin(), registration.methods.end(),
-                    [&method](const StoredLuaMethod& existing) {
-                        return existing.exposedName == method.exposedName;
-                    })) {
-                Logger::Log("PushLuaMethods rejected: field %s of %s belongs to another owner",
-                    method.exposedName.c_str(), targetName.c_str());
-                return kHookApiPushMethodsFailed;
-            }
-        }
-    }
 
-    // 安装前完成登记容器分配；成功后的发布只移动/交换已构造的数据。
-    const bool isNew = registrationIndex == g_pushRegistrations.size();
-    if (isNew) g_pushRegistrations.reserve(g_pushRegistrations.size() + 1);
-    if (g_gameCorePhaseReady) {
-        const std::string& symbolName = candidate.symbolName;
-        void* target = ResolveCurrentGameCoreByName(symbolName.c_str());
-        if (!target) {
-            Logger::Log("PushLuaMethods: resolve failed: %s", symbolName.c_str());
-            return kHookApiPushMethodsFailed;
-        }
-        void* base = candidate.signature == PushMethodSigType::NoManager
-            ? InstallPushMethodsNoManager(target, candidate.methods, owner->ownerId)
-            : InstallPushMethodsWithManager(target, candidate.methods, owner->ownerId);
-        if (!base) {
-            Logger::Log("PushLuaMethods: install failed: %s", symbolName.c_str());
-            return kHookApiPushMethodsFailed;
-        }
+    // 登记只在当次安装内生效：Loader 不再为下一代 GameCore 保存登记表，因此 GameCore
+    // 未就绪时无法延迟安装（Deferred 不再产生），直接失败。
+    if (!g_gameCorePhaseReady) {
+        Logger::Log("PushLuaMethods: GameCore not ready; cannot install %s "
+                    "(no deferred registration)", targetName.c_str());
+        return kHookApiPushMethodsFailed;
     }
-
-    if (isNew) {
-        g_pushRegistrations.push_back(std::move(candidate));
-    } else {
-        g_pushRegistrations[registrationIndex].methods.swap(candidate.methods);
+    const std::string& symbolName = config.symbolName;
+    void* target = ResolveCurrentGameCoreByName(symbolName.c_str());
+    if (!target) {
+        Logger::Log("PushLuaMethods: resolve failed: %s", symbolName.c_str());
+        return kHookApiPushMethodsFailed;
     }
-    return g_gameCorePhaseReady ? kHookApiPushMethodsInstalled : kHookApiPushMethodsDeferred;
+    void* base = config.signature == PushMethodSigType::NoManager
+        ? InstallPushMethodsNoManager(target, batch, owner->ownerId)
+        : InstallPushMethodsWithManager(target, batch, owner->ownerId);
+    if (!base) {
+        Logger::Log("PushLuaMethods: install failed: %s", symbolName.c_str());
+        return kHookApiPushMethodsFailed;
+    }
+    return kHookApiPushMethodsInstalled;
 }
 
 namespace {
@@ -2065,11 +2064,11 @@ void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State
     }
 }
 
-// 确保已注册回调对应的共享钩子已装上。三条调用路径：
-//  1) 插件 RegisterScriptGlobals 首次注册（原有路径）；
-//  2) GameCore 重载后 InitializeGameCorePhase 再调（钩子已随 ResetForReload 摘除，
-//     回调列表跨重载保留——Global 插件仍加载着，其注册项不丢）；
-//  3) 阶段 B 首次进入时列表已非空（Global 插件在阶段 A 注册过）。
+// 确保已注册回调对应的共享钩子已装上。两条调用路径：
+//  1) 插件 RegisterScriptGlobals / RegisterScriptGlobalsForUI 注册时；
+//  2) GameCore 重载后 InitializeGameCorePhase 再调。
+// 共享钩的 MinHook 记录随旧 GameCore 映像在 ResetForReload 里被物理摘除，因此重载后
+// 必须按【当次】仍存在的注册项重新装钩；不存在跨代保留的注册列表。
 // 检查+安装整体持锁，消除并发首装的重复创建竞态。安装走统一站点表，天然幂等，
 // 因此不需要「已装就早退」标志：重复调用只是复用同一站点、刷新 g_orig* 跳板。
 static void EnsureScriptHooksInstalled() {
@@ -2106,239 +2105,22 @@ static void EnsureScriptHooksInstalled() {
 
 }  // namespace
 
-// ---- GameCore 生命周期回调（Global 插件延迟挂钩，语义见 HookAPI.h 尾部文档）----
-
-// 前置声明（定义于本文件后部）：回调崩溃时按 owner 隔离（与 OnLoad 崩溃同构）。
+// 前置声明（定义于本文件后部）：隔离某 owner 的全部注册（OnLoad 失败 / 未声明插件类别 /
+// 回调崩溃），与 OnLoad 崩溃同构。
 static void QuarantinePluginByOwner(const std::wstring& ownerId);
-
-namespace {
-
-struct GameCoreCallbackEntry {
-    std::wstring owner;
-    void (*fn)(void*) = nullptr;
-    std::atomic<void*> context{ nullptr };
-    std::atomic<bool> enabled{ true };
-    std::atomic<uint32_t> activeCalls{ 0 };
-    mutex drainMutex;
-    condition_variable drainCv;
-};
-
-using GameCoreCallbackPtr = std::shared_ptr<GameCoreCallbackEntry>;
-std::vector<GameCoreCallbackPtr> g_gameCoreReadyCallbacks;
-std::vector<GameCoreCallbackPtr> g_gameCoreTeardownCallbacks;
-mutex g_gameCoreCallbackMutex;
-std::recursive_mutex g_gameCoreTransitionMutex;
-thread_local GameCoreCallbackEntry* g_currentGameCoreCallback;
-
-// 登记回调（同 owner + 同 fn 幂等：重复注册仅刷新 context）。
-std::pair<GameCoreCallbackPtr, bool> AddGameCoreCallback(
-        std::vector<GameCoreCallbackPtr>& reg, const std::wstring& owner,
-        void (*fn)(void*), void* context, const char* apiName) {
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
-        [&owner](const PluginEntry& entry) {
-            return entry.ownerId == owner &&
-                (entry.state == PluginState::Loading ||
-                 entry.state == PluginState::Active);
-        });
-    if (plugin == g_plugins.end()) {
-        Logger::Log("%s rejected: owner is no longer active (%ls)",
-            apiName, owner.c_str());
-        return { nullptr, false };
-    }
-    lock_guard<mutex> cbLock(g_gameCoreCallbackMutex);
-    for (auto& existing : reg) {
-        if (existing->owner == owner && existing->fn == fn) {
-            existing->context.store(context, std::memory_order_release);
-            return { existing, false };
-        }
-    }
-    auto entry = std::make_shared<GameCoreCallbackEntry>();
-    entry->owner = owner;
-    entry->fn = fn;
-    entry->context.store(context, std::memory_order_release);
-    Logger::Log("%s: registered owner=%ls", apiName, owner.c_str());
-    reg.push_back(entry);
-    return { entry, true };
-}
-
-__declspec(noinline) bool CallGameCoreCallbackSeh(
-        const GameCoreCallbackPtr& entry, const char* phase) {
-    __try {
-        entry->fn(entry->context.load(std::memory_order_acquire));
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::Log("%s: callback crashed owner=%ls code=0x%08X; quarantining",
-            phase, entry->owner.c_str(), GetExceptionCode());
-        return false;
-    }
-}
-
-bool CallGameCoreCallbackSafe(const GameCoreCallbackPtr& entry, const char* phase) noexcept {
-    try {
-        return CallGameCoreCallbackSeh(entry, phase);
-    } catch (...) {
-        Logger::Log("%s: callback threw C++ exception owner=%ls; quarantining",
-            phase, entry->owner.c_str());
-        return false;
-    }
-}
-
-bool AdmitGameCoreCallback(const GameCoreCallbackPtr& entry) {
-    if (!entry || !entry->enabled.load(std::memory_order_acquire)) return false;
-    entry->activeCalls.fetch_add(1, std::memory_order_acq_rel);
-    if (entry->enabled.load(std::memory_order_acquire)) return true;
-    if (entry->activeCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        lock_guard<mutex> lock(entry->drainMutex);
-        entry->drainCv.notify_all();
-    }
-    return false;
-}
-
-void InvokeAdmittedGameCoreCallback(const GameCoreCallbackPtr& entry,
-                                    const char* phase) {
-    Logger::Log("%s: begin owner=%ls", phase, entry->owner.c_str());
-    auto* previous = g_currentGameCoreCallback;
-    g_currentGameCoreCallback = entry.get();
-    const bool succeeded = CallGameCoreCallbackSafe(entry, phase);
-    g_currentGameCoreCallback = previous;
-    if (succeeded) {
-        Logger::Log("%s: end owner=%ls", phase, entry->owner.c_str());
-    }
-    if (entry->activeCalls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        lock_guard<mutex> lock(entry->drainMutex);
-        entry->drainCv.notify_all();
-    }
-    if (!succeeded) {
-        QuarantinePluginByOwner(entry->owner);
-    }
-}
-
-void DisableAndDrainGameCoreCallbacks(
-        const std::vector<GameCoreCallbackPtr>& callbacks) {
-    for (const auto& entry : callbacks) {
-        entry->enabled.store(false, std::memory_order_release);
-    }
-    for (const auto& entry : callbacks) {
-        if (entry.get() == g_currentGameCoreCallback) continue;
-        unique_lock<mutex> lock(entry->drainMutex);
-        entry->drainCv.wait(lock, [&entry] {
-            return entry->activeCalls.load(std::memory_order_acquire) == 0;
-        });
-    }
-}
-
-void WaitForGameCoreCallbacks(const std::vector<GameCoreCallbackPtr>& registry) {
-    std::vector<GameCoreCallbackPtr> snapshot;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        lock_guard<mutex> cbLock(g_gameCoreCallbackMutex);
-        snapshot = registry;
-    }
-    for (const auto& entry : snapshot) {
-        if (entry.get() == g_currentGameCoreCallback) continue;
-        unique_lock<mutex> lock(entry->drainMutex);
-        entry->drainCv.wait(lock, [&entry] {
-            return entry->activeCalls.load(std::memory_order_acquire) == 0;
-        });
-    }
-}
-
-void RemoveGameCoreCallbacksFor(const std::wstring& owner) {
-    std::vector<GameCoreCallbackPtr> removed;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        lock_guard<mutex> cbLock(g_gameCoreCallbackMutex);
-        auto removeOwned = [&owner, &removed](auto& reg) {
-            for (auto it = reg.begin(); it != reg.end(); ) {
-                if ((*it)->owner == owner) {
-                    removed.push_back(*it);
-                    it = reg.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        };
-        removeOwned(g_gameCoreReadyCallbacks);
-        removeOwned(g_gameCoreTeardownCallbacks);
-    }
-    DisableAndDrainGameCoreCallbacks(removed);
-}
-
-}  // namespace
-
-void RegisterGameCoreReadyImpl(GameCoreReadyFn fn, void* context) {
-    if (!fn) return;
-    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn), "RegisterGameCoreReady");
-    if (!owner) return;
-    auto [entry, inserted] = AddGameCoreCallback(
-        g_gameCoreReadyCallbacks, owner->ownerId, fn, context, "RegisterGameCoreReady");
-    if (!entry) return;
-    // 注册即触发：GameCore 已就绪（如对局中 reconcile 新加载的插件）时立即补调，
-    // 不必等下一次重载。
-    bool admitted = false;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        admitted = inserted && g_gameCorePhaseReady &&
-            g_currentGameCoreCallback != entry.get() &&
-            AdmitGameCoreCallback(entry);
-    }
-    if (admitted) {
-        InvokeAdmittedGameCoreCallback(entry, "GameCoreReady(immediate)");
-    }
-}
-
-void RegisterGameCoreTeardownImpl(GameCoreTeardownFn fn, void* context) {
-    if (!fn) return;
-    auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn), "RegisterGameCoreTeardown");
-    if (!owner) return;
-    AddGameCoreCallback(g_gameCoreTeardownCallbacks, owner->ownerId, fn, context,
-                        "RegisterGameCoreTeardown");
-}
-
-static std::vector<GameCoreCallbackPtr> SnapshotGameCoreCallbacks(
-        const std::vector<GameCoreCallbackPtr>& reg) {
-    std::vector<GameCoreCallbackPtr> snapshot;
-    lock_guard<mutex> cbLock(g_gameCoreCallbackMutex);
-    snapshot = reg;
-    return snapshot;
-}
-
-// 逐条准入、逐条执行：同 owner 的前一回调若崩溃并隔离，后续条目已被禁用，
-// 不会因批量预先增加 activeCalls 而让隔离线程等待自己尚未执行的条目。
-static void FireGameCoreCallbackSnapshot(
-        const std::vector<GameCoreCallbackPtr>& snapshot, const char* phase) {
-    for (const auto& entry : snapshot) {
-        bool admitted = false;
-        {
-            lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-            admitted = AdmitGameCoreCallback(entry);
-        }
-        if (admitted) InvokeAdmittedGameCoreCallback(entry, phase);
-    }
-}
-
-static void FireGameCoreCallbacks(std::vector<GameCoreCallbackPtr>& reg,
-                                  const char* phase) {
-    std::vector<GameCoreCallbackPtr> snapshot;
-    {
-        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        snapshot = SnapshotGameCoreCallbacks(reg);
-    }
-    FireGameCoreCallbackSnapshot(snapshot, phase);
-}
 
 void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
     if (!fn) return;
     // owner 校验与登记必须在同一把生命周期锁内完成。原实现先 RequirePluginOwner（内部取锁
     // 后释放）、再单独取锁 push_back：这中间若插件被停用并跑完 RemovePluginOwnedRegistrations，
-    // 本次登记就永远清不掉（停用期间被守卫挡住，重新启用后又随新 generation 复活 ->
-    // 每次"禁用->启用"都多注册一份）。RequirePluginOwner 内部取的是同一把递归锁，重入安全。
+    // 本次登记就永远清不掉（停用期间被守卫挡住，重新启用后又会多注册一份）。
+    // RequirePluginOwner 内部取的是同一把递归锁，重入安全。
     {
         lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
         auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
                                         "RegisterScriptGlobals");
         if (!owner) return;
+        if (!RequireGameCoreOwner(reinterpret_cast<const void*>(fn), "RegisterScriptGlobals")) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobals.push_back(
             ScriptGlobalsEntry{ owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
@@ -2354,6 +2136,8 @@ void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
         auto owner = RequirePluginOwner(reinterpret_cast<const void*>(fn),
                                         "RegisterScriptGlobalsForUI");
         if (!owner) return;
+        if (!RequireGameCoreOwner(reinterpret_cast<const void*>(fn),
+                                  "RegisterScriptGlobalsForUI")) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobalsUI.push_back(
             ScriptGlobalsEntry{ owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
@@ -2661,41 +2445,6 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
     state.methodOwners.swap(mergedOwners);
     return reinterpret_cast<void*>(state.base);
 }
-
-static void ReinstallPushRegistrations() {
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    if (!g_gameCorePhaseReady) return;
-    size_t installed = 0;
-    for (const auto& registration : g_pushRegistrations) {
-        const auto plugin = std::find_if(g_plugins.begin(), g_plugins.end(),
-            [&registration](const PluginEntry& entry) {
-                return entry.ownerId == registration.owner &&
-                    (entry.state == PluginState::Loading || entry.state == PluginState::Active);
-            });
-        if (plugin == g_plugins.end()) continue;
-        const std::string& symbolName = registration.symbolName;
-        void* target = ResolveCurrentGameCoreByName(symbolName.c_str());
-        if (!target) {
-            Logger::Log("ReinstallPushRegistrations: missing %s",
-                        symbolName.c_str());
-            continue;
-        }
-        void* base = registration.signature == PushMethodSigType::NoManager
-            ? InstallPushMethodsNoManager(target, registration.methods,
-                                          registration.owner)
-            : InstallPushMethodsWithManager(target, registration.methods,
-                                            registration.owner);
-        if (base) {
-            ++installed;
-        } else {
-            Logger::Log("ReinstallPushRegistrations: install failed, registration retained: %s owner=%ls",
-                symbolName.c_str(), registration.owner.c_str());
-        }
-    }
-    Logger::Log("ReinstallPushRegistrations: installed=%zu registered=%zu",
-                installed, g_pushRegistrations.size());
-}
-
 
 // hks 导入缺失时的统一降级：安全默认值 + 限次日志（脚本可能高频调用，不能每次刷日志）。
 // 导入缺失在 InitHavokScript 已整体告警并停用 GameCore 插件加载；此处是纵深防御
@@ -3059,44 +2808,25 @@ const char* LocToUtf8Impl(void* loc) {
 }
 
 using EditPlayerFn = void*(__fastcall*)(int playerId);
-using GetCivDescFn = const char*(__fastcall*)(void* player);
 
 static EditPlayerFn ResolveEditPlayer() {
     return reinterpret_cast<EditPlayerFn>(
         ResolveCurrentGameCoreByName("GameCore::Context::Globals::EditPlayer"));
 }
-static GetCivDescFn ResolveGetCivDesc() {
-    return reinterpret_cast<GetCivDescFn>(
-        ResolveCurrentGameCoreByName("GameCore::Player::Instance::GetCivilizationDescription"));
-}
 
 void* EditPlayerImpl(int playerId) {
+    if (!RequireGameCoreOwner(_ReturnAddress(), "EditPlayer")) return nullptr;
     auto fn = ResolveEditPlayer();
     if (!fn) {
         Logger::Log("EditPlayer: symbol missing");
         return nullptr;
     }
-    // 对局开始前（Ready 回调时机）ms_pkCurrentGame 尚未初始化，引擎 EditPlayer 会
+    // 对局开始前 ms_pkCurrentGame 尚未初始化，引擎 EditPlayer 会
     // 解引用 null 而 AV——SEH 兜底返回 nullptr（对局前调用本就没有意义，属调用方时序错误）。
     __try {
         return fn(playerId);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("EditPlayer: engine call failed (game not started?)");
-        return nullptr;
-    }
-}
-
-const char* GetCivilizationDescriptionImpl(void* player) {
-    if (!player) return nullptr;
-    auto fn = ResolveGetCivDesc();
-    if (!fn) {
-        Logger::Log("GetCivilizationDescription: symbol missing");
-        return nullptr;
-    }
-    __try {
-        return fn(player);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::Log("GetCivilizationDescription: engine call failed");
         return nullptr;
     }
 }
@@ -3167,6 +2897,8 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
     auto owner = RequirePluginOwner(reinterpret_cast<const void*>(name),
                                     "RegisterPushMethodsTarget");
     if (!owner) return 0;
+    if (!RequireGameCoreOwner(reinterpret_cast<const void*>(name),
+                              "RegisterPushMethodsTarget")) return 0;
 
     PushTargetConfig config{
         sigType == kHookApiPushWithManager
@@ -3185,15 +2917,6 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
             return 0;
         }
         return 1;
-    }
-    const bool hasRegistration = std::any_of(g_pushRegistrations.begin(),
-        g_pushRegistrations.end(), [&owner, &nameCopy](const PushRegistration& registration) {
-            return registration.owner == owner->ownerId && registration.targetName == nameCopy;
-        });
-    if (hasRegistration) {
-        Logger::Log("RegisterPushMethodsTarget: cannot change config after registration owner=%ls target=%s",
-            owner->ownerId.c_str(), nameCopy.c_str());
-        return 0;
     }
     ownerConfigs.emplace(nameCopy, config);
     Logger::Log("RegisterPushMethodsTarget: owner=%ls target=%s sig=%d sym=%s",
@@ -3246,6 +2969,78 @@ __declspec(noinline) static bool HookUnpatch(void* target) {
     // （PatchRegistry 没有现成的长度访问器，不为此改动别的文件）。
     if (!IsTargetOpenToCaller(owner->category, target, "Unpatch")) return false;
     return PatchRegistry::RevertOwned(target, owner->ownerId.c_str());
+}
+
+// ---- 插件类别/版本声明（OnLoad 期，由 HookAPI_IsCompatible 代调） ----
+// kind：1=Global，2=GameCore（3 预留给未来的 Frontend，当前拒绝）。对账"插件自述类别"
+// vs "安装路径推出的类别"（CategoryForPath），并记录声明的 apiVersion / sizeof(HookAPI)。
+// 幂等：重复调用只刷新记录。调用方模块优先取 OnLoad 期设置的 g_activePluginModule，
+// 取不到时用返回地址反查（GetModuleHandleEx + FROM_ADDRESS）。
+bool DeclarePluginKindImpl(const HookAPI* api, uint32_t kind, uint32_t apiVersion,
+                           uint32_t pluginStructSize) {
+    (void)api;
+    HMODULE module = g_activePluginModule;
+    if (!module) {
+        if (!GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(_ReturnAddress()), &module) || !module) {
+            Logger::Log("DeclarePluginKind rejected: cannot resolve caller module");
+            return false;
+        }
+    }
+
+    const char* declaredName = nullptr;
+    LoaderCore::PluginCategory declared = LoaderCore::PluginCategory::Global;
+    switch (kind) {
+        case 1u:
+            declaredName = "Global";
+            declared = LoaderCore::PluginCategory::Global;
+            break;
+        case 2u:
+            declaredName = "GameCore";
+            declared = LoaderCore::PluginCategory::GameCore;
+            break;
+        case 3u:
+            Logger::Log("DeclarePluginKind rejected: kind=3 (Frontend) is reserved and not supported");
+            return false;
+        default:
+            Logger::Log("DeclarePluginKind rejected: unknown kind=%u", kind);
+            return false;
+    }
+
+    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+    PluginEntry* entry = nullptr;
+    for (auto& candidate : g_plugins) {
+        if (candidate.handle == module) {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (!entry) {
+        Logger::Log("DeclarePluginKind rejected: module %p is not a tracked plugin", module);
+        return false;
+    }
+    if (declared != entry->category) {
+        Logger::Log("DeclarePluginKind rejected: 声明 %s，路径判为 %s，loader 版本 %u",
+            declaredName, CategoryNameForLog(entry->category),
+            static_cast<unsigned>(CIV6_HOOK_API_VERSION));
+        return false;
+    }
+    if (apiVersion != CIV6_HOOK_API_VERSION) {
+        Logger::Log("DeclarePluginKind rejected: 声明 apiVersion=%u，路径判为 %s，loader 版本 %u",
+            apiVersion, CategoryNameForLog(entry->category),
+            static_cast<unsigned>(CIV6_HOOK_API_VERSION));
+        return false;
+    }
+    entry->kindDeclared = true;
+    entry->declaredKind = kind;
+    entry->declaredApiVersion = apiVersion;
+    entry->declaredStructSize = pluginStructSize;
+    Logger::Log("DeclarePluginKind: plugin=%ls category=%s declared=%s apiVersion=%u structSize=%u",
+        entry->name.c_str(), CategoryNameForLog(entry->category), declaredName,
+        apiVersion, pluginStructSize);
+    return true;
 }
 
 // 只读契约：Loader 初始化后从不写它（全是取地址/读取），插件也只该读。
@@ -3329,7 +3124,6 @@ static const HookAPI g_hookApi = {
     &LocToUtf8Impl,
 
     &EditPlayerImpl,
-    &GetCivilizationDescriptionImpl,
     &MakeHashImpl,
 
     &RegisterPushMethodsTargetImpl,
@@ -3337,15 +3131,14 @@ static const HookAPI g_hookApi = {
     &HookPatch,
     &HookUnpatch,
 
-    &RegisterGameCoreReadyImpl,
-    &RegisterGameCoreTeardownImpl,
-
     &RegisterGameEventImpl,
     &TriggerGameEventImpl,
 
     &GetEngineUtilityImpl,
     &GetActiveLuaStateImpl,
     &LuaPushNilImpl,
+
+    &DeclarePluginKindImpl,
 };
 
 // loader 内部复用 common/HookAPI.h 的 HookInfo 取址工具时的入口（LoaderHooks/UiInject 用），
@@ -3463,10 +3256,9 @@ bool AttachGameCore(HMODULE gameCore) {
         return false;
     }
 
-    Logger::Log("GameCore attached image=%u base=0x%llX SizeOfImage=0x%08X generation=%llu",
+    Logger::Log("GameCore attached image=%u base=0x%llX SizeOfImage=0x%08X",
         static_cast<unsigned>(image),
-        static_cast<unsigned long long>(info.base), sizeOfImage,
-        static_cast<unsigned long long>(info.generation));
+        static_cast<unsigned long long>(info.base), sizeOfImage);
     return true;
 }
 
@@ -3580,6 +3372,25 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     if (alreadyQuarantined || trackedAfterLoad == g_plugins.end()) {
         return false;
     }
+    // 强制声明插件类别：OnLoad 必须经 HookAPI_IsCompatible 调到 DeclarePluginKind
+    // （只有带类别门禁的 HookAPI.h 才会代调）。没声明 = 用旧头文件编的插件，拒载。
+    if (!trackedAfterLoad->kindDeclared) {
+        Logger::Log("Plugin rejected: 未声明插件类别（必须用带类别门禁的 HookAPI.h 重编）: %s",
+            narrow.c_str());
+        lifecycleLock.unlock();
+        QuarantinePluginByOwner(ownerId);
+        lifecycleLock.lock();
+        const auto victim = std::find_if(g_plugins.begin(), g_plugins.end(),
+            [&ownerId](const PluginEntry& tracked) {
+                return tracked.ownerId == ownerId;
+            });
+        if (victim != g_plugins.end()) g_plugins.erase(victim);
+        lifecycleLock.unlock();
+        // ownsRef 语义（G5）：已驻留模块是用 UNCHANGED_REFCOUNT 取回的，引用不归本调用，
+        // 绝不能 FreeLibrary；只有自己 LoadLibraryExW 拿到的引用才释放。
+        if (ownsRef) FreeLibrary(hPlugin);
+        return false;
+    }
 
     auto onMessage = (OnMessageFunc)GetProcAddress(hPlugin, "OnMessage");
     lifecycleLock.unlock();
@@ -3641,7 +3452,7 @@ static void RemovePluginHooks(const wchar_t* owner) {
 }
 
 // 撤销某插件注册的全部回调类条目（禁用/隔离时调用）：脚本全局、PushMethods
-// 方法/登记、GameCore 生命周期回调。这些条目都持有指向插件映像的函数指针，
+// 方法/目标配置、GameEvent 槽位。这些条目都持有指向插件映像的函数指针，
 // 不清就会在对应 detour / 触发点里调进已释放内存（与 OnMessage 悬空 handler
 // 同类问题）。槽位的 methods 清空后保留已装 hook（detour 只透传 base）。
 static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
@@ -3680,28 +3491,18 @@ static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
         }
     }
 
-    const size_t registrationsBefore = g_pushRegistrations.size();
-    g_pushRegistrations.erase(
-        std::remove_if(g_pushRegistrations.begin(), g_pushRegistrations.end(),
-            [&owner](const PushRegistration& registration) {
-                return registration.owner == owner;
-            }),
-        g_pushRegistrations.end());
-    const size_t registrationsRemoved =
-        registrationsBefore - g_pushRegistrations.size();
-
     const size_t targetConfigsRemoved = g_pluginPushTargetConfigs.erase(owner);
 
     // GameEvent 槽位：清空该 owner 注册的事件表（name/luaPushFn/ownerId）。
     // Quarantine/Unload 都经本函数，无需在各自路径重复接线。
     CleanupGameEventsForOwner(owner);
 
-    Logger::Log("RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu registrations=%zu targetConfigs=%zu",
-        owner.c_str(), globals, globalsUi, methods, registrationsRemoved, targetConfigsRemoved);
+    Logger::Log("RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu targetConfigs=%zu",
+        owner.c_str(), globals, globalsUi, methods, targetConfigsRemoved);
 }
 
 // 崩溃隔离（与 OnLoad 崩溃同构）：标记隔离 + 回滚该 owner 的全部注册
-// （补丁/MinHook 钩/Lua 方法/生命周期回调/OnMessage）。模块驻留不卸；
+// （补丁/MinHook 钩/Lua 方法/脚本全局/GameEvent/OnMessage）。模块驻留不卸；
 // 隔离后 reconcile 与阶段 B 全量扫描都不再重试。
 static void QuarantinePluginByOwner(const std::wstring& ownerId) {
     if (ownerId.empty()) return;
@@ -3715,7 +3516,6 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
         }
     }
     // 先禁用并排空所有外部入口；等待期间不得持 lifecycle 锁。
-    RemoveGameCoreCallbacksFor(ownerId);
     g_bus.UnregisterOwner(ownerId);
     PluginInFlight::WaitAll(PluginInFlight::Resolve(ownerId), ownerId.c_str());
     PatchRegistry::RevertAllFor(ownerId.c_str());
@@ -3753,7 +3553,6 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) 
     // 先阻止并排空消息回调，避免 OnUnload 释放插件状态时旧快照仍在执行。
     // 等待时必须释放 lifecycle 锁，否则 handler 若正在调用 HookAPI 会锁反转。
     lifecycleLock.unlock();
-    RemoveGameCoreCallbacksFor(entry.ownerId);
     g_bus.UnregisterOwner(entry.ownerId);
     // 脚本全局/GameEvent 入口使用快照并在锁外执行；先排空 owner 的在途调用，
     // 再进入 OnUnload，避免插件状态被释放后旧回调继续访问。
@@ -3878,15 +3677,9 @@ bool LoaderCore::InitializeGameCorePhase() {
     }
     Localization::InitScript();
     g_gameCorePhaseReady = true;
-    // GameCore 重载后重装共享脚本钩（ResetForReload 已摘除；回调列表跨重载保留）。
-    // 首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。
+    // 共享脚本钩的 MinHook 记录随旧映像在 ResetForReload 里被摘除，这里按【当次】仍存在的
+    // 注册项重装。首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。
     EnsureScriptHooksInstalled();
-    ReinstallPushRegistrations();
-    // Global 插件的 Ready 回调：此刻新映像已 attach、符号可解析——插件在此
-    // InstallHook/Patch/做一次性初始化；先于 GameCore 插件加载，保证顺序确定。
-    const auto readySnapshot = SnapshotGameCoreCallbacks(g_gameCoreReadyCallbacks);
-    lifecycleLock.unlock();
-    FireGameCoreCallbackSnapshot(readySnapshot, "GameCoreReady");
     Logger::Log("InitializeGameCorePhase: OK");
     return true;
 }
@@ -3905,11 +3698,10 @@ bool LoaderCore::IsInitialized() {
 // 为什么第 1 步必须先于 GameCore 插件 FreeLibrary：入口字节还原之后就不会再有新调用
 // 进入插件 detour；反过来先 FreeLibrary 就会留下「入口仍跳向已释放插件代码」的窗口。
 // 覆盖面：GameCore 域内【全部已挂钩站点】——Loader 共享钩（ScriptData / ForUI /
-// PushMethods）与插件 detour 一视同仁，且不看 owner；Global 插件在对局中经 Ready 回调
-// 装的 GameCore 域钩也在此收掉，否则新映像未打补丁、钩子永久失效，PushMethods 槽位还会
-// 按重载次数泄漏（上限 16 个）。exe / 常驻模块域站点不受影响。
-// 已注册的 ScriptGlobals 回调列表跨重载保留（Global 插件仍加载着），
-// 由 EnsureScriptHooksInstalled 在新 GameCore attach 后重新装钩。
+// PushMethods）与插件 detour 一视同仁，且不看 owner。不在此收掉的话，新映像未打补丁、
+// 钩子永久失效，PushMethods 槽位还会按重载次数泄漏（上限 16 个）。
+// exe / 常驻模块域站点不受影响。共享脚本钩由 EnsureScriptHooksInstalled 在新 GameCore
+// attach 后按【当次】仍存在的注册项重新装钩。
 
 // 第 1 步：把「GameCore 域（当前已加载映像 或 正在拆除的区间）+ 已挂钩」的站点批量停用。
 // 用 MH_QueueDisableHook + 【一次】 MH_ApplyQueued，而不是逐个 MH_DisableHook：
@@ -3964,9 +3756,9 @@ static void DisableGameCoreDomainSites() {
 //   1) 进入 teardown 窗口 + ImageAddress::DetachGameCore()（此后 Contains 不再命中，
 //      域过滤只剩 teardown 窗口），释放生命周期锁排空 g_activeSharedDetours（已进入共享
 //      detour 的调用先退出），再重新持生命周期锁；
-//   2) 重扫站点表而不是沿用第 1 步的地址列表：第 1 步与本步之间还跑过 Teardown 回调与
-//      插件卸载，而 PushMethods 这类注册入口按设计【不过域门】，理论上仍可能往正在拆除的
-//      映像上装新钩；重扫能把它一并收掉，否则这条新记录会跨代残留。摘除失败（映像已卸载
+//   2) 重扫站点表而不是沿用第 1 步的地址列表：第 1 步与本步之间还跑过 capture 清理与
+//      插件卸载，注销路径理论上仍可能往正在拆除的映像上装新钩；重扫能把它一并收掉，
+//      否则这条新记录会跨代残留。摘除失败（映像已卸载
 //      -> MH_DisableHook 的 VirtualProtect 失败）时给站点打 recordStale 并拔掉 detour 槽，
 //      避免下次误判「已装」；
 //   3) 复位 g_orig* 与全部 PushMethods 槽位（与旧实现完全一致）。
@@ -4037,8 +3829,7 @@ void LoaderCore::ResetForReload() {
     lock_guard<std::recursive_mutex> transitionLock(g_gameCoreTransitionMutex);
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     g_gameCorePhaseReady = false;
-    // 先进入 teardown 窗口（InstallHook/Patch 对旧映像的目标从此被拒绝），
-    // ImageAddress 暂不 detach——teardown 回调内仍可解析符号读数据收尾。
+    // 先进入 teardown 窗口（InstallHook/Patch 对旧映像的目标从此被拒绝）。
     HookImageInfo current{ sizeof(HookImageInfo) };
     const HookImageId currentId = ImageAddress::LoadedGameCore();
     if (ImageAddress::GetInfo(currentId, &current)) {
@@ -4050,18 +3841,10 @@ void LoaderCore::ResetForReload() {
     }
     lifecycleLock.unlock();
 
-    // phaseReady 已关闭，不会再有新的 Ready 准入；先等已准入回调结束，
-    // 防止其与 Teardown/卸载交错。
-    WaitForGameCoreCallbacks(g_gameCoreReadyCallbacks);
-
     // 第 1 步（必须在 UnloadPluginsOf 之前）：趁旧映像仍映射，用一次 ApplyQueued 批量
     // 还原 GameCore 域全部入口字节。入口不再指向 stub / 插件 detour 之后，后续
     // FreeLibrary 才不会有「入口跳向已释放插件代码」的窗口。
     DisableGameCoreDomainSites();
-
-    // Global 插件收尾回调：置于 GameCore 插件卸载之前（它们可能依赖后者仍在
-    // 钩上维护的数据）；旧映像此刻仍存活。
-    FireGameCoreCallbacks(g_gameCoreTeardownCallbacks, "GameCoreTeardown");
 
     // capture 站点的目标位于旧 GameCore 映像内，重载后地址失效，必须随重载清空落在
     // GameCore 域内的捕获订阅；exe / 常驻模块域上的订阅保留。本步只拔插槽，站点记录
@@ -4082,8 +3865,7 @@ void LoaderCore::ResetForReload() {
     // 第 2 步：重扫站点表物理摘除 GameCore 域的 MinHook 记录（释放跳板），并复位共享钩状态
     // （ScriptData/ForUI + PushMethods 槽位）。顺序理由见函数头注释。
     RemoveGameCoreDomainSiteRecords(lifecycleLock);
-    // GameCore 重载后 Global 插件注册的 GameEvent 槽位跨代保留：Register/Trigger 与
-    // Lua 路径内化（GameEventInvokeLua）每次实时取活跃 state / scriptSystem（见
-    // GetActiveLuaStateImpl），无需在此重挂任何信号环。
-    Logger::Log("ResetForReload: teardown callbacks fired, GameCore plugins unloaded (GameCore modules freed), entry bytes restored in batch, MinHook records physically removed");
+    // GameEvent 是 GameCore 专属入口（注册记录挂在插件 owner 上，随 GameCore 插件卸载
+    // 一并清除）；这里无需为旧代槽位做任何保留或重挂。
+    Logger::Log("ResetForReload: GameCore plugins unloaded (GameCore modules freed), entry bytes restored in batch, MinHook records physically removed");
 }

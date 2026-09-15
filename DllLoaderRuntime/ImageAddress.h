@@ -15,12 +15,11 @@ namespace ImageAddress {
 HookImageId IdentifyExecutable();
 HookImageId IdentifyGameCore(HMODULE module);
 
-// 成功 attach 后 GameCore 代际递增。失败不会改变当前登记。
+// 成功 attach 后 LoadedGameCore() 返回该映像；失败不会改变当前登记。
 bool AttachGameCore(HMODULE module);
 void DetachGameCore();
 
 HookImageId LoadedGameCore();
-uint64_t GameCoreGeneration();
 
 bool IsLoaded(HookImageId image);
 bool GetInfo(HookImageId image, HookImageInfo* outInfo);

@@ -14,12 +14,10 @@ struct ImageState {
     HookImageId id = kHookImageInvalid;
     uintptr_t base = 0;
     size_t sizeOfImage = 0;
-    uint64_t generation = 0;
 };
 
 std::mutex g_mutex;
 ImageState g_gameCore;
-uint64_t g_gameCoreGeneration = 0;
 
 size_t ModuleSizeOfImage(HMODULE module) {
     if (!module) return 0;
@@ -43,7 +41,7 @@ ImageState LoadExecutable() {
     const HookImageId id = IdentifyExecutable();
     const size_t size = ModuleSizeOfImage(module);
     if (id == kHookImageInvalid || size == 0) return {};
-    return { id, reinterpret_cast<uintptr_t>(module), size, 1 };
+    return { id, reinterpret_cast<uintptr_t>(module), size };
 }
 
 const ImageState& Executable() {
@@ -59,7 +57,6 @@ bool CopyInfo(const ImageState& state, HookImageInfo* outInfo) {
     outInfo->image = state.id;
     outInfo->base = state.base;
     outInfo->imageSize = state.sizeOfImage;
-    outInfo->generation = state.generation;
     return true;
 }
 
@@ -104,12 +101,10 @@ bool AttachGameCore(HMODULE module) {
     if (!IsGameCoreId(id) || size == 0) return false;
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    ++g_gameCoreGeneration;
     g_gameCore = {
         id,
         reinterpret_cast<uintptr_t>(module),
-        size,
-        g_gameCoreGeneration
+        size
     };
     return true;
 }
@@ -122,11 +117,6 @@ void DetachGameCore() {
 HookImageId LoadedGameCore() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_gameCore.id;
-}
-
-uint64_t GameCoreGeneration() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return g_gameCoreGeneration;
 }
 
 bool IsLoaded(HookImageId image) {
