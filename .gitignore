@@ -1,7 +1,8 @@
 packaging/ElectionTest/stub_out/
 x64/
 Binaries/
-docs/
+docs/*
+!docs/ARCHITECTURE.md
 
 # Visual Studio user/cache
 .vs/
