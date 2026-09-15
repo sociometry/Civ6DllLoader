@@ -296,7 +296,7 @@ bool LzmaDecodeRaw(const uint8_t* payload, size_t payloadLen, uint32_t origSize,
     return true;
 }
 
-// 解压 sidecar（自带 LZMA1 解码器，与 tools/compress_sidecar.py 对称）：
+// 解压 sidecar（自带 LZMA1 解码器，与 tools/symdb.py compress 对称）：
 //   "C6XC" + u32 algo(=1) + u32 originalSize + payload（13B .lzma 头 + LZMA1 流）
 // 未压缩文件以 "C6SD" 开头，调用方直接透传给 ParseContainer。
 bool DecompressSidecar(const std::vector<uint8_t>& packed, std::vector<uint8_t>& out) {

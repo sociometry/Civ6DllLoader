@@ -10,7 +10,7 @@
 ## 只用解码器
 
 DllLoaderRuntime 只需要 **解码**：`PdataMatch.cpp` 加载 sidecar 时把 LZMA 压缩信封解开。
-编码在构建期由 `tools/compress_sidecar.py` 用 python 标准库 `lzma`（liblzma）完成，所以
+编码在构建期由 `tools/symdb.py compress` 用 python 标准库 `lzma`（liblzma）完成，所以
 `LzmaEnc.c` / `LzFind*.c` / `Threads.c` **不引入**。
 
 ## 用法（一次性解压到整块输出缓冲）

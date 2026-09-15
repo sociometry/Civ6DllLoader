@@ -29,10 +29,10 @@
 namespace {
 
 // ---- exe 域取址表（双版本）----
-// 生成命令：python tools/gen_exe_aobs.py --emit-cpp（重建符号库/游戏更新后重新生成）。
+// 生成命令：python tools/symdb.py aob --emit-cpp（重建符号库/游戏更新后重新生成）。
 // 说明：RVA 是各变体构建下的坐标（运行时会先走 pdata 矫正）；AOB 是该变体里唯一命中的兜底定位串。
 
-// ---- 本块由 tools/gen_exe_aobs.py --emit-cpp 生成；重建符号库/游戏更新后重新生成 ----
+// ---- 本块由 tools/symdb.py aob --emit-cpp 生成；重建符号库/游戏更新后重新生成 ----
 
 constexpr char kAob_LoadDLL[] = "48 81 EC 48 02 00 00 48 83 3D ?? ?? ?? ?? 00 74 ?? 32 C0 48 81 C4 48 02 00 00 C3 48 8D 44 24 2C 48 89 AC 24 58 02 00 00 48 89 44 24 20 48 8D 54 24 2C 0F B7 05 ?? ?? ?? ?? 33 ED 41 B8 04 01 00";
 constexpr char kAob_UnloadDLL_Dx11[] = "48 83 EC 28 48 83 3D ?? ?? ?? ?? 00 74 ?? 48 89 5C 24 20 E8 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? FF D0 48 8B 0D ?? ?? ?? ?? 33 DB 48 89 1D 4E D2";

@@ -3233,7 +3233,7 @@ void LoaderCore::VerifyHookApiTableProtection() {
 }
 
 // exe 版本锚（SizeOfImage + FileHeader.TimeDateStamp）：无符号库时判断"能否直接信任原始 RVA"。
-// 由 tools/gen_exe_aobs.py 的同一份逆向数据得出；游戏更新后这里会失配 -> 只走 AOB 兜底。
+// 由 tools/symdb.py aob 的同一份逆向数据得出；游戏更新后这里会失配 -> 只走 AOB 兜底。
 namespace {
 constexpr uint32_t kAnchorDx11SizeOfImage = 0x36D1000;
 constexpr uint32_t kAnchorDx11TimeDate   = 0x667C6FC6;
