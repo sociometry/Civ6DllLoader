@@ -327,12 +327,46 @@ static bool RequireGameCoreOwner(const void* codeAddress, const char* apiName) {
 // 这一代映像内活动。三类判定都只读，不改动任何状态、不抛异常；拒绝时按统一格式记日志
 // （地址/映像对调用方不开放），调用方按其原本的失败值返回。
 // 日志正文统一为：<ApiName> rejected: target|image|range <位点> is not open to caller (<Global|GameCore>)
+//
+// 规则是【正面】的（"允许落在哪里"），不是"不在 GameCore 里就算数"：
+//   GameCore 类别：目标必须落在【当前 GameCore 映像】内（它唯一的合法域）；
+//   Global  类别：目标必须落在【某个已加载的非 GameCore 模块】内 —— exe、常驻系统 dll
+//                 （user32/dxgi…）、插件自己的模块都算；堆、VirtualAlloc 的 JIT 页、空闲
+//                 地址、以及将来会被 GameCore 占用的地址一律拒绝。
+// 旧的"与当前 GameCore 映像不相交就放行"为什么不行：GameCore 未加载时（阶段 A）它对任何
+// 地址都放行，"Global 绝对不许动 GameCore dll"就只能靠"那块内存写不进去/不可执行"兜住，
+// 而不是一条可判定、可解释的规则。
 
-// 单个目标地址：GameCore 类别要求落在【当前 GameCore 映像】内；Global 类别要求【不在】
-// 当前 GameCore 映像内（exe 与其它常驻模块放行）。GameCore 未加载时，Global 无域可犯。
+// 目标整段是否落在【同一个已加载模块】的映像内。
+// 不解析 PE：两端各自的所属模块句柄相同即证明整段同属一个模块映像；堆 / VirtualAlloc 的
+// JIT 页 / 空闲地址拿不到模块句柄（或两端不同），直接判否。
+static bool RangeInsideOneLoadedModule(const void* target, size_t len) {
+    if (!target || len == 0) return false;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
+    const uintptr_t end = begin + len;
+    if (end < begin) return false;   // 回绕：判否
+    HMODULE firstModule = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(target), &firstModule) || !firstModule) {
+        return false;
+    }
+    HMODULE lastModule = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(end - 1), &lastModule) || !lastModule) {
+        return false;
+    }
+    return firstModule == lastModule;
+}
+
+// 单个目标地址：GameCore 类别要求落在【当前 GameCore 映像】内；Global 类别要求落在某个
+// 已加载的非 GameCore 模块内（见上面的规则）。
 static bool IsTargetOpenToCaller(LoaderCore::PluginCategory caller, const void* target, const char* apiName) {
     const bool inGameCore = TargetInCurrentGameCore(const_cast<void*>(target));
-    const bool ok = (caller == LoaderCore::PluginCategory::GameCore) ? inGameCore : !inGameCore;
+    const bool ok = (caller == LoaderCore::PluginCategory::GameCore)
+        ? inGameCore
+        : (!inGameCore && RangeInsideOneLoadedModule(target, 1));
     if (!ok) {
         Logger::Log("%s rejected: target %p is not open to caller (%s)",
             apiName, target, CategoryNameForLog(caller));
@@ -355,7 +389,8 @@ static bool IsImageOpenToCaller(LoaderCore::PluginCategory caller, HookImageId i
 }
 
 // 整段范围（Patch 用）：GameCore 类别要求 [target, target+len) 全落在当前 GameCore 映像内；
-// Global 类别要求整段与当前 GameCore 映像【不相交】（GameCore 未加载 = 无交集，放行）。
+// Global 类别要求整段与当前 GameCore 映像不相交【且】整段落在同一个已加载的非 GameCore
+// 模块内（正面规则，见上面的说明）。
 // 区间算术一律用无溢出的差值比较（len <= PluginBoundary::kMaxPluginRawBytes，地址为实址）。
 static bool IsRangeOpenToCaller(LoaderCore::PluginCategory caller, const void* target, size_t len, const char* apiName) {
     HookImageInfo gcInfo{ sizeof(HookImageInfo) };
@@ -367,12 +402,11 @@ static bool IsRangeOpenToCaller(LoaderCore::PluginCategory caller, const void* t
     if (caller == LoaderCore::PluginCategory::GameCore) {
         ok = hasGameCore && begin >= gcInfo.base && len <= gcInfo.imageSize &&
             (begin - gcInfo.base) <= gcInfo.imageSize - len;
-    } else if (!hasGameCore) {
-        ok = true;
-    } else if (begin >= gcInfo.base) {
-        ok = (begin - gcInfo.base) >= gcInfo.imageSize;
     } else {
-        ok = (gcInfo.base - begin) >= len;
+        const bool disjoint = !hasGameCore ||
+            (begin >= gcInfo.base ? (begin - gcInfo.base) >= gcInfo.imageSize
+                                  : (gcInfo.base - begin) >= len);
+        ok = disjoint && RangeInsideOneLoadedModule(target, len);
     }
     if (!ok) {
         Logger::Log("%s rejected: range %p len=%zu is not open to caller (%s)",
@@ -3902,12 +3936,9 @@ void LoaderCore::ResetForReload() {
     UnloadPluginsOf(PluginCategory::GameCore);
 
     lifecycleLock.lock();
-    // 旧映像区间的补丁清账：GameCore 插件的补丁已随其卸载按 owner 回滚，
-    // 这里收尾 Global 插件打在旧映像上的补丁（映像卸载前回滚字节，记录随之丢弃）。
-    if (g_gameCoreTeardownAddress) {
-        PatchRegistry::RevertAllInRange(
-            g_gameCoreTeardownAddress, g_gameCoreTeardownSizeOfImage);
-    }
+    // 这里【不需要】补丁清账：唯一的补丁来源是插件的 PatchImpl，它已经过正面域规则
+    // （GameCore 插件只能落在当前 GameCore 映像内且卸载时按 owner 回滚；Global 插件只能
+    // 落在已加载的非 GameCore 模块内），所以拆映像时不可能存在落在旧映像区间里的记录。
     // 第 2 步：重扫站点表物理摘除 GameCore 域的 MinHook 记录（释放跳板），并复位共享钩状态
     // （ScriptData/ForUI + PushMethods 槽位）。顺序理由见函数头注释。
     RemoveGameCoreDomainSiteRecords(lifecycleLock);
