@@ -287,6 +287,9 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
     }
 
     char result = g_origLoadDLL(target);  // 调原函数（已 hook 前 snapshot，MinHook trampoline）
+    // 这次调用可能顺带卸掉了旧的 GameCore（连同 gamecore Lua 环境）：此刻才释放排队中的
+    // 插件模块（重入兜底路径下，ResetForReload 也会把待卸模块入队）。
+    LoaderCore::FreePendingPluginModules();
     if (result != 0) {
         if (LoaderCore::InitializeGameCorePhase()) {
             LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::GameCore);
@@ -310,17 +313,21 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
     return result;
 }
 
-// ---- UnloadDLL detour（阶段 B 收尾：原函数卸掉 GameCore 前先卸 GameCore 插件）----
+// ---- UnloadDLL detour（阶段 B 收尾：原函数卸掉 GameCore 前先做清理）----
 // UnloadDLL 的调用方：LoadDLL 失败路径、退游戏、LoadGameCore 重载、RollbackContent、
 // UpdateContent。在调原函数【之前】清理：此时 GameCore 映像仍活着，插件 OnUnload 能
-// 干净回滚补丁（PatchRegistry::RevertAllFor）/摘 MinHook 钩子（RemovePluginHooks）/
-// FreeLibrary。等 LoadDLL 重入再清就晚了（映像已卸）。
+// 干净回滚补丁（PatchRegistry::RevertAllFor）/摘 MinHook 钩子（RemovePluginHooks）。
+// 但插件模块的 FreeLibrary 【不】在这里做：gamecore 的 gameplay/ui Lua 环境是这次调用
+// 里才拆掉的，而 Lua 表里可能还留着指向插件映像的闭包 -> 排到原函数返回之后再 Free
+// （见 LoaderCore::FreePendingPluginModules）。
 static char __fastcall UnloadDllDetour() {
     if (LoaderCore::IsInitialized()) {
         Logger::Log("UnloadDLL: resetting GameCore phase (unloading plugins before core unload)");
         LoaderCore::ResetForReload();
     }
-    return g_origUnloadDLL();
+    const char result = g_origUnloadDLL();
+    LoaderCore::FreePendingPluginModules();   // 引擎已卸掉 GameCore 及其 Lua 环境
+    return result;
 }
 
 }  // namespace

@@ -50,6 +50,10 @@ void* ResolveExeTarget(const HookInfoExe& info, size_t span = 1);
 void LoadPluginsOf(PluginCategory cat);
 void UnloadPluginsOf(PluginCategory cat);
 
+// 引擎卸完 GameCore 之后调用（LoadDLL / UnloadDLL detour 在调到原函数之后）：真正
+// FreeLibrary 那些在 ResetForReload 里排队的 GameCore 插件模块。见实现处的时机说明。
+void FreePendingPluginModules();
+
 // 单插件加载（按路径含 \Plugins\Global\ 或 \Plugins\GameCore\ 判定类别）。
 // 实现于 Civ6DLLHookLoaderAPI.cpp（S3c）。
 bool LoadSinglePlugin(const std::wstring& path);   // 已加载返回 false

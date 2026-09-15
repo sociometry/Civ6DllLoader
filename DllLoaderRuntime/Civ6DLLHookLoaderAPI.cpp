@@ -73,6 +73,36 @@ static void SetPluginState(PluginEntry& entry, PluginState state) {
         state == PluginState::Loading || state == PluginState::Active);
 }
 
+// GameCore 插件的【待释放】句柄队列。
+// 为什么不在插件卸载处直接 FreeLibrary：那一刻 GameCore 映像还映射着，它承载的 gamecore
+// Lua 环境（gameplay / ui）要到引擎自己的 UnloadDLL 里才拆；而 Lua 表里可能仍持有指向插件
+// 映像的 C 闭包（PushLuaMethods 推入的、以及插件自己在 RegisterScriptGlobals 里注册的）。
+// 等引擎把 GameCore 连同那些 Lua 环境一起拆完（g_origUnloadDLL 返回之后）再 Free，「闭包被
+// 调用」这件事就不再可能发生。只由游戏线程（Load/UnloadPluginsOf）入队，flush 由
+// LoaderHooks 的两个 detour 在调到原函数之后调用。
+static std::mutex g_pendingFreeMutex;
+static std::vector<HMODULE> g_pendingFreeModules;
+
+static void QueueGameCoreModuleForFree(HMODULE module) {
+    if (!module) return;
+    lock_guard<mutex> lock(g_pendingFreeMutex);
+    g_pendingFreeModules.push_back(module);
+}
+
+// 引擎卸完 GameCore 之后调用：真正 FreeLibrary 那些排队的插件模块。
+// 不持任何 Loader 锁调用 FreeLibrary（插件 DllMain(DETACH) 可能反过来调 Loader）。
+void LoaderCore::FreePendingPluginModules() {
+    std::vector<HMODULE> modules;
+    {
+        lock_guard<mutex> lock(g_pendingFreeMutex);
+        modules.swap(g_pendingFreeModules);
+    }
+    for (HMODULE module : modules) {
+        FreeLibrary(module);
+        Logger::Log("Plugin module freed after engine GameCore unload: %p", module);
+    }
+}
+
 // 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
 // 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
 // 唯一写者是游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）。
@@ -3388,7 +3418,13 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         lifecycleLock.unlock();
         // ownsRef 语义（G5）：已驻留模块是用 UNCHANGED_REFCOUNT 取回的，引用不归本调用，
         // 绝不能 FreeLibrary；只有自己 LoadLibraryExW 拿到的引用才释放。
-        if (ownsRef) FreeLibrary(hPlugin);
+        // GameCore 类别同样排到引擎卸完 GameCore 之后：它可能在"没声明类别"之前就已经往
+        // gamecore Lua 表里推过闭包（Quarantine 撤不掉已经在表里的闭包）。
+        if (category == LoaderCore::PluginCategory::GameCore) {
+            QueueGameCoreModuleForFree(hPlugin);
+        } else if (ownsRef) {
+            FreeLibrary(hPlugin);
+        }
         return false;
     }
 
@@ -3585,8 +3621,10 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) 
     // 休眠不会再被调用；代价是重启用时静态状态跨周期保留，OnLoad 必须可重入。
     lifecycleLock.unlock();
     if (freeModule) {
-        FreeLibrary(entry.handle);
-        Logger::Log("Plugin deactivated, module freed: %s",
+        // 释放时机见 g_pendingFreeModules 的说明：等引擎卸完 GameCore（连同 gamecore 的
+        // gameplay/ui Lua 环境）之后才 FreeLibrary。
+        QueueGameCoreModuleForFree(entry.handle);
+        Logger::Log("Plugin deactivated, module queued for free after engine GameCore unload: %s",
             ModScan::WideToNarrow(entry.path).c_str());
     } else {
         Logger::Log("Plugin deactivated, module parked (kept mapped): %s",
@@ -3787,25 +3825,33 @@ static void RemoveGameCoreDomainSiteRecords(
     // 排空后才真正摘除站点记录（释放跳板）；顺序理由见 RemoveHookSiteRecordLocked。
     // teardown 窗口此刻仍是旧映像区间（DetachGameCore 已让 ImageAddress 的 Contains 失效），
     // 它以唯一判据回答「这个站点属不属于本次拆除的映像」。
-    size_t removed = 0;
+    size_t erased = 0;
     size_t stale = 0;
     {
         lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-        for (auto& [target, site] : g_hookSites) {
-            if (!site.hookInstalled) continue;
-            if (!TargetInTearingDownGameCore(target)) continue;
-            if (RemoveHookSiteRecordLocked(target, site)) {
-                ++removed;
+        for (auto it = g_hookSites.begin(); it != g_hookSites.end(); ) {
+            if (!it->second.hookInstalled || !TargetInTearingDownGameCore(it->first)) {
+                ++it;
+                continue;
+            }
+            if (RemoveHookSiteRecordLocked(it->first, it->second)) {
+                // 记录已摘、入口已还原：旧映像再也不会有人走进本站 stub（将来同基址复用的新
+                // 映像，入口字节是它自己的，也不会跳进旧 stub），所以站点节点可以真删掉，不再
+                // 留死条目。stub 那块 asmjit 代码无法按块回收（JitRuntime 只能整体 release，且
+                // 多个 stub 共用同一块），它内嵌的 site 指针从此不被任何可达路径读取。
+                it = g_hookSites.erase(it);
+                ++erased;
                 continue;
             }
             // 摘除失败（目标不可写/不可读）：入口字节没能还原，MinHook 记录与跳板还在。
             // 打 recordStale 让下次在同一地址取站时强制重建；同时先拔掉 detour 槽，
             // 免得下次误判「已装」而拒绝重新挂钩。
             ++stale;
-            site.recordStale = true;
-            site.activeDetour = nullptr;
-            site.detourOwner.clear();
-            site.nextTarget = site.minhookTrampoline;
+            it->second.recordStale = true;
+            it->second.activeDetour = nullptr;
+            it->second.detourOwner.clear();
+            it->second.nextTarget = it->second.minhookTrampoline;
+            ++it;
         }
     }
 
@@ -3820,9 +3866,9 @@ static void RemoveGameCoreDomainSiteRecords(
     }
     g_gameCoreTeardownAddress = 0;
     g_gameCoreTeardownSizeOfImage = 0;
-    Logger::Log("RemoveGameCoreDomainSiteRecords: physically removed MinHook record on %zu site(s), "
-                "marked recordStale=%zu; script/UI detour sites + push slots reset",
-        removed, stale);
+    Logger::Log("RemoveGameCoreDomainSiteRecords: erased %zu site node(s) (MinHook record + trampoline "
+                "released), marked recordStale=%zu; script/UI detour sites + push slots reset",
+        erased, stale);
 }
 
 void LoaderCore::ResetForReload() {
