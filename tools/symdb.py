@@ -12,8 +12,8 @@ symdb.py - Civ6 符号库（sidecar）流水线唯一入口
     compress   pack.bin -> "C6XC"+LZMA1 信封 .xp（自带 SHA256 roundtrip 校验）
     validate   按运行时同款解析独立校验 .bin / .xp
     aob        从 pack.bin 的 mask 指纹生成/核对 loader 的 AOB 常量（--emit-cpp）
-    rva-map    Civ6DllLoader.symdb.json -> rva_map.json（喂 rva_to_symbol.exe）
-    all        一条命令跑完整条产线：module x3 -> pack -> compress -> 部署 -> validate
+    rva-map    GameCore.symdb.json -> rva_map.json（喂 rva_to_symbol.exe）
+    all        一条命令跑完整条产线：module x3 -> pack -> compress -> 部署 -> validate -> 清理中间产物
 
 帮助：python tools/symdb.py <子命令> -h
 
@@ -92,7 +92,7 @@ symdb.py - Civ6 符号库（sidecar）流水线唯一入口
 
 
 ================================================================================
-JSON 结构（json-exe 产出，与 Civ6DllLoader.symdb.json 一致）
+JSON 结构（json-exe 产出，与 GameCore.symdb.json 一致）
 ================================================================================
 {
   "version": 1,
@@ -176,7 +176,7 @@ DEFAULT_GAME_DIR = "E:/SteamLibrary/steamapps/common/Sid Meier's Civilization VI
 DEFAULT_DLL = DEFAULT_GAME_DIR + "/DLC/Expansion2/Binaries/Win64/GameCore_XP2_FinalRelease.dll"
 DEFAULT_EXE_DIR = "E:\\SteamLibrary\\steamapps\\common\\Sid Meier's Civilization VI\\Base\\Binaries\\Win64Steam"
 
-DEFAULT_JSON = os.path.join(HERE, "Civ6DllLoader.symdb.json")
+DEFAULT_JSON = os.path.join(HERE, "GameCore.symdb.json")
 DEFAULT_BIN = os.path.join(HERE, "Civ6DllLoader.symdb.bin")
 DEFAULT_PACK = os.path.join(HERE, "Civ6DllLoader.symdb.pack.bin")
 DEFAULT_AOB_HELPER = os.path.join(HERE, "aob_helper.exe")
@@ -200,7 +200,7 @@ IMAGE_NAMES = {1: "ExeDx11", 2: "ExeDx12", 3: "GameCoreBase",
                4: "GameCoreXP1", 5: "GameCoreXP2"}
 
 # build_module 实际消费的 JSON 结构（symbols/vtables）。version 只是生产者标签：
-# 仓库里的 Civ6DllLoader.symdb.json = 2，两个 exe JSON = 4 —— 结构与 v1 完全一致。
+# 仓库里的 GameCore.symdb.json = 2，两个 exe JSON = 4 —— 结构与 v1 完全一致。
 # 旧 build_sidecar.py 曾写死 "!= 1 就退出"，导致它无法重建仓库里已有的 .bin；
 # 这里保留校验，但接受这三种已知兼容的标签：version 只是标签，从未发布过，
 # 不做版本兼容分支；未知值仍然硬失败。
@@ -1325,7 +1325,7 @@ def validate_files(paths) -> bool:
 
 
 def cmd_validate(args) -> int:
-    files = args.files or [DEFAULT_PACK]
+    files = args.files or [RUNTIME_XP]
     return 0 if validate_files(files) else 1
 
 
@@ -1358,6 +1358,8 @@ AOB_IMAGE_NAMES = {1: "ExeDx11", 2: "ExeDx12"}
 
 def load_pack(path: Path):
     d = path.read_bytes()
+    if d[:4] == XP_MAGIC:          # 允许直接喂部署后的 .xp（C6XC/LZMA1 信封）
+        d = decompress_xp(d)
     if d[:4] != MAGIC or struct.unpack_from("<I", d, 4)[0] != VERSION:
         raise SystemExit(f"{path} 不是 C6SD v1 容器")
     count, moff = struct.unpack_from("<I", d, 8)[0], struct.unpack_from("<I", d, 12)[0]
@@ -1653,7 +1655,7 @@ def cmd_aob(args) -> int:
 
 
 # ============================================================================
-# 八、rva-map：Civ6DllLoader.symdb.json -> rva_map.json
+# 八、rva-map：GameCore.symdb.json -> rva_map.json
 # ============================================================================
 
 def hexstr(rva: int) -> str:
@@ -1726,8 +1728,8 @@ def all_module_jobs(game_dir):
         exe_dir = DEFAULT_EXE_DIR
     return [
         (5, dll,
-         os.path.join(HERE, "Civ6DllLoader.symdb.json"),
-         os.path.join(HERE, "Civ6DllLoader.symdb.bin")),
+         os.path.join(HERE, "GameCore.symdb.json"),
+         os.path.join(HERE, "GameCore.symdb.bin")),
         (1, os.path.join(exe_dir, "CivilizationVI.exe"),
          os.path.join(HERE, "CivilizationVI.symdb.json"),
          os.path.join(HERE, "CivilizationVI.symdb.bin")),
@@ -1741,6 +1743,8 @@ def cmd_all(args) -> int:
     jobs = all_module_jobs(args.game_dir)
     pack_out = DEFAULT_PACK
     xp_out = pack_out + ".xp"
+    # 中间产物：3 个单模块容器 + pack.bin + tools 侧的 .xp；交付物只有 RUNTIME_XP
+    temps = [binp for _img, _pe, _js, binp in jobs] + [pack_out, xp_out]
 
     try:
         # ---- 1) module x3 ----
@@ -1784,6 +1788,17 @@ def cmd_all(args) -> int:
         if not validate_files([pack_out, xp_out]):
             raise RuntimeError("validate 失败")
         print("[5/5] validate OK")
+
+        # ---- 6) 清理中间产物（校验通过之后再删）----
+        print("== 清理中间产物（tools/ 下的 .bin/.xp；交付物是 %s）" % RUNTIME_XP)
+        for p in temps:
+            try:
+                os.unlink(p)
+                print("   removed %s" % p)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print("   WARN 删除失败 %s: %s" % (p, exc), file=sys.stderr)
     except Exception as exc:  # noqa: BLE001
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1
@@ -1804,7 +1819,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "compress / validate / aob / rva-map / all",
         epilog="例：\n"
                "  python tools/symdb.py all\n"
-               "  python tools/symdb.py module 5 --json tools/Civ6DllLoader.symdb.json "
+               "  python tools/symdb.py module 5 --json tools/GameCore.symdb.json "
                "--dll <游戏DLL> --bin /tmp/gc.bin\n"
                "  python tools/symdb.py pack --module 5:gc.bin --module 1:dx11.bin "
                "--module 2:dx12.bin --out out.bin\n"
@@ -1862,21 +1877,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("validate", help="按运行时同款解析校验 .bin / .xp",
                        description="Validate a sidecar container the same way the runtime "
                                    "does (C6SD v1 + C6XC/LZMA1)")
-    p.add_argument("files", nargs="*", help="一个或多个 .bin / .xp（默认 pack.bin）")
+    p.add_argument("files", nargs="*", help="一个或多个 .bin / .xp（默认部署后的 DllLoaderRuntime/*.xp）")
     p.set_defaults(func=cmd_validate)
 
     # ---- aob ----
     p = sub.add_parser("aob", help="从 pack.bin 指纹生成/核对 loader 的 AOB 常量",
                        description="生成/核对 exe 域 loader 目标的 AOB（供 HookInfo/HookInfoExe "
                                    "使用）；退出码 0 = 全部可用，1 = 有需要人工处理的目标")
-    p.add_argument("--pack", default=DEFAULT_PACK, help="输入 pack.bin")
+    p.add_argument("--pack", default=RUNTIME_XP, help="输入容器：pack.bin 或 C6XC 信封 .xp（默认部署后的 .xp）")
     p.add_argument("--exe-dir", default=DEFAULT_EXE_DIR, help="两个 exe 所在目录")
     p.add_argument("--emit-cpp", action="store_true",
                    help="只输出可直接粘贴进 LoaderHooks.cpp / UiInject.cpp 的 constexpr 常量块")
     p.set_defaults(func=cmd_aob)
 
     # ---- rva-map ----
-    p = sub.add_parser("rva-map", help="Civ6DllLoader.symdb.json -> rva_map.json",
+    p = sub.add_parser("rva-map", help="GameCore.symdb.json -> rva_map.json",
                        description="读取 symdb JSON，生成以 rva 为键的符号映射 rva_map.json"
                                    "（喂 rva_to_symbol.exe）")
     p.add_argument("input", nargs="?", default=DEFAULT_JSON)
@@ -1886,8 +1901,8 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- all ----
     p = sub.add_parser("all", help="一条命令跑完整条产线",
                        description="module x3 -> pack -> compress -> 部署到 "
-                                   "DllLoaderRuntime/Civ6DllLoader.symdb.bin.xp -> validate；"
-                                   "任何一步失败立刻退出")
+                                   "DllLoaderRuntime/Civ6DllLoader.symdb.bin.xp -> validate -> "
+                                   "删掉 tools/ 下的 .bin/.xp 中间产物；任何一步失败立刻退出")
     p.add_argument("--game-dir", default=None,
                    help="游戏安装根目录，覆盖默认的 %s" % DEFAULT_GAME_DIR)
     p.set_defaults(func=cmd_all)
