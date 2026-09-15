@@ -3598,7 +3598,7 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
 
 // 按跟踪项卸载单个插件（调用方保证 index 有效）：
 // OnUnload → PatchRegistry::RevertAllFor(name) → RemovePluginHooks(name) → 撤销 capture /
-// 回调类注册 → 从 g_plugins 摘除 →（freeModule 时）FreeLibrary。
+// 回调类注册 → 从 g_plugins 摘除 →（freeModule 时）句柄入队，等引擎卸完 GameCore 才 Free。
 // freeModule 只由 GameCore 类别传 true：GameCore 插件随对局重载必须真正卸载，插件静态
 // 状态才不会跨局残留；调用前 ResetForReload 已批量还原入口字节，不会再有人进入该插件的
 // detour。Global 插件一律 false（只在启动时加载，禁用需要重启）；崩溃隔离路径根本不走
@@ -3931,8 +3931,9 @@ void LoaderCore::ResetForReload() {
     // 由后面的 RemoveGameCoreDomainSiteRecords 物理摘除。
     CleanupAllCaptureSites();
 
-    // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。GameCore 类别会真正
-    // FreeLibrary（入口字节已在上一步还原，见 UnloadPluginByOwnerId）。
+    // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。GameCore 类别的插件模块【不】在这里
+    // FreeLibrary：入口字节已在上一步还原，但 gamecore 的 Lua 环境要等引擎自己的 UnloadDLL
+    // 才拆，所以只把句柄排队（见 UnloadPluginByOwnerId 与 FreePendingPluginModules）。
     UnloadPluginsOf(PluginCategory::GameCore);
 
     lifecycleLock.lock();
@@ -3944,5 +3945,5 @@ void LoaderCore::ResetForReload() {
     RemoveGameCoreDomainSiteRecords(lifecycleLock);
     // GameEvent 是 GameCore 专属入口（注册记录挂在插件 owner 上，随 GameCore 插件卸载
     // 一并清除）；这里无需为旧代槽位做任何保留或重挂。
-    Logger::Log("ResetForReload: GameCore plugins unloaded (GameCore modules freed), entry bytes restored in batch, MinHook records physically removed");
+    Logger::Log("ResetForReload: GameCore plugins unloaded (modules queued for free after engine unload), entry bytes restored in batch, MinHook records physically removed");
 }
