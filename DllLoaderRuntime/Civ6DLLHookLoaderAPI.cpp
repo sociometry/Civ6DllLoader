@@ -3117,8 +3117,22 @@ constexpr uint32_t CivCrc32Raw(const char* str) {
     }
     return h;
 }
-// 编译期自检：raw("123456789") = 0x340BC6D9（标准 CRC32 0xCBF43926 去掉最终异或）
-static_assert(CivCrc32Raw("123456789") == 0x340BC6D9u, "Civ CRC32 (raw) self-check failed");
+// 官方表核对（ConsoleApplication1.cpp:17-50 里还原出来的 crc32_table，共 258 项）：
+//   前 256 项与标准反射表（多项式 0xEDB88320）【逐项一致】；尾部多出的 0xEDB88320 /
+//   0xDEBB20E3 永远不会被索引（索引只取 (uint8_t)），故闭式实现与官方查表实现逐位等价。
+// 编译期自检（向量取自官方实现/还原工程实测值，不是本实现的输出）：
+//   raw("")                  = 0xFFFFFFFF   （init 原样返回）
+//   raw("123456789")         = 0x340BC6D9   （标准 CRC32 0xCBF43926 去掉最终异或）
+//   raw("a")                 = 0x174841BC   （标准 0xE8B7BE43）
+//   raw("Hello")             = 0x082E767D   （标准 0xF7D18982）
+//   raw("TERRA7")            = 0x16D22538
+//   raw("NOTIFICATION_ADDED")= 0xF26F3ACF   （ConsoleApplication1 旧 exe 对照值）
+static_assert(CivCrc32Raw("")                   == 0xFFFFFFFFu, "Civ CRC32 self-check: empty");
+static_assert(CivCrc32Raw("123456789")          == 0x340BC6D9u, "Civ CRC32 self-check: 123456789");
+static_assert(CivCrc32Raw("a")                  == 0x174841BCu, "Civ CRC32 self-check: a");
+static_assert(CivCrc32Raw("Hello")              == 0x082E767Du, "Civ CRC32 self-check: Hello");
+static_assert(CivCrc32Raw("TERRA7")             == 0x16D22538u, "Civ CRC32 self-check: TERRA7");
+static_assert(CivCrc32Raw("NOTIFICATION_ADDED") == 0xF26F3ACFu, "Civ CRC32 self-check: NOTIFICATION_ADDED");
 
 uint32_t MakeHashImpl(const char* str) {
     return str ? CivCrc32Raw(str) : 0;   // 空指针返回 0（官方实现会直接解引用）
