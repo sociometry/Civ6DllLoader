@@ -3060,7 +3060,6 @@ const char* LocToUtf8Impl(void* loc) {
 
 using EditPlayerFn = void*(__fastcall*)(int playerId);
 using GetCivDescFn = const char*(__fastcall*)(void* player);
-using MakeHashFn = uint32_t(__fastcall*)(const char* str);
 
 static EditPlayerFn ResolveEditPlayer() {
     return reinterpret_cast<EditPlayerFn>(
@@ -3069,10 +3068,6 @@ static EditPlayerFn ResolveEditPlayer() {
 static GetCivDescFn ResolveGetCivDesc() {
     return reinterpret_cast<GetCivDescFn>(
         ResolveCurrentGameCoreByName("GameCore::Player::Instance::GetCivilizationDescription"));
-}
-static MakeHashFn ResolveMakeHash() {
-    return reinterpret_cast<MakeHashFn>(
-        ResolveCurrentGameCoreByName("GameCore::Utilities::MakeHash"));
 }
 
 void* EditPlayerImpl(int playerId) {
@@ -3106,10 +3101,27 @@ const char* GetCivilizationDescriptionImpl(void* player) {
     }
 }
 
+// Civ 风格字符串哈希：官方 GameCore::Utilities::MakeHash 的逐位等价实现（IDA 实证）。
+//   官方：MakeHash(s) => Crypto::CRC::CalcString(&GameCore::Utilities::ms_Hasher, s, 0xFFFFFFFF)
+//   循环体：v4 = a3 >> 8; v5 = m_table[(uint8_t)(a3 ^ *p)]; a3 = v4 ^ v5; 返回 a3（无最终异或）；
+//   ms_Hasher->m_table 就是标准反射表（多项式 0xEDB88320，init 0xFFFFFFFF）。
+// 官方写入里 `char i` 配合 (unsigned __int8)(a3 ^ i) 的截断，使 char 的符号扩展不生效，
+// 所以这里用 uint8_t 与之逐位一致。内化后不再解析 GameCore 符号：对局前也能算，也不受重载影响。
+constexpr uint32_t CivCrc32Raw(const char* str) {
+    uint32_t h = 0xFFFFFFFFu;
+    for (const char* p = str; p && *p; ++p) {
+        h ^= static_cast<uint8_t>(*p);
+        for (int i = 0; i < 8; ++i) {
+            h = (h & 1u) ? ((h >> 1) ^ 0xEDB88320u) : (h >> 1);
+        }
+    }
+    return h;
+}
+// 编译期自检：raw("123456789") = 0x340BC6D9（标准 CRC32 0xCBF43926 去掉最终异或）
+static_assert(CivCrc32Raw("123456789") == 0x340BC6D9u, "Civ CRC32 (raw) self-check failed");
+
 uint32_t MakeHashImpl(const char* str) {
-    auto fn = ResolveMakeHash();
-    if (!fn || !str) return 0;
-    return fn(str);
+    return str ? CivCrc32Raw(str) : 0;   // 空指针返回 0（官方实现会直接解引用）
 }
 
 int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pushMethodsSymbol) {
