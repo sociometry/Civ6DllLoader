@@ -110,13 +110,15 @@ static void ClearActivePluginContext() {
 // 几乎零开销）；有捕获才保存参数、调用 CaptureDispatch，再尾跳 nextTarget。
 // nextTarget = activeDetour（有 Detour 时）或 minhookTrampoline（无 Detour 时）。
 //
-// 生命周期硬约束（M1）：站点、stub、trampoline 一经建立就【永不物理脱钩】。退役只
-// 拔插槽（activeDetour=nullptr / hasCapture=false / captureOuts.clear()），绝不调用
-// MH_RemoveHook、绝不 JitRuntime::release、绝不 g_hookSites.erase。理由：stub 先减
-// 计数再尾跳，且 activeCalls==0 不能证明没有调用者仍在 stub 内；释放任何 JIT 代码 /
-// 节点 / trampoline 都是 UAF。节点只在进程退出时随静态对象回收。
-// 唯一的物理重建是「跨 GameCore 代际重建」（M4，见 GetOrCreateHookSiteLocked）：
-// 旧映像已卸载，旧 trampoline 悬垂，必须摘掉旧 MinHook 记录后重挂。
+// 生命周期硬约束（M1）：日常「退役」只拔插槽（activeDetour=nullptr / hasCapture=false /
+// captureOuts.clear()），绝不调用 MH_RemoveHook、绝不 JitRuntime::release、绝不
+// g_hookSites.erase。理由：stub 先读 nextTarget 再尾跳，且没有可靠的计数能证明没有
+// 调用者仍在 stub 内；随手释放 JIT 代码 / 节点 / trampoline 都是 UAF。节点只在进程
+// 退出时随静态对象回收。
+// S3 的唯一例外是 GameCore teardown：趁旧映像仍映射时先用一次 MH_ApplyQueued 批量还原
+// 全部 GameCore 域入口字节（此后不再有新调用进入 stub / 插件 detour），再物理摘除
+// MinHook 记录（释放跳板）。见 DisableGameCoreDomainSites / RemoveGameCoreDomainSiteRecords。
+// 摘除失败的站点打 recordStale，下次在同一地址取站时强制重建（GetOrCreateHookSiteLocked）。
 struct HookSite {
     struct CaptureOut {
         void** address = nullptr;
@@ -133,7 +135,9 @@ struct HookSite {
     bool retiring = false;                // g_captureMutex 保护；阻止新的捕获写入
     uint32_t captureParamIndex = 0;
     std::vector<CaptureOut> captureOuts;  // g_captureMutex 保护
-    uint64_t gameCoreGeneration = 0;      // 站点建立时的域代际（exe / 非 GameCore 域 = 0）
+    // MinHook 记录没能在 teardown 里摘掉的标记（目标映像已卸载 -> Disable/Remove 都失败）。
+    // 下次在同一个地址取站时会据此强制重建记录，否则站点会一直以为钩还装着。
+    bool recordStale = false;
 };
 
 static std::map<void*, HookSite> g_hookSites;
@@ -339,15 +343,6 @@ static bool TargetInTearingDownGameCore(void* target) {
         p - g_gameCoreTeardownAddress < g_gameCoreTeardownSizeOfImage;
 }
 
-// ---------------- HookAPI ??? ----------------
-// 站点的域代际：GameCore 域目标取当前映像代际；exe / 非 GameCore 域恒为 0
-// （exe 域站点不参与代际比较，免得被误判为陈旧）。
-static uint64_t SiteGenerationForTarget(const void* target) {
-    return TargetInCurrentGameCore(const_cast<void*>(target))
-        ? ImageAddress::GameCoreGeneration()
-        : 0;
-}
-
 // 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
 // 快路径（hasCapture == 0，Detour-only 站点的常态）：
 //   mov r10, imm64(site)
@@ -430,12 +425,11 @@ static bool BuildHookHubStub(HookSite* site, void** outStub) {
 }
 
 // 取/建 target 上的统一站点。调用方必须持有 Runtime::MinHookMutex()（站点锁）。
-// 首次建站（或跨 GameCore 代际重建）才 MH_CreateHook + MH_EnableHook。
+// 首次建站（或 recordStale 强制重建）才 MH_CreateHook + MH_EnableHook。
 // 失败不抛异常：记日志并返回 nullptr；只在确认尚未发布（created）时 erase 该空节点，
 // 且 erase 之后绝不再使用 site 引用（M5）。
 static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
     if (!target) return nullptr;
-    const uint64_t generation = SiteGenerationForTarget(target);
 
     auto it = g_hookSites.find(target);
     const bool created = (it == g_hookSites.end());
@@ -444,18 +438,15 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
     }
     HookSite* site = &it->second;
 
-    const bool rebuild = !created && site->gameCoreGeneration != generation;
-    if (!created && !rebuild && site->hookInstalled) {
-        return site;   // 既有、同代、可用
+    if (!created && !site->recordStale && site->hookInstalled) {
+        return site;   // 既有、可用
     }
 
-    if (rebuild) {
-        // M4：跨 GameCore 代际。旧映像已卸载，旧 trampoline（指向旧映像前导字节的重定位
-        // 副本）不再可用，绝不复用。这是「代际重建」，不是 M1 禁止的「退役」：只发生在
-        // 注册路径，target 刚由当前映像解析、可读，此刻摘除旧 MinHook 记录不会踩到未映射内存。
-        Logger::Log("HookSite: rebuild across generation target=%p %llu -> %llu (%s)",
-            target, static_cast<unsigned long long>(site->gameCoreGeneration),
-            static_cast<unsigned long long>(generation), why ? why : "");
+    if (!created && site->recordStale) {
+        // recordStale：上一次 GameCore teardown 没能摘掉这条 MinHook 记录（目标映像当时
+        // 已卸载 -> Disable/Remove 都失败）。此刻 target 是调用方刚解析出来的地址，可读，
+        // 尽力摘掉残留记录后再重建；旧 trampoline 已指向已卸载映像，绝不复用。
+        Logger::Log("HookSite: recordStale rebuild target=%p (%s)", target, why ? why : "");
         if (site->hookInstalled && Runtime::IsReadableSpan(target, 1)) {
             MH_DisableHook(target);
             const MH_STATUS st = MH_RemoveHook(target);
@@ -473,6 +464,7 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
         site->hasCapture = false;
         site->retiring = false;
         site->captureOuts.clear();
+        site->recordStale = false;
     }
 
     if (!site->stubCode && !BuildHookHubStub(site, &site->stubCode)) {
@@ -484,7 +476,7 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
     MH_STATUS status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
     if (status == MH_ERROR_ALREADY_CREATED) {
         // 只有「本站节点已存在（!created）」才可能是本站自己的残留 MinHook 记录
-        // （例如上一次代际 MH_RemoveHook 失败）。对全新站点，ALREADY_CREATED 只可能
+        // （例如上一次 teardown 的 MH_RemoveHook 失败）。对全新站点，ALREADY_CREATED 只可能
         // 是别人的钩子；无条件摘除会释放对方的 trampoline（可能让跳板指针悬垂并静默
         // 顶掉 Lua 脚本全局注册），因此必须拒绝。Loader 共享钩并入站点表后，
         // target 上不会再存在独立于本站的第三方记录需要在这里避让。
@@ -506,7 +498,6 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
     }
     // 先把 stub 的尾跳目标置为新 trampoline，再 Enable：否则 Enable 之后、赋值之前进入
     // stub 的调用会 jmp 到 nullptr。
-    site->gameCoreGeneration = generation;
     site->nextTarget = site->minhookTrampoline;
     if ((status = MH_EnableHook(target)) != MH_OK) {
         Logger::Log("HookSite: MH_EnableHook failed target=%p status=%s (%s)",
@@ -516,9 +507,8 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
         return nullptr;
     }
     site->hookInstalled = true;
-    Logger::Log("HookSite: installed hub stub target=%p stub=%p trampoline=%p gen=%llu (%s)",
-        target, site->stubCode, site->minhookTrampoline,
-        static_cast<unsigned long long>(generation), why ? why : "");
+    Logger::Log("HookSite: installed hub stub target=%p stub=%p trampoline=%p (%s)",
+        target, site->stubCode, site->minhookTrampoline, why ? why : "");
     return site;
 }
 
@@ -573,20 +563,6 @@ static size_t RetireHookSiteDetoursForOwnerLocked(const std::wstring& owner) {
             ++retired;
             Logger::Log("HookSite: retired detour slot %p (owner=%ls)", target, owner.c_str());
         }
-    }
-    return retired;
-}
-
-static size_t RetireHookSiteDetoursForGenerationLocked(uint64_t generation) {
-    size_t retired = 0;
-    for (auto& [target, site] : g_hookSites) {
-        if (!site.activeDetour || site.gameCoreGeneration != generation) continue;
-        site.activeDetour = nullptr;
-        site.detourOwner.clear();
-        site.nextTarget = site.minhookTrampoline;
-        ++retired;
-        Logger::Log("HookSite: retired detour slot %p across generation %llu", target,
-            static_cast<unsigned long long>(generation));
     }
     return retired;
 }
@@ -683,15 +659,16 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
 //      执行原函数——安全且语义正确，且此后不会再有人引用这块跳板；
 //   c) MH_RemoveHook(target)：释放跳板。必须排在 b 之后，否则在途线程会从 stub 直接
 //      跳进已释放的跳板（UAF）。
-// 摘除失败时保留站点记账（hookInstalled 等不动），交给下次代际重建处理。
+// 摘除失败时保留站点记账（hookInstalled 等不动）；teardown 路径会给该站点打
+// recordStale，交给下次在同一地址取站时强制重建。
 static bool RemoveHookSiteRecordLocked(void* target, HookSite& site) {
     if (!target) return false;
     const MH_STATUS disable = MH_DisableHook(target);
     if (disable != MH_OK && disable != MH_ERROR_DISABLED) {
         // 入口字节没能还原（例如映像已卸载 → MinHook 的 VirtualProtect 失败返回
         // MH_ERROR_MEMORY_PROTECT）：此时【绝不能】把 nextTarget 指向 target——入口
-        // 仍跳本站 stub，stub 再跳 target 就成了死循环；记录与跳板原样保留，交给下次
-        // 代际重建清理。
+        // 仍跳本站 stub，stub 再跳 target 就成了死循环；记录与跳板原样保留，由调用方
+        // 决定是否打 recordStale（teardown 路径）交给下次取站重建。
         Logger::Log("RemoveHookSiteRecord: MH_DisableHook(%p) -> %s; record retained",
             target, MH_StatusToString(disable));
         return false;
@@ -2023,7 +2000,8 @@ std::vector<ScriptGlobalsEntry> g_scriptGlobalsUI;
 ProxyTypes::RegisterScriptData g_origRegisterScriptData = nullptr;
 ProxyTypes::RegisterScriptDataForUI g_origRegisterScriptDataForUI = nullptr;
 // 上述两个跳板由统一站点的 MH_CreateHook 回填（尾跳原函数），detour 用它们调原实现；
-// 站点退役（ResetSharedGameCoreHooks）时随站点记录一并清空。是否已挂钩不再需要标志：
+// 站点在 GameCore teardown 物理摘除（RemoveGameCoreDomainSiteRecords）时随记录一并清空。
+// 是否已挂钩不再需要标志：
 // 站点表本身就是唯一账本，重复安装幂等。
 
 static void CallScriptGlobalsSafe(ScriptGlobalsFn fn, void* L) {
@@ -3723,8 +3701,13 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
 }
 
 // 按跟踪项卸载单个插件（调用方保证 index 有效）：
-// OnUnload → PatchRegistry::RevertAllFor(name) → RemovePluginHooks(name) → FreeLibrary，语义与 S2a 接线一致。
-static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
+// OnUnload → PatchRegistry::RevertAllFor(name) → RemovePluginHooks(name) → 撤销 capture /
+// 回调类注册 → 从 g_plugins 摘除 →（freeModule 时）FreeLibrary。
+// freeModule 只由 GameCore 类别传 true：GameCore 插件随对局重载必须真正卸载，插件静态
+// 状态才不会跨局残留；调用前 ResetForReload 已批量还原入口字节，不会再有人进入该插件的
+// detour。Global 插件一律 false（只在启动时加载，禁用需要重启）；崩溃隔离路径根本不走
+// 本函数，模块继续驻留。
+static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) {
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     const auto initial = std::find_if(g_plugins.begin(), g_plugins.end(),
         [&ownerId](const PluginEntry& entry) {
@@ -3769,14 +3752,21 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId) {
                    candidate.ownerId == entry.ownerId;
         });
     if (tracked != g_plugins.end()) g_plugins.erase(tracked);
-    // 不 FreeLibrary：游戏线程可能仍在该插件的 detour/回调内执行（MH_DisableHook
-    // 不等待所有类型的在飞调用），此刻卸下映像会把正在执行的代码变成 UAF。
-    // 改为驻留模块（hook 框架的标准做法）：映像保持映射
-    // 但休眠——钩已摘、补丁已回滚、Lua 方法/回调/OnMessage 已注销，不会再被调用。
-    // 代价是该插件重启用时静态状态跨周期保留，OnLoad 必须可重入（重新注册其
-    // 钩子/回调）；这与全新加载路径对插件的要求一致。
-    Logger::Log("Plugin deactivated, module parked (kept mapped): %s",
-        ModScan::WideToNarrow(entry.path).c_str());
+    // FreeLibrary 必须在生命周期锁【之外】调用：插件 DllMain(DLL_PROCESS_DETACH) 可能
+    // 反过来调 Loader，持锁卸载会让行为不可控，而且 FreeLibrary 本身可能阻塞。
+    // freeModule=false（Global）时继续驻留：游戏线程可能仍在该插件的 detour/回调内
+    // 执行（MH_DisableHook 不等待所有类型的在飞调用），此刻卸下映像会把正在执行的
+    // 代码变成 UAF。驻留后钩已摘、补丁已回滚、Lua 方法/回调/OnMessage 已注销，映像
+    // 休眠不会再被调用；代价是重启用时静态状态跨周期保留，OnLoad 必须可重入。
+    lifecycleLock.unlock();
+    if (freeModule) {
+        FreeLibrary(entry.handle);
+        Logger::Log("Plugin deactivated, module freed: %s",
+            ModScan::WideToNarrow(entry.path).c_str());
+    } else {
+        Logger::Log("Plugin deactivated, module parked (kept mapped): %s",
+            ModScan::WideToNarrow(entry.path).c_str());
+    }
 }
 
 static const char* CategoryNameForLog(LoaderCore::PluginCategory cat) {
@@ -3807,7 +3797,8 @@ void LoaderCore::UnloadPluginsOf(PluginCategory cat) {
         }
     }
     for (const auto& owner : owners) {
-        UnloadPluginByOwnerId(owner);
+        // 只有 GameCore 类别真正卸映像（Global 插件只在启动时加载，禁用需要重启）。
+        UnloadPluginByOwnerId(owner, cat == PluginCategory::GameCore);
     }
     size_t remaining = 0;
     {
@@ -3879,44 +3870,84 @@ bool LoaderCore::IsInitialized() {
     return g_gameCorePhaseReady;
 }
 
-// GameCore 重载时的共享钩子复位（G1）：RegisterScriptData/ForUI 共享钩与全部
-// PushMethods 槽位钩现在都只是站点表里「detourOwner 为空、带 detour」的站点——目标都
-// 在旧 GameCore 映像内，映像卸载后补丁字节随映射消失，而 MinHook 记录与 trampoline
-// 指针全部残留：
-//  - 若不复位：重进游戏后 detour 不再被调用（新映像是未打补丁的原始字节），
-//    Lua 注入本会话永久失效；
-//  - PushMethods 槽位还会按重载次数泄漏（上限 16 个）。
-// 脱钩完全由站点表驱动。在 UnloadDllDetour 路径调用时旧映像仍存活，可干净摘钩。
-// 在 LoadDllDetour 重入兜底路径调用时映像可能已卸载（ImageAddress 仍记着旧基址，
-// 域过滤照样命中）：此时 MinHook 侧 VirtualProtect 失败并返回 MEMORY_PROTECT，既不
-// 复制备份字节也不释放跳板，站点记录原样保留——不会踩未映射内存，留给站点按代际
-// 重建（GetOrCreateHookSiteLocked）时清理。
+// ================= GameCore teardown：批量停用 + 物理摘除 =================
+// S3 之前：跨 GameCore 代际靠「域代际计数器」在注册路径重建站点，MinHook 记录与跳板
+// 一直驻留到进程退出。S3 起改为在 teardown 里趁旧映像还活着【物理摘钩】：
+//   1) DisableGameCoreDomainSites()：一次 MH_ApplyQueued 批量还原 GameCore 域全部入口字节；
+//   2) （Teardown 回调 / capture 清理 / GameCore 插件卸载之后）
+//      RemoveGameCoreDomainSiteRecords()：按地址物理摘除 MinHook 记录（释放跳板）。
+// 为什么第 1 步必须先于 GameCore 插件 FreeLibrary：入口字节还原之后就不会再有新调用
+// 进入插件 detour；反过来先 FreeLibrary 就会留下「入口仍跳向已释放插件代码」的窗口。
+// 覆盖面：GameCore 域内【全部已挂钩站点】——Loader 共享钩（ScriptData / ForUI /
+// PushMethods）与插件 detour 一视同仁，且不看 owner；Global 插件在对局中经 Ready 回调
+// 装的 GameCore 域钩也在此收掉，否则新映像未打补丁、钩子永久失效，PushMethods 槽位还会
+// 按重载次数泄漏（上限 16 个）。exe / 常驻模块域站点不受影响。
 // 已注册的 ScriptGlobals 回调列表跨重载保留（Global 插件仍加载着），
 // 由 EnsureScriptHooksInstalled 在新 GameCore attach 后重新装钩。
-static void ResetSharedGameCoreHooks(
-        unique_lock<std::recursive_mutex>& lifecycleLock) {
-    // 先收集「目标属于当前 GameCore 域（已加载域 或 正在拆除的区间）+ 无 owner +
-    // 有 detour」的共享钩站点，并逐个 MH_DisableHook（入口字节还原为原函数）。
-    // 必须趁 ImageAddress 尚未 detach、teardown 窗口仍有效时收集，之后再按 target
-    // 列表物理摘除。
-    std::vector<void*> sharedTargets;
-    {
-        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-        const HookImageId gcId = ImageAddress::LoadedGameCore();
-        for (auto& [target, site] : g_hookSites) {
-            if (!site.activeDetour || !site.detourOwner.empty()) continue;   // 只取 Loader 共享钩
-            if (!ImageAddress::Contains(gcId, target) && !TargetInTearingDownGameCore(target)) {
-                continue;
-            }
-            const MH_STATUS status = MH_DisableHook(target);
-            if (status != MH_OK && status != MH_ERROR_DISABLED) {
-                Logger::Log("ResetSharedGameCoreHooks: MH_DisableHook(%p) -> %s",
-                    target, MH_StatusToString(status));
-            }
-            sharedTargets.push_back(target);
+
+// 第 1 步：把「GameCore 域（当前已加载映像 或 正在拆除的区间）+ 已挂钩」的站点批量停用。
+// 用 MH_QueueDisableHook + 【一次】 MH_ApplyQueued，而不是逐个 MH_DisableHook：
+//   * QueueDisable 只置 queueEnable=FALSE、不碰目标内存，因而可以边遍历站点表边调用；
+//   * ApplyQueued 内部用一次 Freeze(ALL_HOOKS_POS) 把这批入口字节一起还原，是一个批处理
+//     事务：入口一还原，就不会再有新调用进入 stub / 插件 detour。
+// 但 ApplyQueued 的内部循环遇到第一个 EnableHookLL 失败就 break（后面的记录不会被停用），
+// 所以排队前必须把不可读的目标剔除——否则一个已卸载映像的坏目标会挡住整批。
+// 不可读候选（映像在 LoadDLL 重入兜底路径里已经卸载）无法排进本批：给它打 recordStale，
+// 下次在同一地址取站时强制重建记录（否则站点会一直以为钩还装着，永不重新挂钩）。
+// 无返回值：第 2 步自己重扫站点表（见 RemoveGameCoreDomainSiteRecords 的说明），因此本批
+// 不带地址列表，也就不会漏掉 teardown 期间才装上的钩。
+static void DisableGameCoreDomainSites() {
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    const HookImageId gcId = ImageAddress::LoadedGameCore();
+    size_t candidates = 0;
+    size_t readable = 0;
+    size_t unreadable = 0;
+    size_t queued = 0;
+    for (auto& [target, site] : g_hookSites) {
+        if (!site.hookInstalled) continue;
+        if (!ImageAddress::Contains(gcId, target) && !TargetInTearingDownGameCore(target)) {
+            continue;
+        }
+        ++candidates;
+        if (!Runtime::IsReadableSpan(target, 1)) {
+            // 本批不能包含不可读目标（ApplyQueued 首败即 break）；标脏，等下次取站重建。
+            ++unreadable;
+            site.recordStale = true;
+            continue;
+        }
+        ++readable;
+        const MH_STATUS status = MH_QueueDisableHook(target);
+        if (status == MH_OK) {
+            ++queued;
+        } else {
+            // 排队失败只记日志：这一步本来就不会改写目标内存，第 2 步还会按地址再尝试
+            // 物理摘除，并据结果决定是否打 recordStale。
+            Logger::Log("DisableGameCoreDomainSites: MH_QueueDisableHook(%p) -> %s",
+                target, MH_StatusToString(status));
         }
     }
+    // 一次 ApplyQueued = 这一批入口字节在同一个 Freeze 事务里还原。
+    const MH_STATUS applied = MH_ApplyQueued();
+    Logger::Log("DisableGameCoreDomainSites: candidates=%zu readable=%zu queued=%zu unreadable=%zu "
+                "applyQueued=%s",
+        candidates, readable, queued, unreadable, MH_StatusToString(applied));
+}
 
+// 第 2 步：物理摘除 GameCore 域的站点记录（释放 MinHook 跳板），并复位共享钩状态。
+// 骨架沿用被本步替换掉的共享钩复位函数（S3 已删除）：
+//   1) 进入 teardown 窗口 + ImageAddress::DetachGameCore()（此后 Contains 不再命中，
+//      域过滤只剩 teardown 窗口），释放生命周期锁排空 g_activeSharedDetours（已进入共享
+//      detour 的调用先退出），再重新持生命周期锁；
+//   2) 重扫站点表而不是沿用第 1 步的地址列表：第 1 步与本步之间还跑过 Teardown 回调与
+//      插件卸载，而 PushMethods 这类注册入口按设计【不过域门】，理论上仍可能往正在拆除的
+//      映像上装新钩；重扫能把它一并收掉，否则这条新记录会跨代残留。摘除失败（映像已卸载
+//      -> MH_DisableHook 的 VirtualProtect 失败）时给站点打 recordStale 并拔掉 detour 槽，
+//      避免下次误判「已装」；
+//   3) 复位 g_orig* 与全部 PushMethods 槽位（与旧实现完全一致）。
+// 本函数不碰 capture 槽：capture 的清理由 ResetForReload 里更早的 CleanupAllCaptureSites()
+// 与插件卸载路径的 CleanupCaptureSitesForOwner 负责。
+static void RemoveGameCoreDomainSiteRecords(
+        unique_lock<std::recursive_mutex>& lifecycleLock) {
     // 禁止新的 GameCore API 解析后释放生命周期锁，让已经进入 detour 的插件回调
     // 能正常调用 HookAPI 并退出；不能在持 lifecycle/hook 锁时等待。
     HookImageInfo current{ sizeof(HookImageInfo) };
@@ -3936,13 +3967,27 @@ static void ResetSharedGameCoreHooks(
     lifecycleLock.lock();
 
     // 排空后才真正摘除站点记录（释放跳板）；顺序理由见 RemoveHookSiteRecordLocked。
+    // teardown 窗口此刻仍是旧映像区间（DetachGameCore 已让 ImageAddress 的 Contains 失效），
+    // 它以唯一判据回答「这个站点属不属于本次拆除的映像」。
+    size_t removed = 0;
+    size_t stale = 0;
     {
         lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-        for (void* target : sharedTargets) {
-            const auto it = g_hookSites.find(target);
-            if (it != g_hookSites.end()) {
-                RemoveHookSiteRecordLocked(target, it->second);
+        for (auto& [target, site] : g_hookSites) {
+            if (!site.hookInstalled) continue;
+            if (!TargetInTearingDownGameCore(target)) continue;
+            if (RemoveHookSiteRecordLocked(target, site)) {
+                ++removed;
+                continue;
             }
+            // 摘除失败（目标不可写/不可读）：入口字节没能还原，MinHook 记录与跳板还在。
+            // 打 recordStale 让下次在同一地址取站时强制重建；同时先拔掉 detour 槽，
+            // 免得下次误判「已装」而拒绝重新挂钩。
+            ++stale;
+            site.recordStale = true;
+            site.activeDetour = nullptr;
+            site.detourOwner.clear();
+            site.nextTarget = site.minhookTrampoline;
         }
     }
 
@@ -3957,27 +4002,9 @@ static void ResetSharedGameCoreHooks(
     }
     g_gameCoreTeardownAddress = 0;
     g_gameCoreTeardownSizeOfImage = 0;
-    Logger::Log("ResetSharedGameCoreHooks: script/UI detour sites + push slots reset");
-}
-
-// 按代际退役所有 GameCore 域的插件 detour（调用方持生命周期锁）。
-// 统一站点表是唯一的挂钩账本：Global 插件在对局中经 Ready 回调装的 GameCore 域钩
-// 无人摘，异基址重载后旧站点目标指向未映射内存，统一在旧映像卸载前处理——只拔
-// detour 槽（activeDetour=nullptr，nextTarget=minhookTrampoline），绝不物理脱钩：
-// stub / trampoline 保持存活，重载后按代际重建（M4）。
-// exe 域（generation == 0）不受影响。
-// 注：Loader 共享钩（ScriptData / ForUI / PushMethods）的退役由 ResetSharedGameCoreHooks
-// 负责，这里只处理有 owner 的插件 detour。
-static void DisableGameCoreGenerationHooks(uint64_t generation) {
-    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-    const size_t retiredSites = RetireHookSiteDetoursForGenerationLocked(generation);
-    Logger::Log("DisableGameCoreGenerationHooks: siteDetoursRetired=%zu", retiredSites);
-}
-
-static void RemoveGameCoreGenerationHooks(uint64_t generation) {
-    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
-    const size_t retiredSites = RetireHookSiteDetoursForGenerationLocked(generation);
-    Logger::Log("RemoveGameCoreGenerationHooks: siteDetoursRetired=%zu", retiredSites);
+    Logger::Log("RemoveGameCoreDomainSiteRecords: physically removed MinHook record on %zu site(s), "
+                "marked recordStale=%zu; script/UI detour sites + push slots reset",
+        removed, stale);
 }
 
 void LoaderCore::ResetForReload() {
@@ -3995,28 +4022,28 @@ void LoaderCore::ResetForReload() {
         g_gameCoreTeardownAddress = 0;
         g_gameCoreTeardownSizeOfImage = 0;
     }
-    const uint64_t teardownGeneration = ImageAddress::GameCoreGeneration();
     lifecycleLock.unlock();
 
     // phaseReady 已关闭，不会再有新的 Ready 准入；先等已准入回调结束，
     // 防止其与 Teardown/卸载交错。
     WaitForGameCoreCallbacks(g_gameCoreReadyCallbacks);
 
-    // 先关闭该代插件钩入口，再运行 Teardown。回调返回即表示插件已排空自己
-    // 的在途 detour；此后才会释放 original trampoline。
-    DisableGameCoreGenerationHooks(teardownGeneration);
+    // 第 1 步（必须在 UnloadPluginsOf 之前）：趁旧映像仍映射，用一次 ApplyQueued 批量
+    // 还原 GameCore 域全部入口字节。入口不再指向 stub / 插件 detour 之后，后续
+    // FreeLibrary 才不会有「入口跳向已释放插件代码」的窗口。
+    DisableGameCoreDomainSites();
 
     // Global 插件收尾回调：置于 GameCore 插件卸载之前（它们可能依赖后者仍在
     // 钩上维护的数据）；旧映像此刻仍存活。
     FireGameCoreCallbacks(g_gameCoreTeardownCallbacks, "GameCoreTeardown");
 
     // capture 站点的目标位于旧 GameCore 映像内，重载后地址失效，必须随重载清空落在
-    // GameCore 域内的捕获订阅；exe / 常驻模块域上的订阅保留。站点/stub/trampoline 不释放
-    // （M1），只拔插槽；等下次 Ready 回调由插件重新注册（注册时按代际重建，见
-    // GetOrCreateHookSiteLocked）。
+    // GameCore 域内的捕获订阅；exe / 常驻模块域上的订阅保留。本步只拔插槽，站点记录
+    // 由后面的 RemoveGameCoreDomainSiteRecords 物理摘除。
     CleanupAllCaptureSites();
 
-    // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。
+    // UnloadPluginsOf 自身不触碰初始化标志，天然无递归。GameCore 类别会真正
+    // FreeLibrary（入口字节已在上一步还原，见 UnloadPluginByOwnerId）。
     UnloadPluginsOf(PluginCategory::GameCore);
 
     lifecycleLock.lock();
@@ -4026,13 +4053,11 @@ void LoaderCore::ResetForReload() {
         PatchRegistry::RevertAllInRange(
             g_gameCoreTeardownAddress, g_gameCoreTeardownSizeOfImage);
     }
-    // 共享钩子（ScriptData/ForUI + PushMethods 槽位）目标在旧 GameCore 映像内，
-    // 必须随重载复位，否则 Lua 注入在新映像下永久失效（见函数头注释）。
-    ResetSharedGameCoreHooks(lifecycleLock);
-    // 按代际清掉剩余的 GameCore 域插件钩（Global 插件的钩 + 各类漏网）。
-    RemoveGameCoreGenerationHooks(teardownGeneration);
+    // 第 2 步：重扫站点表物理摘除 GameCore 域的 MinHook 记录（释放跳板），并复位共享钩状态
+    // （ScriptData/ForUI + PushMethods 槽位）。顺序理由见函数头注释。
+    RemoveGameCoreDomainSiteRecords(lifecycleLock);
     // GameCore 重载后 Global 插件注册的 GameEvent 槽位跨代保留：Register/Trigger 与
     // Lua 路径内化（GameEventInvokeLua）每次实时取活跃 state / scriptSystem（见
     // GetActiveLuaStateImpl），无需在此重挂任何信号环。
-    Logger::Log("ResetForReload: teardown callbacks fired, GameCore plugins unloaded, shared hooks reset, generation hooks cleared");
+    Logger::Log("ResetForReload: teardown callbacks fired, GameCore plugins unloaded (GameCore modules freed), entry bytes restored in batch, MinHook records physically removed");
 }

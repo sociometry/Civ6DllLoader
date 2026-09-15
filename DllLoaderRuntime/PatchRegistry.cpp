@@ -334,7 +334,12 @@ size_t RevertAllFor(const wchar_t* owner) {
         std::vector<SavedProtection> saved;
         if (!MakeWritableRecording(t, origSize, saved)) {
             RestoreProtections(saved);
-            Logger::Log("PatchRegistry::RevertAllFor: protect failed target=%p err=%lu", t, GetLastError());
+            // 目标已不可写/不可读（映像已卸载）：原始字节随映射一起消失，恢复无意义，
+            // 保留记录只会把已死的地址长期留在表里（并挡住同地址区间的后续 Apply）。
+            // 丢弃记录——original 缓冲随 Entry 一起析构，不泄漏、不悬垂。
+            Logger::Log("PatchRegistry::RevertAllFor: protect failed target=%p err=%lu (dropping record)",
+                t, GetLastError());
+            Registry().erase(it);
             continue;
         }
         memcpy(t, it->second.original.data(), origSize);
