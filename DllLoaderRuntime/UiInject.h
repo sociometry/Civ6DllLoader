@@ -13,8 +13,5 @@ void ExtractResources();
 // 返回 false = hook 未安装（特征码不匹配 / 游戏已更新），静默降级。
 bool Install();
 
-// 请求重建注入树（只设置标志，不在调用线程直接操作 ForgeUI 对象）。
-// 当前无进程内调用者：Global 插件仅启动时加载，Mod 开关不再触发运行期重注入。
-void RequestRefresh();
 
 }  // namespace UiInject

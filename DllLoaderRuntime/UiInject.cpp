@@ -110,8 +110,8 @@ typedef void  (__fastcall* LuaInitFn)(void* ctx, const wchar_t* name);
 typedef void* (__fastcall* LoadUiFn)(void* state);
 
 // ---- 状态 ----
-// UI 对象只能在游戏/UI 线程操作；刷新请求由 RequestRefresh 设置，
-// 具体销毁与重建只在 LoadUI detour（或明确的 UI 线程刷新点）执行。
+// UI 对象只能在游戏/UI 线程操作；g_refreshRequested 初值为 true，注入失败时由失败路径重新
+// 置位（下次 LoadUI 再试），成功后就保持 false；具体销毁与重建只在 LoadUI detour 里执行。
 std::atomic<bool> g_refreshRequested{ true };
 std::atomic<bool> g_injectionInProgress{ false };
 void* g_frontEndContext = nullptr;
@@ -772,9 +772,6 @@ void UiInject::ExtractResources() {
     ExtractOne(module, kXmlResourceId, kXmlFileName);
 }
 
-void UiInject::RequestRefresh() {
-    g_refreshRequested.store(true, std::memory_order_release);
-}
 
 bool UiInject::Install() {
     std::lock_guard<std::mutex> hookLock(Runtime::MinHookMutex());

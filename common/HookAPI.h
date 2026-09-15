@@ -151,7 +151,6 @@ enum {
 
 typedef enum HookApiPushMethodsResult {
     kHookApiPushMethodsFailed = 0,
-    kHookApiPushMethodsDeferred = 1,
     kHookApiPushMethodsInstalled = 2
 } HookApiPushMethodsResult;
 
@@ -198,8 +197,8 @@ typedef struct HookAPI {
     void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
 
     // Failed：本次没有安装任何方法（GameCore 未就绪、符号解析失败，或与同一 target 上
-    //   的既有定义冲突）；Installed：本次已安装。Deferred 取值保留但不再产生 —— Loader
-    //   不再为下一代 GameCore 保存登记表，登记只在当次安装内生效。
+    //   的既有定义冲突）；Installed：本次已安装。没有"延迟登记"取值 —— Loader 不为下一代
+    //   GameCore 保存登记表，登记只在当次安装内生效。
     // 同 owner + target + exposedName 的相同定义重复调用幂等；同 target 的同名
     // 不同定义（包括不同 owner）整批拒绝。函数和 internalName/exposedName 均须非空。
     // 参数由 Loader 复制。原 PushMethods 由 Loader 自动调用，本接口不再返回其

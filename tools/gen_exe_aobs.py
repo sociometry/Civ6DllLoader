@@ -37,8 +37,6 @@ IMAGE_NAMES = {1: "ExeDx11", 2: "ExeDx12"}
 FUNC_TARGETS = [
     ("LoadDLL",          0xF8510,  0xF8850),
     ("UnloadDLL",        0xF8E30,  0xF9170),
-    ("lEnableMod",       0x4CCFE0, 0x4CD840),
-    ("lDisableMod",      0x4CCD50, 0x4CD5B0),
     ("GetConfiguration", 0x100390, 0x100CE0),
     ("GetRuleSet",       0x100F40, 0x101890),
     ("LoadUI",           0x8AB40,  0x8B080),

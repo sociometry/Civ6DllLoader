@@ -13,7 +13,6 @@
 
 #include "pch.h"
 
-#include <atomic>
 #include <cwctype>
 #include <string>
 
