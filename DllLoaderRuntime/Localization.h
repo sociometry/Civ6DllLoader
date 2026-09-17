@@ -8,9 +8,6 @@
 
 namespace Localization {
 
-class ParameterArgument;
-class Language;
-
 // Opaque storage matching Firaxis Localization::String layout size (over-allocated safely).
 class String {
 public:
@@ -25,19 +22,16 @@ public:
 
     bool PushArgument(const char* arg);
     const char* toUTF8() const;
-    unsigned int GetArgumentCount() const;
 
 private:
     alignas(8) unsigned char storage_[LOCALIZATION_STRING_BYTES];
 };
 
-using GetArgumentCountFunc = unsigned int(__fastcall*)(const String* pThis);
 using LookupFunc = String*(__cdecl*)(String* pThis, const char* key);
 using PushArgumentFunc = bool(__fastcall*)(String* pThis, const char* arg);
 using DestructorFunc = void(__fastcall*)(String* pThis);
 using ToUTF8Func = const char*(__fastcall*)(const String* pThis);
 
-extern GetArgumentCountFunc GetArgumentCountPtr;
 extern LookupFunc LookupPtr;
 extern PushArgumentFunc PushArgumentPtr;
 extern DestructorFunc DestructorPtr;

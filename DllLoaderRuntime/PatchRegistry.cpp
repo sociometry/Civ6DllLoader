@@ -1,5 +1,5 @@
 // PatchRegistry.cpp — v2 单层补丁注册表（HookAPI Patch/Unpatch 后端）。
-// 设计见 docs/superpowers/specs/2026-08-17-civ6dllloader-v2-design.md §4.1 / §10 Q19。
+// 域规则/补丁仲裁见 docs/ARCHITECTURE.md §4.1 与 §5.5；历史设计文档已删除。
 #include "pch.h"
 #include "PatchRegistry.h"
 

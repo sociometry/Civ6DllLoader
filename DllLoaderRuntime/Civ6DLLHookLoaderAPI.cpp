@@ -23,15 +23,14 @@
 #include "PluginInFlight.h"
 
 #include <cstdarg>
-#include <cstdarg>
 #include <cstdlib>
+#include <cstring>   // memcmp（前导字节副本比对）
 #include <cwchar>
 #include <cwctype>
 #include <atomic>
 #include <condition_variable>
 #include <intrin.h>
 #include <optional>
-#include <unordered_set>
 
 #include "PatchRegistry.h"
 #include "LoaderCore.h"
@@ -56,12 +55,8 @@ struct PluginEntry {
     std::wstring ownerId;
     LoaderCore::PluginCategory category = LoaderCore::PluginCategory::Global;
     PluginState state = PluginState::Active;
-    // 插件经 DeclarePluginKind 自述的类别/版本（OnLoad 返回前必须已声明，
-    // 见 LoadPluginDllInternal 的强制校验）。kindDeclared=false = 未声明，拒载。
-    bool kindDeclared = false;
-    uint32_t declaredKind = 0;
-    uint32_t declaredApiVersion = 0;
-    uint32_t declaredStructSize = 0;
+    // 类别 / ABI 版本在 OnLoad 之前就由插件的 Civ6PluginKind 导出判完（见 LoadPluginDllInternal），
+    // 这里不再保存任何"插件自述"字段。
 };
 static vector<PluginEntry> g_plugins;
 
@@ -89,6 +84,14 @@ static void QueueGameCoreModuleForFree(HMODULE module) {
     g_pendingFreeModules.push_back(module);
 }
 
+// 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
+// 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
+// 唯一写者是游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）。
+// Runtime::MinHookMutex（MinHook 调用 + owner 表）与 PatchRegistry 的
+// CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
+// [声明位置] 必须在 FreePendingPluginModules 之前：它在 FreeLibrary 之后要用它清悬垂句柄。
+static std::recursive_mutex g_pluginLifecycleMutex;
+
 // 引擎卸完 GameCore 之后调用：真正 FreeLibrary 那些排队的插件模块。
 // 不持任何 Loader 锁调用 FreeLibrary（插件 DllMain(DETACH) 可能反过来调 Loader）。
 void LoaderCore::FreePendingPluginModules() {
@@ -100,29 +103,25 @@ void LoaderCore::FreePendingPluginModules() {
     for (HMODULE module : modules) {
         FreeLibrary(module);
         Logger::Log("Plugin module freed after engine GameCore unload: %p", module);
+        // 句柄已失效：把跟踪表里同句柄的条目置空，避免悬垂句柄被"同基址复用"的新模块误命中
+        // （崩溃隔离的条目会一直留在表里，正是为了让 LoadSinglePlugin 的按路径去重拦住重试）。
+        lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+        for (auto& entry : g_plugins) {
+            if (entry.handle == module) entry.handle = nullptr;
+        }
     }
 }
-
-// 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
-// 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
-// 唯一写者是游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）。
-// Runtime::MinHookMutex（MinHook 调用 + owner 表）与 PatchRegistry 的
-// CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
-static std::recursive_mutex g_pluginLifecycleMutex;
 
 // GameCore 阶段切换互斥（InitializeGameCorePhase / ResetForReload 与插件加载/卸载互斥）：
 // 保证 "attach -> 装钩 -> 加载 GameCore 插件" 与 "teardown -> 卸载" 两段不会交错。
 static std::recursive_mutex g_gameCoreTransitionMutex;
 
-// 插件回调在途登记 / 排空统一走 PluginInFlight（见 PluginInFlight.h）。
-// 原先进程里散着几套等价实现（本文件的 PluginCallbackState / PluginCallbackGuard /
-// TryEnterPluginCallback / WaitForPluginCallbacks，以及消息总线自己的
-// enabled + activeCalls + drainCv），本次合并为一套：
+// 插件回调的在途登记 / 排空全部走 PluginInFlight（见 PluginInFlight.h），只有一套实现：
 //  - 状态门禁：写 PluginEntry::state 时经 SetPluginState 同步镜像到
-//    PluginInFlight::SetAllowed（唯一写者）；
-//  - 在途记账：四个"加载器 -> 插件"入口（ScriptGlobals / ScriptGlobalsUI /
-//    GameEvent / PushMethods）改走 PluginInFlight::Enter；
-//  - 排空：卸载/隔离与消息总线注销统一调 PluginInFlight::WaitAll。
+//    PluginInFlight::SetAllowed（镜像的唯一写者）；
+//  - 在途记账："加载器 -> 插件"入口（消息、ScriptGlobals / ScriptGlobalsUI、
+//    GameEvent、PushMethods）进入时走 PluginInFlight::Enter；
+//  - 排空：卸载/隔离与消息总线注销都调 PluginInFlight::WaitAll。
 
 // OnLoad/OnUnload 的快速 owner 上下文。异步调用不依赖它，而由回调/调用方地址反查
 // 所属插件模块，避免错误归为 Loader 导致插件停用后钩子仍生效。
@@ -150,12 +149,12 @@ static void ClearActivePluginContext() {
 // 几乎零开销）；有捕获才保存参数、调用 CaptureDispatch，再尾跳 nextTarget。
 // nextTarget = activeDetour（有 Detour 时）或 minhookTrampoline（无 Detour 时）。
 //
-// 生命周期硬约束（M1）：日常「退役」只拔插槽（activeDetour=nullptr / hasCapture=false /
+// 生命周期硬约束：日常「退役」只拔插槽（activeDetour=nullptr / hasCapture=false /
 // captureOuts.clear()），绝不调用 MH_RemoveHook、绝不 JitRuntime::release、绝不
 // g_hookSites.erase。理由：stub 先读 nextTarget 再尾跳，且没有可靠的计数能证明没有
 // 调用者仍在 stub 内；随手释放 JIT 代码 / 节点 / trampoline 都是 UAF。节点只在进程
 // 退出时随静态对象回收。
-// S3 的唯一例外是 GameCore teardown：趁旧映像仍映射时先用一次 MH_ApplyQueued 批量还原
+// 唯一的例外是 GameCore teardown：趁旧映像仍映射时先用一次 MH_ApplyQueued 批量还原
 // 全部 GameCore 域入口字节（此后不再有新调用进入 stub / 插件 detour），再物理摘除
 // MinHook 记录（释放跳板）。见 DisableGameCoreDomainSites / RemoveGameCoreDomainSiteRecords。
 // 摘除失败的站点打 recordStale，下次在同一地址取站时强制重建（GetOrCreateHookSiteLocked）。
@@ -178,6 +177,14 @@ struct HookSite {
     // MinHook 记录没能在 teardown 里摘掉的标记（目标映像已卸载 -> Disable/Remove 都失败）。
     // 下次在同一个地址取站时会据此强制重建记录，否则站点会一直以为钩还装着。
     bool recordStale = false;
+    // 建 MinHook 记录时目标前导字节的副本：recordStale 重建前用它判断"这个地址现在还是不是
+    // 当年那个函数"。不一致就绝不调用 MH_DisableHook / MH_RemoveHook —— 两者都会把旧记录的
+    // 备份字节写回目标，旧映像已卸载时那就是在破坏当前映射的代码（跨映像/跨版本写坏函数）。
+    static constexpr size_t kGuardBytes = 16;
+    uint8_t prologueBackup[kGuardBytes] = {};
+    bool prologueValid = false;
+    // 前导字节对不上（或当时没读到）：本会话不再碰这个地址，绝不冒险写回旧字节（fail-closed）。
+    bool poisoned = false;
 };
 
 static std::map<void*, HookSite> g_hookSites;
@@ -211,6 +218,14 @@ static LoaderCore::PluginCategory CategoryForPath(const std::wstring& path) {
     return NormalizePluginPath(path).find(L"\\plugins\\global\\") != std::wstring::npos
         ? LoaderCore::PluginCategory::Global
         : LoaderCore::PluginCategory::GameCore;
+}
+
+// Civ6PluginKind 导出低 32 位的 kind -> 插件类别。1=Global，2=GameCore；
+// 3 预留给未来的 Frontend（未支持），其余一律未知 -> 拒载。
+static bool KindToCategory(uint32_t kind, LoaderCore::PluginCategory& out) {
+    if (kind == 1u) { out = LoaderCore::PluginCategory::Global; return true; }
+    if (kind == 2u) { out = LoaderCore::PluginCategory::GameCore; return true; }
+    return false;
 }
 
 static uintptr_t g_gameCoreTeardownAddress;
@@ -442,7 +457,7 @@ static bool TargetInTearingDownGameCore(void* target) {
 // rax/r10/r11 在函数入口是 volatile，且都不是参数寄存器，快路径只动 rax/r10。
 // 栈对齐：入口 rsp ≡ 8 (mod 16)，sub 0x98（≡8）后 rsp ≡ 0 (mod 16)，[rsp+0..0x20)
 // 恰好是 CaptureDispatch 的 shadow space，[rsp+0x20..0x80) 保存参数（movaps 目标全部
-// 16 字节对齐）。慢路径【不再】调用 CaptureEnter/CaptureLeave：在「永不释放」前提下
+// 16 字节对齐）。慢路径不调用任何"进入/离开"计数（stub 与节点永不释放，计数不构成安全判据）：
 // 计数不是安全判据（见 HookSite 注释）。
 // stub 运行时从 site 字段读 nextTarget，因此 MinHook trampoline 可在 stub 生成之后由
 // MH_CreateHook 回填，无需生成后回写任何可执行字节。
@@ -504,8 +519,8 @@ static bool BuildHookHubStub(HookSite* site, void** outStub) {
 
 // 取/建 target 上的统一站点。调用方必须持有 Runtime::MinHookMutex()（站点锁）。
 // 首次建站（或 recordStale 强制重建）才 MH_CreateHook + MH_EnableHook。
-// 失败不抛异常：记日志并返回 nullptr；只在确认尚未发布（created）时 erase 该空节点，
-// 且 erase 之后绝不再使用 site 引用（M5）。
+// 失败不抛异常：记日志并返回 nullptr；只有确认"这个节点刚建、还没被任何调用者看到"
+// （created）时才 erase 它；erase 之后绝不再使用 site 引用。
 static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
     if (!target) return nullptr;
 
@@ -516,14 +531,36 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
     }
     HookSite* site = &it->second;
 
+    if (!created && site->poisoned) {
+        Logger::Log("HookSite: target %p is poisoned (stale MinHook record from an unmapped image); "
+                    "refusing (%s)", target, why ? why : "");
+        return nullptr;
+    }
+
     if (!created && !site->recordStale && site->hookInstalled) {
         return site;   // 既有、可用
     }
 
     if (!created && site->recordStale) {
         // recordStale：上一次 GameCore teardown 没能摘掉这条 MinHook 记录（目标映像当时
-        // 已卸载 -> Disable/Remove 都失败）。此刻 target 是调用方刚解析出来的地址，可读，
-        // 尽力摘掉残留记录后再重建；旧 trampoline 已指向已卸载映像，绝不复用。
+        // 已卸载 -> Disable/Remove 都失败）。此刻 target 是调用方刚解析出来的地址，可读。
+        // 前置判据：当前字节必须与建记录时的副本一致（= 同一个函数），否则 MinHook 的
+        // Disable/Remove 会把**旧映像备份的字节**写进当前映射的代码。
+        bool samePrologue = false;
+        if (site->prologueValid) {
+            uint8_t current[HookSite::kGuardBytes] = {};
+            if (PluginBoundary::TryReadRaw(target, current, HookSite::kGuardBytes,
+                    HookSite::kGuardBytes)) {
+                samePrologue = std::memcmp(current, site->prologueBackup,
+                    HookSite::kGuardBytes) == 0;
+            }
+        }
+        if (!samePrologue) {
+            site->poisoned = true;
+            Logger::Log("HookSite: recordStale target=%p 前导字节与建记录时不一致（旧映像已卸载/地址被复用）；"
+                        "拒绝触碰它的 MinHook 记录 (fail-closed) (%s)", target, why ? why : "");
+            return nullptr;
+        }
         Logger::Log("HookSite: recordStale rebuild target=%p (%s)", target, why ? why : "");
         if (site->hookInstalled && Runtime::IsReadableSpan(target, 1)) {
             MH_DisableHook(target);
@@ -553,18 +590,25 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
 
     MH_STATUS status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
     if (status == MH_ERROR_ALREADY_CREATED) {
-        // 只有「本站节点已存在（!created）」才可能是本站自己的残留 MinHook 记录
-        // （例如上一次 teardown 的 MH_RemoveHook 失败）。对全新站点，ALREADY_CREATED 只可能
-        // 是别人的钩子；无条件摘除会释放对方的 trampoline（可能让跳板指针悬垂并静默
-        // 顶掉 Lua 脚本全局注册），因此必须拒绝。Loader 共享钩并入站点表后，
-        // target 上不会再存在独立于本站的第三方记录需要在这里避让。
-        if (!created && Runtime::IsReadableSpan(target, 1)) {
+        // 只有「本站节点已存在（!created）」**且当前字节与建记录时的副本一致**才可能是本站
+        // 自己的残留记录（例如上一次 teardown 的 MH_RemoveHook 失败）。对全新站点、
+        // 或字节对不上的地址，ALREADY_CREATED 只可能是别人的钩子；无条件摘除会释放对方的
+        // trampoline（跳板指针悬垂、静默顶掉 Lua 脚本全局注册），并把旧字节写进当前映像。
+        bool ownLeftover = false;
+        if (!created && site->prologueValid) {
+            uint8_t current[HookSite::kGuardBytes] = {};
+            ownLeftover = PluginBoundary::TryReadRaw(target, current, HookSite::kGuardBytes,
+                HookSite::kGuardBytes) &&
+                std::memcmp(current, site->prologueBackup, HookSite::kGuardBytes) == 0;
+        }
+        if (ownLeftover) {
             MH_RemoveHook(target);
             status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
         } else {
             Logger::Log("HookSite: target %p already hooked by another owner; refusing to replace (%s)",
                 target, why ? why : "");
             if (created) g_hookSites.erase(it);
+            else site->poisoned = true;   // 不是我们的记录：别再碰这个地址
             return nullptr;
         }
     }
@@ -573,6 +617,14 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
             target, MH_StatusToString(status), why ? why : "");
         if (created) g_hookSites.erase(it);
         return nullptr;
+    }
+    // 保存前导字节副本（供将来 recordStale 判断"同一函数"）。MH_CreateHook 不改入口字节，
+    // 所以此刻读到的就是 MinHook 备份下来的那几字节。
+    site->prologueValid = PluginBoundary::TryReadRaw(target, site->prologueBackup,
+        HookSite::kGuardBytes, HookSite::kGuardBytes);
+    if (!site->prologueValid) {
+        Logger::Log("HookSite: target %p 前导字节不可读；本次仍建站，但 recordStale 只能 fail-closed (%s)",
+            target, why ? why : "");
     }
     // 先把 stub 的尾跳目标置为新 trampoline，再 Enable：否则 Enable 之后、赋值之前进入
     // stub 的调用会 jmp 到 nullptr。
@@ -628,7 +680,7 @@ static bool InstallLoaderDetourOnSite(void* target, void* detour, void** origSlo
     return true;
 }
 
-// 退役站点 detour 槽：只拔插槽（M1），绝不 MH_RemoveHook / g_hookSites.erase。
+// 退役站点 detour 槽：只拔插槽，绝不 MH_RemoveHook / g_hookSites.erase。
 // 调用方必须持有 Runtime::MinHookMutex()。
 static size_t RetireHookSiteDetoursForOwnerLocked(const std::wstring& owner) {
     if (owner.empty()) return 0;
@@ -1382,7 +1434,7 @@ void* LoaderCore::ResolveDataByAobCore(HookImageId image, const char* aob, uint3
 //     自行重新注册；exe / 常驻模块域上的订阅与重载无关，保留；
 //  2) 插件卸载：捕获槽的 out 指向插件内存，卸载后悬空（UnloadPluginByOwnerId 调用
 //     CleanupCaptureSitesForOwner）。
-// 硬约束 M1：这里【只】清空 captureOuts / 翻转 hasCapture，绝不 MH_RemoveHook、绝不
+// 硬约束：这里【只】清空 captureOuts / 翻转 hasCapture，绝不 MH_RemoveHook、绝不
 // g_captureRuntime.release、绝不 g_hookSites.erase。站点 / stub / MinHook trampoline
 // 全程存活，只在进程退出时随静态对象回收。本段只取 g_captureMutex（capture 侧），
 // 不取 MinHook 锁，因此不会与「MinHook -> capture」的注册路径成环。
@@ -1578,7 +1630,8 @@ void* GetActiveLuaStateImpl() {
         void* singleton = GameEventReadPtrSafe(slot, 0);
         if (!singleton) continue;
         void* L = GameEventReadPtrSafe(static_cast<const char*>(singleton) + 0x10, 0);
-        // 【诊断】一次性打印命中 RVA（预期 slot RVA=0x2D08F88），验证 AOB 锚点正确性
+        // 每个进程只打一次命中 RVA（预期 slot RVA=0x2D08F88）：确认 AOB 锚点落对位置，
+        // 是"活跃 state 取不到"这类现场问题的第一手证据。
         static bool s_logged = false;
         if (!s_logged && L) {
             s_logged = true;
@@ -2596,7 +2649,7 @@ void LuaPushNumberImpl(void* L, double num) {
 }
 
 void LuaPushIntegerImpl(void* L, int num) {
-    // G12: 语义对齐——API 承诺压整数，用 hksi_lua_pushinteger 压整数标记值
+    // 语义对齐：API 承诺压整数，用 hksi_lua_pushinteger 压整数标记值
     // （此前走 pushnumber 是历史遗留，hks 开启 IntLiterals 时两者字节码可区分）。
     HKS_GUARD_VOID(hks::pushinteger, L, num);
 }
@@ -3035,78 +3088,6 @@ __declspec(noinline) static bool HookUnpatch(void* target) {
     return PatchRegistry::RevertOwned(target, owner->ownerId.c_str());
 }
 
-// ---- 插件类别/版本声明（OnLoad 期，由 HookAPI_IsCompatible 代调） ----
-// kind：1=Global，2=GameCore（3 预留给未来的 Frontend，当前拒绝）。对账"插件自述类别"
-// vs "安装路径推出的类别"（CategoryForPath），并记录声明的 apiVersion / sizeof(HookAPI)。
-// 幂等：重复调用只刷新记录。调用方模块优先取 OnLoad 期设置的 g_activePluginModule，
-// 取不到时用返回地址反查（GetModuleHandleEx + FROM_ADDRESS）。
-bool DeclarePluginKindImpl(const HookAPI* api, uint32_t kind, uint32_t apiVersion,
-                           uint32_t pluginStructSize) {
-    (void)api;
-    HMODULE module = g_activePluginModule;
-    if (!module) {
-        if (!GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCWSTR>(_ReturnAddress()), &module) || !module) {
-            Logger::Log("DeclarePluginKind rejected: cannot resolve caller module");
-            return false;
-        }
-    }
-
-    const char* declaredName = nullptr;
-    LoaderCore::PluginCategory declared = LoaderCore::PluginCategory::Global;
-    switch (kind) {
-        case 1u:
-            declaredName = "Global";
-            declared = LoaderCore::PluginCategory::Global;
-            break;
-        case 2u:
-            declaredName = "GameCore";
-            declared = LoaderCore::PluginCategory::GameCore;
-            break;
-        case 3u:
-            Logger::Log("DeclarePluginKind rejected: kind=3 (Frontend) is reserved and not supported");
-            return false;
-        default:
-            Logger::Log("DeclarePluginKind rejected: unknown kind=%u", kind);
-            return false;
-    }
-
-    lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-    PluginEntry* entry = nullptr;
-    for (auto& candidate : g_plugins) {
-        if (candidate.handle == module) {
-            entry = &candidate;
-            break;
-        }
-    }
-    if (!entry) {
-        Logger::Log("DeclarePluginKind rejected: module %p is not a tracked plugin", module);
-        return false;
-    }
-    if (declared != entry->category) {
-        Logger::Log("DeclarePluginKind rejected: 声明 %s，路径判为 %s，loader 版本 %u",
-            declaredName, CategoryNameForLog(entry->category),
-            static_cast<unsigned>(CIV6_HOOK_API_VERSION));
-        return false;
-    }
-    if (apiVersion != CIV6_HOOK_API_VERSION) {
-        Logger::Log("DeclarePluginKind rejected: 声明 apiVersion=%u，路径判为 %s，loader 版本 %u",
-            apiVersion, CategoryNameForLog(entry->category),
-            static_cast<unsigned>(CIV6_HOOK_API_VERSION));
-        return false;
-    }
-    entry->kindDeclared = true;
-    entry->declaredKind = kind;
-    entry->declaredApiVersion = apiVersion;
-    entry->declaredStructSize = pluginStructSize;
-    Logger::Log("DeclarePluginKind: plugin=%ls category=%s declared=%s apiVersion=%u structSize=%u",
-        entry->name.c_str(), CategoryNameForLog(entry->category), declaredName,
-        apiVersion, pluginStructSize);
-    return true;
-}
-
 // 只读契约：Loader 初始化后从不写它（全是取地址/读取），插件也只该读。
 // const 让它落到 .rdata（PAGE_READONLY）——插件写它会当场 AV，被 CallOnLoadSafe 接住。
 static const HookAPI g_hookApi = {
@@ -3201,8 +3182,6 @@ static const HookAPI g_hookApi = {
     &GetEngineUtilityImpl,
     &GetActiveLuaStateImpl,
     &LuaPushNilImpl,
-
-    &DeclarePluginKindImpl,
 };
 
 // loader 内部复用 common/HookAPI.h 的 HookInfo 取址工具时的入口（LoaderHooks/UiInject 用），
@@ -3344,15 +3323,16 @@ static void CallOnUnloadSafe(OnUnloadFunc onUnload, const char* name) {
     }
 }
 
-// v2 统一插件加载流程：LoadLibraryExW + OnLoad(SEH) + OnMessage 自动注册 + 记录跟踪项。
+// v2 统一插件加载流程：LoadLibraryExW + 类别/ABI 门禁(OnLoad 之前) + OnLoad(SEH) +
+// OnMessage 自动注册 + 记录跟踪项。
 // nameNarrow = 显示名（通常为文件名，内部取 stem 作 Patch owner / OnMessage 名）；已加载（同句柄）返回 false。
 static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& nameNarrow,
     LoaderCore::PluginCategory category) {
     lock_guard<std::recursive_mutex> transitionLock(g_gameCoreTransitionMutex);
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
 
-    // G5: 已驻留模块（禁用后未卸载）用 UNCHANGED_REFCOUNT 取回，"禁用→启用"循环
-    // 不再累计引用计数；未映射才真正加载。ownsRef 标记引用是否归本调用所有，
+    // 已驻留模块（更早的启用周期留下、未卸载）用 UNCHANGED_REFCOUNT 取回，"禁用→启用"
+    // 循环不再累计引用计数；未映射才真正加载。ownsRef 标记引用是否归本调用所有，
     // 失败路径只释放自己拿到的引用（GetModuleHandleEx 取回的引用不属于我们）。
     bool ownsRef = false;
     HMODULE hPlugin = nullptr;
@@ -3372,6 +3352,30 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
             if (ownsRef) FreeLibrary(hPlugin);
             return false;
         }
+    }
+
+    // 类别门禁前置（OnLoad 之前）：插件头文件（common/HookAPI.h）自动发出 Civ6PluginKind 导出，
+    // 低 32 位 = kind（高 32 位 = apiVersion，只进日志、不参与判断）。在这里拒载永远安全——
+    // 插件一行代码都还没跑过，没有钩子/补丁/回调需要回滚，FreeLibrary 只释放本次自己
+    // LoadLibraryExW 拿到的引用（ownsRef）。ABI 版本兼容性由插件侧 HookAPI_IsCompatible 判。
+    using PluginKindFn = uint64_t(*)();
+    auto kindFn = reinterpret_cast<PluginKindFn>(GetProcAddress(hPlugin, "Civ6PluginKind"));
+    if (!kindFn) {
+        Logger::Log("Plugin rejected: 缺 Civ6PluginKind 导出（必须用带类别门禁的 HookAPI.h 重编）: %s",
+            ModScan::WideToNarrow(wpath).c_str());
+        if (ownsRef) FreeLibrary(hPlugin);
+        return false;
+    }
+    const uint64_t kindInfo = kindFn();   // 纯常量返回，不碰游戏状态
+    const uint32_t declaredKind = static_cast<uint32_t>(kindInfo & 0xFFFFFFFFu);
+    const uint32_t declaredApi = static_cast<uint32_t>(kindInfo >> 32);   // 仅日志/诊断
+    LoaderCore::PluginCategory declaredCategory = LoaderCore::PluginCategory::Global;
+    if (!KindToCategory(declaredKind, declaredCategory) || declaredCategory != category) {
+        Logger::Log("Plugin rejected: 类别与安装路径不符 (kind=%u api=%u 路径类别=%s): %s",
+            static_cast<unsigned>(declaredKind), static_cast<unsigned>(declaredApi),
+            CategoryNameForLog(category), ModScan::WideToNarrow(wpath).c_str());
+        if (ownsRef) FreeLibrary(hPlugin);
+        return false;
     }
 
     auto onLoad = (OnLoadFunc)GetProcAddress(hPlugin, "OnLoad");
@@ -3426,39 +3430,27 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         trackedAfterLoad->state == PluginState::Quarantined;
 
     if (!onLoadOk) {
-        // 崩溃隔离（G2）：仅驻留模块不够——按 owner 回滚全部注册并标记隔离，
-        // 防止半初始化状态持续生效、以及阶段 B 全量扫描反复重试崩溃的 OnLoad。
+        // 崩溃隔离：按 owner 回滚全部注册并标记隔离，防止半初始化状态持续生效、
+        // 以及阶段 B 全量扫描反复重试崩溃的 OnLoad（条目留在 g_plugins，按路径去重拦住重试）。
         Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
         lifecycleLock.unlock();
         if (!alreadyQuarantined) QuarantinePluginByOwner(ownerId);
+        // 模块释放策略（崩溃 = OnLoad 已经跑过，插件可能留有待执行的 detour）：
+        //   GameCore 类别：入队，等引擎卸完 GameCore（连同它的 Lua 环境）之后再 FreeLibrary；
+        //                  Free 时 FreePendingPluginModules 会把这里的悬垂句柄置空。
+        //   Global  类别：驻留——exe 域钩子被高频调用，MH_DisableHook 不等待所有在飞调用，
+        //                  此刻 FreeLibrary 会把正在执行的插件代码变成 UAF。
+        if (category == LoaderCore::PluginCategory::GameCore) {
+            QueueGameCoreModuleForFree(hPlugin);
+            Logger::Log("Plugin quarantined, module queued for free after engine GameCore unload: %s",
+                ModScan::WideToNarrow(wpath).c_str());
+        } else {
+            Logger::Log("Plugin quarantined, module parked (kept mapped): %s",
+                ModScan::WideToNarrow(wpath).c_str());
+        }
         return false;
     }
     if (alreadyQuarantined || trackedAfterLoad == g_plugins.end()) {
-        return false;
-    }
-    // 强制声明插件类别：OnLoad 必须经 HookAPI_IsCompatible 调到 DeclarePluginKind
-    // （只有带类别门禁的 HookAPI.h 才会代调）。没声明 = 用旧头文件编的插件，拒载。
-    if (!trackedAfterLoad->kindDeclared) {
-        Logger::Log("Plugin rejected: 未声明插件类别（必须用带类别门禁的 HookAPI.h 重编）: %s",
-            narrow.c_str());
-        lifecycleLock.unlock();
-        QuarantinePluginByOwner(ownerId);
-        lifecycleLock.lock();
-        const auto victim = std::find_if(g_plugins.begin(), g_plugins.end(),
-            [&ownerId](const PluginEntry& tracked) {
-                return tracked.ownerId == ownerId;
-            });
-        if (victim != g_plugins.end()) g_plugins.erase(victim);
-        lifecycleLock.unlock();
-        // ownsRef 语义（G5）：已驻留模块是用 UNCHANGED_REFCOUNT 取回的，引用不归本调用，
-        // 绝不能 FreeLibrary；只有自己 LoadLibraryExW 拿到的引用才释放。
-        // GameCore 类别同样排到引擎卸完 GameCore 之后：它可能在"没声明类别"之前就已经往
-        // gamecore Lua 表里推过闭包（Quarantine 撤不掉已经在表里的闭包）。
-        if (category == LoaderCore::PluginCategory::GameCore) {
-            QueueGameCoreModuleForFree(hPlugin);
-        } else if (ownsRef) {
-            FreeLibrary(hPlugin);
-        }
         return false;
     }
 
@@ -3483,31 +3475,15 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     return true;
 }
 
-void LoadPluginDLL(const char* name, const string& path) {
-    const std::wstring wpath = ModScan::NarrowToWide(path);
-    LoadPluginDllInternal(wpath, name ? name : "", CategoryForPath(wpath));
-}
+// 说明（为什么这里什么都没有了）：v1 曾有一条"loader 消息入口"——任何插件都能
+// BroadcastMessage/SendMessageTo("Loader", "load-plugin", <路径>)，让 Loader 去
+// LoadLibrary 那个**任意路径**的 DLL 并以完整 HookAPI 调它的 OnLoad。它绕过了
+// ModScan/EnabledMods 的启用集过滤（等于把"任意 native 代码执行"交给任何插件），
+// 而且仓库里没有任何生产者。已连同 InitializeLoader（它唯一职责就是注册那个
+// "Loader" 消息处理器）一并删除：插件只从"启用 Mod 的 Plugins\{Global,GameCore}"
+// 目录、经 LoaderCore::LoadSinglePlugin 加载。
 
-void OnLoaderMessage(const char* topic, const void* data, size_t len) {
-    Logger::Log("OnLoaderMessage %s", topic ? topic : "");
-    if (topic && data && strcmp(topic, "load-plugin") == 0 && len > 0) {
-        string path((const char*)data, len);
-        LoadPluginDLL(nullptr, path);
-    }
-}
-
-bool InitializeLoader(HMODULE hModule) {
-    // v1 时代还记录模块句柄供 GetCurrentModuleDir 使用；该路径已随 v1 死代码清理
-    // 删除，现在只注册 "Loader" 消息处理器（load-plugin 遗留入口，保持兼容）。
-    (void)hModule;
-    static std::once_flag registerLoaderHandler;
-    std::call_once(registerLoaderHandler, [] {
-        g_bus.RegisterHandler("Loader", OnLoaderMessage);
-    });
-    return true;
-}
-
-// ================= LoaderCore 实现（S3c：插件生命周期 v2） =================
+// ================= LoaderCore 实现（插件生命周期） =================
 
 // 退役某插件通过 HookAPI.InstallHook 注册的 detour 槽（只拔插槽，绝不物理脱钩）：
 // 清空该 owner 的 activeDetour / detourOwner，nextTarget 回落到 minhookTrampoline
@@ -3734,12 +3710,9 @@ bool LoaderCore::InitializeGameCorePhase() {
         Logger::Log("InitializeGameCorePhase: AttachGameCore failed");
         return false;
     }
-    // v2 无薄壳：以当前进程 exe 模块作扫描锚。
-    if (!InitializeLoader(GetModuleHandleW(nullptr))) {
-        Logger::Log("InitializeGameCorePhase: InitializeLoader failed");
-        ImageAddress::DetachGameCore();
-        return false;
-    }
+    // 阶段 B 固定顺序：AttachGameCore（映像登记 + pdata 表 + 作用域记账）→ HavokScript 导入 →
+    // 本地化导入 → 共享脚本钩重装（EnsureScriptHooksInstalled，见本函数末尾）→ 加载 GameCore 插件。
+    // （历史步骤 InitializeLoader 已删除，见文件上方说明。）
     // HavokScript 导入缺失 = Lua API 半可用，对插件是崩溃源：停用 GameCore 插件
     // 加载（本会话游戏本体照常运行）。
     if (!hks::InitHavokScript()) {
@@ -3762,8 +3735,8 @@ bool LoaderCore::IsInitialized() {
 }
 
 // ================= GameCore teardown：批量停用 + 物理摘除 =================
-// S3 之前：跨 GameCore 代际靠「域代际计数器」在注册路径重建站点，MinHook 记录与跳板
-// 一直驻留到进程退出。S3 起改为在 teardown 里趁旧映像还活着【物理摘钩】：
+// 早期实现：跨 GameCore 代际靠「域代际计数器」在注册路径重建站点，MinHook 记录与跳板
+// 一直驻留到进程退出。现在改为在 teardown 里趁旧映像还活着【物理摘钩】：
 //   1) DisableGameCoreDomainSites()：一次 MH_ApplyQueued 批量还原 GameCore 域全部入口字节；
 //   2) （Teardown 回调 / capture 清理 / GameCore 插件卸载之后）
 //      RemoveGameCoreDomainSiteRecords()：按地址物理摘除 MinHook 记录（释放跳板）。
@@ -3824,7 +3797,7 @@ static void DisableGameCoreDomainSites() {
 }
 
 // 第 2 步：物理摘除 GameCore 域的站点记录（释放 MinHook 跳板），并复位共享钩状态。
-// 骨架沿用被本步替换掉的共享钩复位函数（S3 已删除）：
+// 骨架沿用被本步替换掉的共享钩复位函数（该函数已删除）：
 //   1) 进入 teardown 窗口 + ImageAddress::DetachGameCore()（此后 Contains 不再命中，
 //      域过滤只剩 teardown 窗口），释放生命周期锁排空 g_activeSharedDetours（已进入共享
 //      detour 的调用先退出），再重新持生命周期锁；
@@ -3859,7 +3832,7 @@ static void RemoveGameCoreDomainSiteRecords(
     // 排空后才真正摘除站点记录（释放跳板）；顺序理由见 RemoveHookSiteRecordLocked。
     // teardown 窗口此刻仍是旧映像区间（DetachGameCore 已让 ImageAddress 的 Contains 失效），
     // 它以唯一判据回答「这个站点属不属于本次拆除的映像」。
-    size_t erased = 0;
+    size_t reset = 0;
     size_t stale = 0;
     {
         lock_guard<mutex> hookLock(Runtime::MinHookMutex());
@@ -3869,12 +3842,26 @@ static void RemoveGameCoreDomainSiteRecords(
                 continue;
             }
             if (RemoveHookSiteRecordLocked(it->first, it->second)) {
-                // 记录已摘、入口已还原：旧映像再也不会有人走进本站 stub（将来同基址复用的新
-                // 映像，入口字节是它自己的，也不会跳进旧 stub），所以站点节点可以真删掉，不再
-                // 留死条目。stub 那块 asmjit 代码无法按块回收（JitRuntime 只能整体 release，且
-                // 多个 stub 共用同一块），它内嵌的 site 指针从此不被任何可达路径读取。
-                it = g_hookSites.erase(it);
-                ++erased;
+                // 记录已摘、入口已还原。**节点不删**：stub 的机器码里用 imm64 永久内嵌了
+                // &HookSite（见 BuildHookHubStub），而"已经没有调用者停在 stub 内"无法证明
+                // （见 HookSite 顶部的硬约束注释）——erase 会让仍在 stub 里的线程读到已释放的 map 节点。
+                // 这里把站点复位成"未挂钩、可重建"：stub 保留并复用，下次在同一地址取站时走
+                // MH_CreateHook + MH_EnableHook 的正常重建路径（还会重拍前导字节副本）。
+                HookSite& site = it->second;
+                site.hookInstalled = false;      // RemoveHookSiteRecordLocked 已置，写出来当不变量
+                site.minhookTrampoline = nullptr;
+                site.activeDetour = nullptr;
+                site.detourOwner.clear();
+                site.nextTarget = nullptr;
+                {
+                    // 锁序恒为 MinHook -> capture（本循环外层已持 MinHook 锁）。
+                    lock_guard<mutex> captureLock(g_captureMutex);
+                    site.hasCapture = false;
+                    site.retiring = false;
+                    site.captureOuts.clear();
+                }
+                ++reset;
+                ++it;
                 continue;
             }
             // 摘除失败（目标不可写/不可读）：入口字节没能还原，MinHook 记录与跳板还在。
@@ -3898,11 +3885,20 @@ static void RemoveGameCoreDomainSiteRecords(
             g_withManagerSlots[i] = WithManagerHookSlot{};
         }
     }
+    // teardown 窗口【不在这里清】：它以"旧映像区间"为唯一判据，必须活到引擎真正换掉映像
+    // 那一步 —— LoaderHooks 的两个 detour 调完原函数后调 ClearGameCoreTeardownWindow()。
+    // 提前清会让"仍映射着的旧映像"重新对 Global 插件变成可钩的已加载模块。
+    Logger::Log("RemoveGameCoreDomainSiteRecords: reset %zu site(s) in place (MinHook record + "
+                "trampoline released; node kept: stubs embed &HookSite), marked recordStale=%zu; "
+                "script/UI detour sites + push slots reset",
+        reset, stale);
+}
+
+// teardown 窗口的清零点：由 LoaderHooks 的两个 detour 在引擎原函数返回之后调用。
+// 见 §2.3 第 9 步：窗口必须在引擎 LoadDLL/UnloadDLL 真正换映像之后才失效。
+void LoaderCore::ClearGameCoreTeardownWindow() {
     g_gameCoreTeardownAddress = 0;
     g_gameCoreTeardownSizeOfImage = 0;
-    Logger::Log("RemoveGameCoreDomainSiteRecords: erased %zu site node(s) (MinHook record + trampoline "
-                "released), marked recordStale=%zu; script/UI detour sites + push slots reset",
-        erased, stale);
 }
 
 void LoaderCore::ResetForReload() {

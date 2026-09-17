@@ -1,6 +1,7 @@
-// LoaderHooks.cpp — Civ6DllLoader v2 游戏内 hook 安装（S4）。
+// LoaderHooks.cpp — Civ6DllLoader v2 游戏内 hook 安装。
 //
-// 安装 2 个 MinHook detour（详见 docs/LoadDLL_analysis.md 与设计文档 §3.1 阶段 B、§4.1 阶段 B）：
+// 安装 2 个 MinHook detour（证据见 docs/analysis/LoadDLL_analysis.md，编排见
+// docs/ARCHITECTURE.md §2.2）：
 //   - GameCore::LoadDLL            （阶段 B：接管 GameCore 加载）
 //   - GameCore::UnloadDLL          （阶段 B 收尾：卸 GameCore 前先卸插件）
 // Global 插件仅启动时加载一次；主菜单开关 Mod 需重启才生效（不再挂 lEnableMod/lDisableMod 钩）。
@@ -287,6 +288,9 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
     }
 
     char result = g_origLoadDLL(target);  // 调原函数（已 hook 前 snapshot，MinHook trampoline）
+    // 引擎这一步才真正换映像：此刻旧的 teardown 窗口（旧映像区间）使命结束，可以清。
+    // 清早了会把"仍映射着的旧映像"重新变成 Global 插件可钩的目标（见 §2.3 第 9 步）。
+    LoaderCore::ClearGameCoreTeardownWindow();
     // 这次调用可能顺带卸掉了旧的 GameCore（连同 gamecore Lua 环境）：此刻才释放排队中的
     // 插件模块（重入兜底路径下，ResetForReload 也会把待卸模块入队）。
     LoaderCore::FreePendingPluginModules();
@@ -326,6 +330,8 @@ static char __fastcall UnloadDllDetour() {
         LoaderCore::ResetForReload();
     }
     const char result = g_origUnloadDLL();
+    // 引擎已卸掉 GameCore 映像：teardown 窗口（旧映像区间）可以清了（§2.3 第 9 步）。
+    LoaderCore::ClearGameCoreTeardownWindow();
     LoaderCore::FreePendingPluginModules();   // 引擎已卸掉 GameCore 及其 Lua 环境
     return result;
 }

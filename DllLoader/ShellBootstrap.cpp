@@ -53,7 +53,7 @@ HMODULE LoadRealGameCore() {
         }
     }
 
-    // Resolve from CivilizationVI.exe dir: Base\Binaries\Win64 -> DLC\Expansion2\...
+    // Resolve from CivilizationVI.exe dir: Base\Binaries\Win64Steam (or Win64) -> DLC\Expansion2\...
     wchar_t exePath[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
         std::wstring dir(exePath);

@@ -4,7 +4,6 @@
 #include "../third_party/sqlite/sqlite3.h"
 
 #include <algorithm>
-#include <fstream>
 #include <filesystem>
 #include <shlobj.h>
 
@@ -40,28 +39,6 @@ std::wstring GetModsSqlitePath() {
     fs::path p = fs::path(local) / L"Firaxis Games" / L"Sid Meier's Civilization VI" / L"Mods.sqlite";
     CoTaskMemFree(local);
     return p.wstring();
-}
-
-std::string ExtractModIdFromXml(const std::string& xml) {
-    // Prefer <Mod ... id="guid"
-    const std::string key = "id=\"";
-    size_t pos = 0;
-    while ((pos = xml.find(key, pos)) != std::string::npos) {
-        // Only accept near a <Mod tag to avoid random id attrs.
-        const size_t tag = xml.rfind('<', pos);
-        if (tag != std::string::npos) {
-            const size_t modTag = xml.find("Mod", tag);
-            if (modTag != std::string::npos && modTag < pos && (pos - modTag) < 64) {
-                const size_t start = pos + key.size();
-                const size_t end = xml.find('"', start);
-                if (end != std::string::npos && end > start) {
-                    return ToLowerAscii(xml.substr(start, end - start));
-                }
-            }
-        }
-        pos += key.size();
-    }
-    return {};
 }
 
 }  // namespace
@@ -111,28 +88,6 @@ std::wstring FindModRoot(const std::wstring& anyPathUnderMod) {
         fs::path parent = cur.parent_path();
         if (parent == cur) break;
         cur = parent;
-    }
-    return {};
-}
-
-std::string ReadModId(const std::wstring& modRoot) {
-    if (modRoot.empty()) return {};
-    std::error_code ec;
-    fs::path root(modRoot);
-    if (!fs::is_directory(root, ec)) return {};
-
-    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
-        std::error_code fileEc;
-        if (!it->is_regular_file(fileEc)) continue;
-        if (_wcsicmp(it->path().extension().c_str(), L".modinfo") != 0) continue;
-
-        std::ifstream in(it->path(), std::ios::binary);
-        if (!in) continue;
-        std::string xml((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        // Cap parse work
-        if (xml.size() > 256 * 1024) xml.resize(256 * 1024);
-        std::string id = ExtractModIdFromXml(xml);
-        if (!id.empty()) return id;
     }
     return {};
 }
@@ -233,21 +188,11 @@ Snapshot Load() {
 bool AllowsPath(const Snapshot& snap, const std::wstring& path) {
     if (!snap.ok) return false;
 
+    // 只认 Mods.sqlite 返回的精确 mod root，不沿路径向上找 .modinfo 再放宽：
+    // 外层 mod 目录即使包着某个启用 root，其自身的其它文件也不因此获得授权。
     for (const auto& root : snap.enabledModRoots) {
         if (PathIsUnderRoot(path, root)) return true;
     }
-
-    const std::wstring modRoot = FindModRoot(path);
-    if (modRoot.empty()) return false;
-
-    for (const auto& root : snap.enabledModRoots) {
-        if (modRoot == root || PathIsUnderRoot(modRoot, root) || PathIsUnderRoot(root, modRoot)) {
-            return true;
-        }
-    }
-
-    // ModId 只能作为数据库元数据，不能单独授权路径：同一个 ModId 可以有多个
-    // 安装副本，授权必须绑定到 Mods.sqlite 返回的精确 mod root。
     return false;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
-// Civ6DllLoader v2 — Loader 核心接口（S3a 在 RuntimeEntry.cpp 实现早期初始化与一次性启动线程，
-// S3c 在 Civ6DLLHookLoaderAPI.cpp 实现插件生命周期，S4 在 LoaderHooks.cpp 实现 hook 与阶段 B 编排）。
+// Civ6DllLoader v2 — Loader 核心接口。
+// 实现分布：RuntimeEntry.cpp（早期初始化与一次性启动线程）、
+// Civ6DLLHookLoaderAPI.cpp（插件生命周期）、LoaderHooks.cpp（exe 域 hook 与阶段 B 编排）。
 #include <string>
 
 #include "../common/HookAPI.h"
@@ -13,10 +14,10 @@ enum class PluginCategory {
 };
 
 // 阶段 A 基础初始化（工作线程内调用）：Logger::Init(L"Civ6DllLoader_Loader.log")
-// + PdataMatch::Init + Runtime::InitMinHook。实现于 RuntimeEntry.cpp（S3a）。
+// + PdataMatch::Init + Runtime::InitMinHook。实现于 RuntimeEntry.cpp。
 void InitEarly();
 
-// Loader 自身模块句柄（version.dll）。实现于 RuntimeEntry.cpp（S3a）；供插件扫描作锚。
+// Loader 自身模块句柄（version.dll）。实现于 RuntimeEntry.cpp；供插件扫描作锚。
 // 返回 0 表示尚未初始化（DllMain 休眠检测未通过，理论不会走到扫描）。
 HMODULE RuntimeModuleHandle();
 
@@ -46,7 +47,7 @@ void VerifyHookApiTableProtection();
 //  全程走内部无锁工具表，不经过插件 HookAPI 表、不拿插件生命周期锁。
 void* ResolveExeTarget(const HookInfoExe& info, size_t span = 1);
 
-// 扫描启用 Mod 并加载/卸载指定类别全部插件。实现于 Civ6DLLHookLoaderAPI.cpp（S3c）。
+// 扫描启用 Mod 并加载/卸载指定类别全部插件。实现于 Civ6DLLHookLoaderAPI.cpp。
 void LoadPluginsOf(PluginCategory cat);
 void UnloadPluginsOf(PluginCategory cat);
 
@@ -55,19 +56,23 @@ void UnloadPluginsOf(PluginCategory cat);
 void FreePendingPluginModules();
 
 // 单插件加载（按路径含 \Plugins\Global\ 或 \Plugins\GameCore\ 判定类别）。
-// 实现于 Civ6DLLHookLoaderAPI.cpp（S3c）。
+// 实现于 Civ6DLLHookLoaderAPI.cpp。
 bool LoadSinglePlugin(const std::wstring& path);   // 已加载返回 false
 
-// 阶段 B：官方 XP2 加载完成后（S4 detour 内调用）。实现于 Civ6DLLHookLoaderAPI.cpp（S3c）：
+// 阶段 B：官方 XP2 加载完成后（LoadDLL detour 内调用）。实现于 Civ6DLLHookLoaderAPI.cpp：
 // AttachGameCore(GetModuleHandleW(L"GameCore_XP2_FinalRelease.dll"))
-// → InitializeLoader(GetModuleHandleW(nullptr)) → hks::InitHavokScript() → Localization::InitScript()。
-// 返回 false 表示初始化失败（S4 据此跳过 GameCore 插件加载）。
+// → hks::InitHavokScript() → Localization::InitScript() → EnsureScriptHooksInstalled()。
+// 返回 false 表示初始化失败（detour 据此跳过 GameCore 插件加载）。
 bool InitializeGameCorePhase();
 
 // GameCore 重载循环：IsInitialized = 阶段 B 是否已完成；
-// ResetForReload = 卸载全部 GameCore 插件 + 复位初始化标志（S4 在再次进入 LoadDLL detour 时调用）。
-// 实现于 S3c。
+// ResetForReload = 卸载全部 GameCore 插件 + 复位初始化标志（再次进入 LoadDLL detour 时调用）。
 bool IsInitialized();
 void ResetForReload();
+
+// teardown 窗口的清零点：LoaderHooks 的两个 detour 在引擎原函数返回后调用（§2.2/§2.3）。
+// 不要在 ResetForReload 内部提前清：窗口是"旧映像区间"，必须活到引擎真正换映像那一步，
+// 否则仍映射着的旧映像会重新对 Global 插件变成可钩的已加载模块。
+void ClearGameCoreTeardownWindow();
 
 }  // namespace LoaderCore

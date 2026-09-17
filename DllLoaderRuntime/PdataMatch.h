@@ -8,7 +8,9 @@ namespace PdataMatch {
     // 加载 sidecar：多模块容器 v1（Header + ModuleDesc[]，每个模块独立 pdata/符号/槽位/堆/AOB；
     // 单模块符号库也是它，moduleCount=1）。先读旁路文件 Civ6DllLoader.symdb.bin，再 RCDATA 资源 102。
     // 压缩信封 "C6XC"(algo 1=LZMA1) 可解；裸 "C6SD" 直接透传。
-    // 返回 false = sidecar 缺失/损坏（调用方应拒绝插件注入）。
+    // 返回 false = sidecar 缺失/损坏。注意调用方的处置不同：RuntimeEntry::InitEarly 只记日志继续
+    // （缺 sidecar 时该映像不做 RVA 矫正，fail-closed 返回 0，不回退原 RVA）；
+    // AttachGameCore 只在"有上下文但建表失败"时拒绝注入。
     bool Init(HMODULE runtimeModule);
 
     // 是否存在该映像的 sidecar 上下文（决定是否需要为它建档；没有就跳过）。

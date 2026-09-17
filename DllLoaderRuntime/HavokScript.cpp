@@ -138,34 +138,6 @@ namespace hks {
 		}
 	}
 
-	int l_sethook(lua_State* L) {
-		if (!tocfunction || !checkinteger || !optinteger || !sethook) return 0;
-		void* hook = tocfunction(L, 1);
-		int mask = checkinteger(L, 2);
-		int count = optinteger(L, 3, 0);
-
-		sethook(L, hook, mask, count);
-		return 0;
-	}
-
-	static int hook_id = 0;
-	int l_gethook(lua_State* L) {
-		if (!gethook || !pushnamedcclosure || !pushinteger || !gethookmask || !gethookcount) {
-			return 0;
-		}
-		void* hook = gethook(L);
-		if (hook == NULL) return 0;
-
-		char hook_name[20] = "hook_";
-		snprintf(hook_name + strlen(hook_name), sizeof(hook_name) - strlen(hook_name),
-			"%d", hook_id++);
-
-		pushnamedcclosure(L, (luaFunc)hook, 0, hook_name, 0);
-		pushinteger(L, gethookmask(L));
-		pushinteger(L, gethookcount(L));
-		return 3;
-	}
-
 	int checkplayerid(lua_State* L, int position) {
 		if (!checkinteger) {
 			if (error) error(L, "checkplayerid unavailable (HavokScript import missing)");
@@ -185,8 +157,10 @@ namespace hks {
 	}
 
 	// ---- 原始栈写入兜底（仅当 HavokScript 未导出对应 push 函数时使用）----
-	// lua_State::top 指针槽偏移：版本锁定值（当前 GameCore 布局）。官方导出可用时
-	// 本路径不会执行；布局变化时由下面的可写探测兜住，写不进去只丢这一个值。
+	// lua_State::top 指针槽偏移：版本锁定值（对当前 GameCore 布局硬编码）。官方导出
+	// 可用时本路径不会执行；一旦 lua_State 布局变动，这个偏移就不再指向 top 槽，
+	// pushboolean / pushlightuserdata 会【静默丢值】——下面的可写探测只挡得住“写不
+	// 进去”的情形（所以不会崩），挡不住“写到别处可写内存”，故换游戏版本必须重验此值。
 	constexpr uintptr_t kLuaStateTopSlotOffset = 0x48;
 
 	// 写入一个 16 字节 TValue（tt(4)+pad(4)+value(8)）并把 top 指针推进一个槽位。

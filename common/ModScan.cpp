@@ -153,7 +153,7 @@ void FilterByEnabledMods(std::vector<std::wstring>& paths, HMODULE shellModule, 
 namespace {
 
 // v2: collect <mod>/Binaries/Win64/Plugins/<pluginSubdir>/*.dll candidates under one content root
-// (Plugins\Global\ and Plugins\GameCore\ hierarchy one level deeper than the legacy flat Plugins\ scan).
+// (Plugins\Global\ and Plugins\GameCore\ are subdirectories of each mod's Plugins\ folder).
 void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::path& pluginSubdir,
                                        std::vector<std::wstring>& out) {
     std::error_code rootEc;
@@ -180,7 +180,7 @@ void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::pa
 }
 
 // v2 shared pipeline: scan roots -> EnabledMods filter -> case-insensitive lexicographic sort ->
-// basename dedup (order/filter/dedup mirrors the legacy flat Plugins scan).
+// basename dedup (stable order, case-insensitive sort, dedup by filename).
 std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir, HMODULE anchor) {
     // 锚 = Loader 自身模块（version.dll）；由其目录收集扫描根，避免 exe 目录(Win64Steam)导致的根上溯偏差。
     std::vector<std::wstring> out;
@@ -190,7 +190,7 @@ std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdi
     FilterByEnabledMods(out, anchor, "plugin");
 
     std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
-        // Case-insensitive lexicographic order for stable load order (mirrors legacy flat scan).
+        // Case-insensitive lexicographic order for stable load order.
         const size_t n = (std::min)(a.size(), b.size());
         for (size_t i = 0; i < n; ++i) {
             const wchar_t ca = towlower(a[i]);
@@ -275,7 +275,8 @@ std::vector<std::wstring> FindRuntimeCandidates(HMODULE shellModule) {
     for (const auto& root : CollectScanRoots(shellModule)) {
         CollectRuntimesUnderContentRoot(root, out);
     }
-    FilterByEnabledMods(out, shellModule, "runtime");
+    // 故意【不】过 FilterByEnabledMods：安装/自更新 loader 只看版本（RC 资源 105），
+    // 与"插件只从启用的 Mod 加载"是两条独立的通路，候选所在 Mod 是否启用不影响版本选举。
     return out;
 }
 

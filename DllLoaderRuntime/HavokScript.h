@@ -110,9 +110,6 @@ namespace hks {
 	extern void pushboolean(lua_State* L, bool value);
 	extern void pushlightuserdata(lua_State* L, void* ptr);
 
-	extern int l_sethook(lua_State* L);
-	extern int l_gethook(lua_State* L);
-
 	// Should only ever be called once. false = HavokScript 模块缺失或有导入未解析，
 	// 调用方应停用依赖 Lua API 的插件加载。
 	extern bool InitHavokScript();

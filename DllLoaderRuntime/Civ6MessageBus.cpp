@@ -2,7 +2,6 @@
 #include "Civ6MessageBus.h"
 #include "PluginInFlight.h"
 #include "../common/Logger.h"
-#include <algorithm>
 #include <unordered_map>
 #include <mutex>
 #include <string>
@@ -59,19 +58,6 @@ bool Civ6MessageBus::RegisterHandler(const std::string& name, MessageHandler han
     return true;
 }
 
-void Civ6MessageBus::UnregisterHandler(const std::string& name) {
-    std::wstring owner;
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        auto it = handlers_.find(name);
-        if (it == handlers_.end()) return;
-        owner = it->second->owner;
-        handlers_.erase(it);
-    }
-    // 先摘表项，再在总线锁外排空该 owner 的在途回调。
-    PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
-}
-
 void Civ6MessageBus::UnregisterOwner(const std::wstring& owner) {
     if (owner.empty()) return;
     {
@@ -88,24 +74,6 @@ void Civ6MessageBus::UnregisterOwner(const std::wstring& owner) {
     // （回调线程的 Enter / 注册路径都要进总线锁，持锁等待会成环）。
     // 调用方通常已经 SetAllowed(false)；此处只负责等干净。
     PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
-}
-
-void Civ6MessageBus::Clear() {
-    std::vector<HandlerPtr> removed;
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        for (const auto& [name, entry] : handlers_) removed.push_back(entry);
-        handlers_.clear();
-    }
-    // 摘表项（上面，持锁）与排空（下面，锁外）分开：WaitAll 绝不能在 mtx_ 内调用。
-    std::vector<std::wstring> waited;
-    for (const auto& entry : removed) {
-        if (!entry) continue;
-        const std::wstring& owner = entry->owner;
-        if (std::find(waited.begin(), waited.end(), owner) != waited.end()) continue;
-        waited.push_back(owner);
-        PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
-    }
 }
 
 void Civ6MessageBus::Broadcast(const char* topic, const void* data, size_t len) {

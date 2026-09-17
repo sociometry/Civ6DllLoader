@@ -26,12 +26,7 @@ public:
                          const std::wstring& owner = {},
                          const std::function<bool()>& canRegister = {});
 
-    // 注销消息处理器
-    void UnregisterHandler(const std::string& name);
     void UnregisterOwner(const std::wstring& owner);
-
-    // 注销全部处理器；排空语义与上面一致。
-    void Clear();
 
     // 广播消息给所有处理器
     void Broadcast(const char* topic, const void* data, size_t len);

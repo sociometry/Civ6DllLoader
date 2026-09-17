@@ -131,8 +131,4 @@ LoaderLockScope::~LoaderLockScope() {
     --g_lockDepth;
 }
 
-void ReportLockedPluginAccess(const char* what) {
-    ReportLockedAccess(what);
-}
-
 }  // namespace PluginBoundary

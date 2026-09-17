@@ -19,18 +19,20 @@
 //     number: a plugin built from a newer header observes runtime structSize < its own
 //     sizeof(HookAPI) and must refuse to run. apiVersion only covers rule 3.
 //  5. Every plugin MUST call HookAPI_IsCompatible(api) at the top of OnLoad - see the example
-//     at the bottom of this header. Besides the version/size check it also declares the plugin
-//     kind (Global / GameCore) to the loader. A plugin that never declares is rejected at load
-//     time, and the kind gate at the bottom makes GameCore-only entries uncompilable in a
-//     Global plugin.
+//     at the bottom of this header. It checks the header version and the struct size.
+//     The plugin KIND needs no call at all: this header emits a "Civ6PluginKind" export
+//     (low 32 = kind, high 32 = apiVersion) that the loader reads with GetProcAddress BEFORE
+//     calling OnLoad. A plugin built from an older header has no such export and is rejected
+//     without ever running (so a rejected plugin can always be FreeLibrary'd safely). The kind
+//     gate at the bottom makes GameCore-only entries uncompilable in a Global plugin.
 /* Loader 侧（非插件 TU）：Loader 自己的两个工程在 vcxproj 预处理宏里【显式】定义
    CIV6_HOOKAPI_BUILD_IMPL（DllLoaderRuntime.vcxproj / DllLoader.vcxproj 两侧的
    PreprocessorDefinitions）。没有它，Loader 那些包含 HookAPI.h 的 TU 会命中文件尾部的
    "必须声明插件类别" #error；插件工程不得定义它。 */
 
 // 插件类别取值（1=Global，2=GameCore；3 预留给未来的 Frontend）。
-// HookAPI_IsCompatible 位于本文件中段，扫描到它时文件尾部的门禁块还没有定义该值，
-// 因此这里先按插件宏定值；文件尾部的门禁块用 #ifndef 兜底定义同样的值。
+// 这里先按插件宏定值：紧随其后的 Civ6PluginKind 导出要用它；文件尾部的门禁块再用 #ifndef
+// 兜底定义同样的值（那里拿它重命名 GameCore 专属成员，让越界调用在编译期报错）。
 // Loader 侧（CIV6_HOOKAPI_BUILD_IMPL）不定义该值。
 #if defined(CIV6_PLUGIN_GLOBAL)
 #define CIV6_PLUGIN_KIND_VALUE 1u
@@ -43,6 +45,22 @@
 // 首次对外发布之后再破坏前缀，才按规则 3 递增。
 #ifndef CIV6_HOOK_API_VERSION
 #define CIV6_HOOK_API_VERSION 1u
+#endif
+
+// 插件类别导出（由本头文件自动发出，插件作者零改动）：
+//   loader 在调 OnLoad 之前 GetProcAddress("Civ6PluginKind") 读它，用低 32 位 kind 与"安装路径
+//   推出的类别"对账，不符 = OnLoad 之前就拒载（此刻插件没有任何钩子/补丁/回调，FreeLibrary 永远安全）。
+//   高 32 位 apiVersion 只进日志/诊断，不参与拒载：ABI 兼容性仍由插件侧 HookAPI_IsCompatible 判。
+//   inline 是必须的（同一头文件被多个 TU 包含）；返回值是纯常量，不碰游戏状态、不需要 static。
+//   loader 侧（CIV6_HOOKAPI_BUILD_IMPL）不发出该导出。
+#if defined(CIV6_PLUGIN_GLOBAL) || defined(CIV6_PLUGIN_GAMECORE)
+#if !defined(CIV6_PLUGIN_KIND_VALUE)
+#error "CIV6: 必须声明插件类别（CIV6_PLUGIN_KIND_VALUE = 1 Global / 2 GameCore）"
+#endif
+extern "C" __declspec(dllexport) inline uint64_t Civ6PluginKind(void) {
+    return static_cast<uint64_t>(CIV6_PLUGIN_KIND_VALUE) |
+        (static_cast<uint64_t>(CIV6_HOOK_API_VERSION) << 32);   // 低 32=kind，高 32=apiVersion
+}
 #endif
 
 // Opaque Localization::String storage size for stack buffers (bytes). Prefer LocCreate/LocDestroy.
@@ -319,29 +337,15 @@ typedef struct HookAPI {
     // Lua nil 入栈（hks ?hksi_lua_pushnil 导出）。参数打包回调里构造 nil 参数用。
     void (*LuaPushNil)(void* L);
 
-    // 插件把"编译期类别 + 头文件版本 + 自己的 sizeof(HookAPI)"报给 Loader（由 HookAPI_IsCompatible 代调）。
-    // Loader 据此与"安装路径推出的类别/当前 apiVersion"对账，并在 OnLoad 结束时强制要求声明过。
-    bool (*DeclarePluginKind)(const HookAPI* api, uint32_t kind, uint32_t apiVersion, uint32_t pluginStructSize);
 } HookAPI;
 
 // True if this runtime can serve a plugin built from this header.
 // Call it once at the top of OnLoad and abort if it returns 0: the second test is the
 // append-only case (runtime table shorter than this plugin's header), the first is the
-// breaking-change case (rule 3). It also declares this plugin kind/version to the loader
-// (DeclarePluginKind), so calling it is mandatory: the loader rejects a plugin that never
-// declares.
+// breaking-change case (rule 3). The plugin kind is NOT declared here - it travels in the
+// Civ6PluginKind export emitted above, and the loader checks it before OnLoad.
 static inline int HookAPI_IsCompatible(const HookAPI* api) {
     if (!api) return 0;
-#if defined(CIV6_PLUGIN_GLOBAL) || defined(CIV6_PLUGIN_GAMECORE)
-    // 插件侧：先向 Loader 声明"编译期类别 + 头文件版本 + 自己的 sizeof(HookAPI)"；
-    // 声明失败（类别与安装路径推出的不符 / apiVersion 不符）直接返回 0。
-    // 表短到没有该字段（旧 Loader）时不读越界，交给下面的版本检查拒绝。
-    const uint32_t declareMinSize = static_cast<uint32_t>(
-        offsetof(HookAPI, DeclarePluginKind) + sizeof(api->DeclarePluginKind));
-    if (api->structSize >= declareMinSize && api->DeclarePluginKind &&
-        !api->DeclarePluginKind(api, CIV6_PLUGIN_KIND_VALUE,
-                                CIV6_HOOK_API_VERSION, (uint32_t)sizeof(HookAPI))) return 0;
-#endif
     if (api->apiVersion != CIV6_HOOK_API_VERSION) return 0;
     if (api->structSize < sizeof(HookAPI)) return 0;
     return 1;
@@ -673,7 +677,10 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
 //   }
 // This is how a plugin built from a newer header detects an older runtime instead of
 // reading past the end of the table. The table itself is read-only - writing to it faults.
-/* ---- 插件类别门禁（纯编译期语法门：不改结构体、不改布局） ---- */
+/* ---- 插件类别门禁（纯编译期语法门：不改结构体、不改布局） ----
+   同一个 CIV6_PLUGIN_KIND_VALUE 驱动两件事：
+     a) 本文件前段据此发出 Civ6PluginKind 导出（loader 在 OnLoad 之前判类别 + apiVersion）；
+     b) 下面据此重命名 GameCore 专属成员名，越界调用在编译期就报错。 */
 #if !defined(CIV6_PLUGIN_GLOBAL) && !defined(CIV6_PLUGIN_GAMECORE) && !defined(CIV6_HOOKAPI_BUILD_IMPL)
 #error "CIV6: 必须声明插件类别：在工程预处理宏里定义 CIV6_PLUGIN_GLOBAL 或 CIV6_PLUGIN_GAMECORE"
 #endif

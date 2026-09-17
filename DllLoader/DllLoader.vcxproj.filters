@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="源文件">
@@ -9,10 +9,38 @@
       <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
       <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
     </Filter>
-    <Filter Include="资源文件">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    <Filter Include="common">
+      <UniqueIdentifier>{2C7D1E40-0001-4A2B-9C3D-8E5F1A000001}</UniqueIdentifier>
     </Filter>
+    <Filter Include="third_party">
+      <UniqueIdentifier>{2C7D1E40-0002-4A2B-9C3D-8E5F1A000002}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="dllmain.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="ShellBootstrap.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="pch.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\common\ModScan.cpp">
+      <Filter>common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\common\RuntimePackage.cpp">
+      <Filter>common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\common\EnabledMods.cpp">
+      <Filter>common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\common\Logger.cpp">
+      <Filter>common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\third_party\sqlite\sqlite3.c">
+      <Filter>third_party</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framework.h">
@@ -21,69 +49,35 @@
     <ClInclude Include="pch.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="Civ6DLLHookLoaderAPI.h">
+    <ClInclude Include="ShellBootstrap.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="Civ6MessageBus.h">
+    <ClInclude Include="..\DllLoaderRuntime\ProxyTypes.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="ProxyTypes.h">
-      <Filter>头文件</Filter>
+    <ClInclude Include="..\common\LoaderProtocol.h">
+      <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="Runtime.h">
-      <Filter>头文件</Filter>
+    <ClInclude Include="..\common\LoaderVersion.h">
+      <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="HavokScript.h">
-      <Filter>头文件</Filter>
+    <ClInclude Include="..\common\RuntimePackage.h">
+      <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="frida-core.h">
-      <Filter>头文件</Filter>
+    <ClInclude Include="..\common\HookAPI.h">
+      <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="Localization.h">
-      <Filter>头文件</Filter>
+    <ClInclude Include="..\common\ModScan.h">
+      <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="Logger.h">
-      <Filter>头文件</Filter>
+    <ClInclude Include="..\common\EnabledMods.h">
+      <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="test.h">
-      <Filter>头文件</Filter>
+    <ClInclude Include="..\common\Logger.h">
+      <Filter>common</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="Civ6DLLHookLoaderAPI.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="Civ6MessageBus.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="dllmain.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="Runtime.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="HavokScript.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="Localization.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="pch.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="Logger.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="test.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <Library Include="resources\frida-core.lib">
-      <Filter>资源文件</Filter>
-    </Library>
-    <Library Include="resources\libMinHook.x64.lib">
-      <Filter>资源文件</Filter>
-    </Library>
+    <ClInclude Include="..\third_party\sqlite\sqlite3.h">
+      <Filter>third_party</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

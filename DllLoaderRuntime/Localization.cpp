@@ -6,16 +6,10 @@
 
 namespace Localization {
 
-GetArgumentCountFunc GetArgumentCountPtr = nullptr;
 LookupFunc LookupPtr = nullptr;
 PushArgumentFunc PushArgumentPtr = nullptr;
 DestructorFunc DestructorPtr = nullptr;
 ToUTF8Func ToUTF8Ptr = nullptr;
-
-unsigned int String::GetArgumentCount() const {
-    if (!GetArgumentCountPtr) return 0;
-    return GetArgumentCountPtr(this);
-}
 
 String::String() {
     std::memset(this, 0, sizeof(*this));
@@ -54,8 +48,6 @@ static void InitImports(HMODULE dll) {
         ToUTF8Ptr = reinterpret_cast<ToUTF8Func>(
             GetProcAddress(dll, "?toUTF8@String@Localization@@QEAAPEBDAEAIH@Z"));
     }
-    GetArgumentCountPtr = reinterpret_cast<GetArgumentCountFunc>(
-        GetProcAddress(dll, "?GetArgumentCount@String@Localization@@QEBAIXZ"));
 
     // 聚合告警：Localization 各包装自带判空降级（返回空串/nullptr），这里把缺失
     // 的导出名列出来，方便对游戏版本差异定位。空的 ToUTF8 已尝试大小写变体。
@@ -64,7 +56,6 @@ static void InitImports(HMODULE dll) {
         { reinterpret_cast<const void*>(PushArgumentPtr), "PushArgument" },
         { reinterpret_cast<const void*>(DestructorPtr), "~String" },
         { reinterpret_cast<const void*>(ToUTF8Ptr), "toUTF8/ToUTF8" },
-        { reinterpret_cast<const void*>(GetArgumentCountPtr), "GetArgumentCount" },
     };
     for (const auto& c : checks) {
         if (!c.ptr) {
@@ -73,12 +64,11 @@ static void InitImports(HMODULE dll) {
     }
 
     Logger::Log(
-        "Localization Lookup=%p PushArg=%p Dtor=%p ToUTF8=%p ArgCount=%p",
+        "Localization Lookup=%p PushArg=%p Dtor=%p ToUTF8=%p",
         reinterpret_cast<void*>(LookupPtr),
         reinterpret_cast<void*>(PushArgumentPtr),
         reinterpret_cast<void*>(DestructorPtr),
-        reinterpret_cast<void*>(ToUTF8Ptr),
-        reinterpret_cast<void*>(GetArgumentCountPtr));
+        reinterpret_cast<void*>(ToUTF8Ptr));
 }
 
 void InitScript() {

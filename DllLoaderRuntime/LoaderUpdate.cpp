@@ -25,7 +25,7 @@ struct RuntimeCandidate {
 };
 
 // 自身模块句柄 + 全路径（即 exe 目录\version.dll），并推导 exe 目录。
-// 异常场合（被旧薄壳从 Mod 目录 LoadLibrary 探测）→ 文件名不是 version.dll → 返回 false 直接退出。
+// 判据是自身文件名不是 version.dll（开发中直接加载、或被别的宿主加载）→ 返回 false 直接退出。
 bool GetSelfPath(std::wstring& outPath, std::wstring& outExeDir) {
     HMODULE hSelf = nullptr;
     if (!GetModuleHandleExW(

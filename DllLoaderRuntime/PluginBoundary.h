@@ -1,5 +1,5 @@
 #pragma once
-// Civ6DllLoader - 插件内存安全边界（P1-1 修复）。
+// Civ6DllLoader - 插件内存安全边界。
 //
 // ============================ 不变量（Invariant） ============================
 // 任何持有 Loader 内部锁的代码，只允许访问 Loader 自有内存：
@@ -36,9 +36,11 @@ constexpr uint32_t kMaxLuaMethodsPerCall = 512;
 constexpr size_t kMinHookTargetSpan = 32;
 
 // ---- 叶子探针 ----
-// 全工程唯一允许出现 __try 的地方：只有 POD 局部变量（MSVC C2712 不允许
-// “需要对象展开的函数”里写 __try）。异常在叶子内部就被吃掉，调用方的 C++
-// 对象从头到尾不知道发生过异常，因此不存在“析构被跳过”的问题。
+// __try 在本工程多处出现（本文件的叶子探针、Civ6MessageBus::CallHandlerSeh、
+// Civ6DLLHookLoaderAPI.cpp 的若干 leaf、LoaderHooks.cpp 的 GetRuleSetName、UiInject 的
+// Call*Safe）。统一约定：写 __try 的函数只允许 POD 局部变量（MSVC C2712 不允许
+// “需要对象展开的函数”里写 __try），异常在叶子内部就被吃掉——调用方的 C++ 对象
+// 从头到尾不知道发生过异常，因此不存在“析构被跳过”的问题。
 __declspec(noinline) bool TryReadRaw(const void* src, void* dst, size_t len, size_t maxLen);
 __declspec(noinline) bool TryStrLenRaw(const char* s, size_t limit, size_t& outLen);
 
@@ -75,8 +77,5 @@ struct LoaderLockScope {
     LoaderLockScope(const LoaderLockScope&) = delete;
     LoaderLockScope& operator=(const LoaderLockScope&) = delete;
 };
-
-// 供外部（如恢复点 / 看门狗）上报一次违反。
-void ReportLockedPluginAccess(const char* what);
 
 }  // namespace PluginBoundary

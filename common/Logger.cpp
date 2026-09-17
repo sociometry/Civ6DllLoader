@@ -70,35 +70,26 @@ static std::wstring ResolveLogPath(const wchar_t* logFileName) {
     return dir + L"\\" + logFileName;
 }
 
-void Logger::Init(const wchar_t* logFileName, bool alsoOutputDebug, bool enableConsole) {
+void Logger::Init(const wchar_t* logFileName, bool alsoOutputDebug) {
     if (gLogFile) {
         fclose(gLogFile);
         gLogFile = nullptr;
     }
 
     gUseDebugOutput = alsoOutputDebug;
-    if (enableConsole) {
-        AllocConsole();
-        freopen_s(&gLogFile, "CONOUT$", "w", stdout);
-        freopen_s(&gLogFile, "CONOUT$", "w", stderr);
-        gLogPath.clear();
+    gLogPath = ResolveLogPath(logFileName);
+    // Truncate once per Civ6 process; append across frontend↔ingame / GameCore reloads.
+    const bool truncate = ClaimFirstOpenThisProcess(logFileName);
+    gLogFile = _wfsopen(gLogPath.c_str(), truncate ? L"w" : L"a", _SH_DENYWR);
+    if (gLogFile) {
+        setvbuf(gLogFile, nullptr, _IONBF, 0);
+        OutputDebugStringW((L"[DllLoader] log -> " + gLogPath + L"\n").c_str());
+        Log("=== Logger initialized (pid=%lu mode=%s) ===",
+            GetCurrentProcessId(), truncate ? "truncate" : "append");
     } else {
-        gLogPath = ResolveLogPath(logFileName);
-        // Truncate once per Civ6 process; append across frontend↔ingame / GameCore reloads.
-        const bool truncate = ClaimFirstOpenThisProcess(logFileName);
-        gLogFile = _wfsopen(gLogPath.c_str(), truncate ? L"w" : L"a", _SH_DENYWR);
-        if (gLogFile) {
-            setvbuf(gLogFile, nullptr, _IONBF, 0);
-            OutputDebugStringW((L"[DllLoader] log -> " + gLogPath + L"\n").c_str());
-            Log("=== Logger initialized (pid=%lu mode=%s) ===",
-                GetCurrentProcessId(), truncate ? "truncate" : "append");
-        } else {
-            OutputDebugStringW((L"[DllLoader] failed to open log: " + gLogPath + L"\n").c_str());
-            Log("=== Logger initialized (open failed) ===");
-        }
-        return;
+        OutputDebugStringW((L"[DllLoader] failed to open log: " + gLogPath + L"\n").c_str());
+        Log("=== Logger initialized (open failed) ===");
     }
-    Log("=== Logger initialized ===");
 }
 
 void Logger::Shutdown() {
@@ -107,7 +98,6 @@ void Logger::Shutdown() {
         fclose(gLogFile);
         gLogFile = nullptr;
     }
-    FreeConsole();
 }
 
 void Logger::Log(const char* format, ...) {
@@ -130,17 +120,4 @@ void Logger::Log(const char* format, ...) {
         fflush(gLogFile);
     }
     if (gUseDebugOutput) OutputDebugStringA(line.c_str());
-}
-
-void Logger::LogRaw(const char* msg) {
-    if (gLogFile) {
-        fputs(msg, gLogFile);
-        fputc('\n', gLogFile);
-        fflush(gLogFile);
-    }
-    if (gUseDebugOutput) OutputDebugStringA(msg);
-}
-
-void Logger::LogCrash(const char* context) {
-    Logger::Log("CRASH in context: %s", context ? context : "unknown");
 }

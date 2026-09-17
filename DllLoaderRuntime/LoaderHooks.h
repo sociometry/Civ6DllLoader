@@ -1,5 +1,5 @@
 #pragma once
-// Civ6DllLoader v2 — 游戏内 hook 安装接口（S4 实现 LoaderHooks.cpp）。
+// Civ6DllLoader v2 — 游戏内 hook 安装接口（实现在 LoaderHooks.cpp）。
 namespace LoaderHooks {
 
 // 安装 GameCore::LoadDLL 入口 detour（RVA 0xF8510，特征码 48 81 EC 48 02 00 00 48 83 3D ?? ?? ?? ?? 00 74 0A 32 C0

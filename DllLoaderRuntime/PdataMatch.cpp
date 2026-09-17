@@ -167,6 +167,14 @@ struct Symbol {
 
 std::mutex g_mutex;
 
+// 构建期串行化锁（Init 与 BuildNewTable 互斥）。
+// 为什么必须串行：构建过程会把该映像的 old pdata / 符号表 / AOB 表从 ContextState【move 到】
+// 进程级 globals（见 BuildNewTable），构建结束再由 RestoreContextFromGlobals 搬回；两次构建
+// 并发就会互相搬错模块的数据。只罩"解析 + 构建"这条冷路径：CorrectRva / CorrectByName /
+// Fingerprint / CorrectVTableByName 仍只用 g_mutex，构建期间对应上下文已置 tableReady=false，
+// 因此游戏线程的查询不会被这把锁挡住。
+std::mutex g_buildMutex;
+
 // 前置声明（定义在 ParseNewPdata 之前）
 uint64_t ComputeTableFingerprint(const std::vector<PdataSig>& table);
 
@@ -593,7 +601,8 @@ uint64_t ComputeTableFingerprint(const std::vector<PdataSig>& table) {
     return NormHash::Fnv1a64(bytes.data(), bytes.size());
 }
 
-// 解析 new GameCore 的 .pdata：RUNTIME_FUNCTION 数组 -> (begin_rva, size, unwind_hash) 签名表
+// 解析目标映像的 .pdata：RUNTIME_FUNCTION 数组 -> (begin_rva, size, unwind_hash) 签名表。
+// 参数名 gameCore 是历史命名：exe（DX11/DX12）与 GameCore 都走这里。
 bool ParseNewPdata(HMODULE gameCore, std::vector<PdataSig>& outTable,
     uint64_t& outFingerprint, uint32_t& outImageSize, uint32_t& outTimeDateStamp) {
     if (!gameCore) return false;
@@ -803,9 +812,9 @@ std::vector<uint32_t> AlignTables(
         }
     }
 
-    // v9：未匹配项局部恢复（头 hash）
-    // 对 v3 + head-hash 后仍 kUnmatched 且有序言头 hash 的 old 条目，在前后最近已匹配锚点
-    // 划出的 new 区间内，用 SizeOfProlog 口径头 hash 做唯一匹配恢复（函数体变了但序言没变）。
+    // 头 hash 局部恢复：经过"锚点链 + 插值 + 外推 + 头 hash 校验"后仍 kUnmatched、且 sidecar
+    // 里带序言头 hash 的 old 条目，在前后最近已匹配锚点划出的 new 区间内，用 SizeOfProlog 口径的
+    // 头 hash 做**唯一**匹配恢复（函数体变了但序言没变）。
     if (!headHashByRva.empty() && newBase != nullptr) {
         // 反向占用表：new 条目是否已被映射
         std::vector<uint8_t> newUsed(m, 0);
@@ -857,9 +866,9 @@ std::vector<uint32_t> AlignTables(
         }
     }
 
-    // v10：归一化全函数体 AOB 恢复
-    // 对 v9 后仍 kUnmatched 且有 AOB 的 old 条目，在前后已匹配锚点划定的 new RVA 区间内
-    // 用归一化字节（body+mask）做唯一 AOB 搜索，命中后对齐到 new pdata 函数入口。
+    // 函数体 AOB 恢复：对上一阶段后仍 kUnmatched、且 sidecar 里带函数体 AOB 的 old 条目，
+    // 在前后已匹配锚点划定的 new RVA 区间内用归一化字节（body+mask）做唯一 AOB 搜索，
+    // 命中后对齐到 new pdata 函数入口。
     if (!g_aobByRva.empty() && newBase != nullptr) {
         std::vector<uint8_t> newUsed(m, 0);
         for (size_t oi = 0; oi < n; ++oi) {
@@ -1359,6 +1368,8 @@ void ClearTempGlobals() {
 }  // namespace
 
 bool Init(HMODULE runtimeModule) {
+    // 解析阶段会写进程级 globals（ParseModuleData），与 BuildNewTable 的暂存区互斥。
+    std::lock_guard<std::mutex> buildLock(g_buildMutex);
     // 候选来源与优先级：
     //  1) 旁路文件 Civ6DllLoader.symdb.bin（开发用覆盖：测新符号库无需重编）。
     //  2) RCDATA 102：部署产物。
@@ -1403,6 +1414,56 @@ bool Init(HMODULE runtimeModule) {
     return false;
 }
 
+// 磁盘缓存自校验：拒绝"结构上不可能是 AlignTables 产出"的映射。
+// 合法映射的每一条都必然满足下面三条之一（AlignTables 四条产出路径的不变量）：
+//   ① pdata 签名完全相等（窗口哈希锚点 / 锚点间插值 / 首尾外推）；
+//   ② sidecar 带该 old_rva 的头 hash，且新映像同一函数头字节的归一化哈希相等（头 hash 局部恢复）；
+//   ③ sidecar 带该 old_rva 的函数体 AOB（函数体 AOB 恢复）。
+// 抽头/尾 + 最多 64 个等距条目逐条判定。**不做单调性检查**：头 hash / AOB 恢复允许非单调，
+// 硬加单调性会误杀合法缓存。抽样判定失败 = 缓存被改坏/来路不明 -> 丢掉重算（fail-closed）。
+static bool ValidateCachedMap(const std::vector<PdataSig>& oldTable,
+    const std::vector<uint32_t>& map,
+    const std::vector<PdataSig>& newTable,
+    const std::unordered_map<uint32_t, uint64_t>& headHashByRva,
+    const uint8_t* newBase, uint32_t newImageSize,
+    size_t& outChecked, size_t& outBad) {
+    outChecked = 0;
+    outBad = 0;
+    const size_t n = oldTable.size();
+    if (n == 0 || map.size() != n || newTable.empty()) return false;
+
+    auto checkOne = [&](size_t oi) -> bool {
+        const uint32_t ni = map[oi];
+        if (ni == kUnmatched) return true;
+        ++outChecked;
+        if (static_cast<size_t>(ni) >= newTable.size()) { ++outBad; return false; }
+        const PdataSig& oe = oldTable[oi];
+        const PdataSig& ne = newTable[ni];
+        if (oe.size == ne.size && oe.unwind_hash == ne.unwind_hash) return true;   // ①
+        const auto hit = headHashByRva.find(oe.begin_rva);
+        if (hit != headHashByRva.end() && newBase != nullptr) {                    // ②
+            const size_t headLen = ne.prologSize < 32 ? ne.prologSize : 32;
+            if (headLen != 0 &&
+                static_cast<uint64_t>(ne.begin_rva) + headLen <= newImageSize &&
+                NormHash::NormalizedHeadHash(newBase + ne.begin_rva, headLen) == hit->second) {
+                return true;
+            }
+        }
+        if (g_aobByRva.find(oe.begin_rva) != g_aobByRva.end()) return true;        // ③
+        ++outBad;
+        return false;
+    };
+
+    if (!checkOne(0)) return false;
+    const size_t step = (n > 64) ? (n / 64) : 1;
+    for (size_t oi = step; oi + 1 < n; oi += step) {
+        if (!checkOne(oi)) return false;
+    }
+    return checkOne(n - 1);
+}
+
+// 注意：**exe 与 GameCore 都走这条路径**（InitEarly 对当前 exe 调 BuildNewTable，
+// AttachGameCore 对 GameCore 调）。参数名沿用历史的 gameCore，语义是"目标映像模块"。
 static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
     std::vector<PdataSig> oldTable;
     std::unordered_map<uint32_t, uint64_t> headHashByRva;
@@ -1484,6 +1545,7 @@ static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
         }
     }
 
+    const uint8_t* newBase = reinterpret_cast<const uint8_t*>(gameCore);
     if (identical) {
         mapping.resize(oldTable.size());
         for (size_t i = 0; i < mapping.size(); ++i) mapping[i] = static_cast<uint32_t>(i);
@@ -1491,14 +1553,26 @@ static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
             mapping.size());
     } else {
         const std::wstring cachePath = CachePath(imageId);
+        bool cacheAccepted = false;
         if (!cachePath.empty() && LoadCache(cachePath, fingerprint, g_oldFingerprint,
                 oldTable.size(), newTable.size(), mapping)) {
-            fromCache = true;
-            Logger::Log("PdataMatch: cache hit (fingerprint=0x%016llX, entries=%zu)",
-                static_cast<unsigned long long>(fingerprint), mapping.size());
-        } else {
-            mapping = AlignTables(oldTable, newTable, headHashByRva,
-                reinterpret_cast<const uint8_t*>(gameCore), imageSize, anchors);
+            size_t checked = 0;
+            size_t bad = 0;
+            if (ValidateCachedMap(oldTable, mapping, newTable, headHashByRva, newBase,
+                    imageSize, checked, bad)) {
+                cacheAccepted = true;
+                fromCache = true;
+                Logger::Log("PdataMatch: cache hit (fingerprint=0x%016llX, entries=%zu, "
+                            "self-check ok: %zu sampled)",
+                    static_cast<unsigned long long>(fingerprint), mapping.size(), checked);
+            } else {
+                Logger::Log("PdataMatch: cache rejected by self-validation (sampled=%zu bad=%zu); "
+                            "recomputing (fail-closed)", checked, bad);
+                mapping.clear();
+            }
+        }
+        if (!cacheAccepted) {
+            mapping = AlignTables(oldTable, newTable, headHashByRva, newBase, imageSize, anchors);
             Logger::Log("PdataMatch: aligned old=%zu new=%zu anchors=%zu",
                 oldTable.size(), newTable.size(), anchors);
             if (!cachePath.empty()) {
@@ -1514,11 +1588,10 @@ static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
     // 叶子函数 AOB 匹配 + vtable 槽位反推（仅跨版本；版本一致时恒等解析，无需匹配）
     std::unordered_map<uint32_t, uint32_t> leafMap;
     if (!identical) {
-        leafMap = BuildLeafMap(oldTable, mapping, newTable,
-            reinterpret_cast<const uint8_t*>(gameCore), imageSize);
+        leafMap = BuildLeafMap(oldTable, mapping, newTable, newBase, imageSize);
         // vtable 定位：矫正槽函数后在 .rdata 搜指针序列，结果并入 leafMap
         const auto vtableMap = BuildVtableMap(vtables, oldTable, mapping, newTable, leafMap,
-            reinterpret_cast<const uint8_t*>(gameCore), imageSize);
+            newBase, imageSize);
         for (const auto& kv : vtableMap) leafMap.emplace(kv.first, kv.second);
     }
 
@@ -1572,6 +1645,8 @@ static void RestoreContextFromGlobals(uint32_t imageId) {
 }
 
 bool BuildNewTable(uint32_t imageId, HMODULE target) {
+    // 见 g_buildMutex：构建把上下文数据 move 进进程级 globals，必须与其它构建/解析串行。
+    std::lock_guard<std::mutex> buildLock(g_buildMutex);
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         const auto it = g_contexts.find(imageId);

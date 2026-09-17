@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "LoaderVersion.h"
 
-// v2: LoaderHost/ABI 机制已随薄壳 Runtime 选举与启动移除（设计文档 §4.2/§4.3），
+// v2: LoaderHost/ABI 机制已随薄壳 Runtime 选举与启动移除（历史设计文档已删除），
 // 仅保留版本宏、文件名常量与导出函数指针类型。
 
 #define CIV6_DLL_LOADER_MAKE_VERSION(major, minor, patch) \

@@ -4,7 +4,7 @@
 // 17 条 /EXPORT 转发 pragma 连同 MAKE_EXPORT 宏定义（#ifdef _WIN64 分支）逐字搬入本文件，
 // 原注释风格一并保留。与原文件不同：DllMain 不在此处（统一在 RuntimeEntry.cpp）。
 //
-// 作用（设计文档 §2/§4.1）：Loader 以 version.dll 名义安装在游戏 exe 目录时，
+// 作用（见 docs/ARCHITECTURE.md §1.1）：Loader 以 version.dll 名义安装在游戏 exe 目录时，
 // 游戏对 version.dll 的静态导入（GetFileVersionInfoExW/SizeExW/W/SizeW 等 4 个 IAT 槽）
 // 被转发到系统 System32/SysWOW64 真 version.dll，崩溃日志/版本上报功能原样工作；
 // 其余 13 条转发保证对 version API 的间接调用同样落到系统 DLL。

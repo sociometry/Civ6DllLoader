@@ -9,7 +9,7 @@ namespace EnabledMods {
 struct Snapshot {
     bool ok = false;
     std::string error;
-    std::unordered_set<std::string> modIds;          // lowercase GUID from .modinfo
+    std::unordered_set<std::string> modIds;          // lowercase ModId from Mods.sqlite
     std::vector<std::wstring> enabledModRoots;       // normalized absolute mod roots
 };
 
@@ -20,14 +20,12 @@ Snapshot Load();
 // Walk up from a file/dir path to the folder that contains a *.modinfo.
 std::wstring FindModRoot(const std::wstring& anyPathUnderMod);
 
-// Parse id="..." from the first .modinfo under modRoot (lowercase).
-std::string ReadModId(const std::wstring& modRoot);
-
 std::wstring NormalizePath(const std::wstring& path);
 bool PathIsUnderRoot(const std::wstring& path, const std::wstring& root);
 
 // True if path belongs to an enabled mod root recorded by Mods.sqlite.
-// ModId 不单独构成授权条件，因为同一 ID 可能存在多个安装副本。
+// 授权必须绑定 SQL 返回的精确 mod root；嵌套/重叠目录不得隐式授权。
+// 只比较 ModId(GUID) 不够，因为同一个 GUID 可能有多份安装副本。
 bool AllowsPath(const Snapshot& snap, const std::wstring& path);
 
 }  // namespace EnabledMods
