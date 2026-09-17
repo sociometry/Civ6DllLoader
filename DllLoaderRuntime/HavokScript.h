@@ -14,7 +14,6 @@
 
 namespace hks {
 	constexpr int LUA_GLOBAL = -10002;
-	constexpr int LUA_REGISTRYINDEX = -10000;
 
 	typedef struct lua_State lua_State;
 

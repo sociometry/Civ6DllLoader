@@ -190,6 +190,9 @@
 - `g_gameCoreTeardownAddress` / `g_gameCoreTeardownSizeOfImage`：**teardown 窗口**。窗口内
   `TargetInTearingDownGameCore(target)` 为真，`InstallHook` 直接拒绝；窗口也是 teardown 后半段
   "哪些站点属于本次要拆的映像"的唯一判据（因为那时 `ImageAddress` 已经 detach）。
+  两个字段是 `std::atomic`，成对生效有固定次序：写侧先 size 再 address(release)，清零点先
+  address(release) 再 size；读侧先 address(acquire)，非 0 才读 size。写侧是游戏线程，读侧还有
+  插件线程（`TargetInTearingDownGameCore`）。
 
 ### 2.2 LoadDLL / UnloadDLL 的编排（`LoaderHooks.cpp`）
 
@@ -202,7 +205,9 @@
 3. 若 `IsInitialized()` 仍为真（说明 `UnloadDLL` 钩子没生效 / 没清场）→ 先 `ResetForReload()` 兜底；
 4. 调原函数 `g_origLoadDLL(target)`；
 5. `ClearGameCoreTeardownWindow()`：**引擎这一步才真正换映像**，旧的 teardown 窗口（旧映像区间）
-   到此失效——提前清会让仍映射着的旧映像重新对 Global 插件变成"可钩的已加载模块"（§2.3 第 9 步）；
+   到此失效——提前清会让仍映射着的旧映像重新对 Global 插件变成"可钩的已加载模块"（§2.3 第 9 步）。
+   清窗发生在判返回值**之前**：`result == 0` 的幂等短路路径里映像仍是同一个（随后按"已加载
+   模块"重新初始化插件，见本节第 7 点），失败路径同样不该把旧区间留在保护态；
 6. `FreePendingPluginModules()`：这次调用可能顺带卸掉了旧的 GameCore，排队中的插件模块此刻才释放；
 7. 成功 → `InitializeGameCorePhase()` + `LoadPluginsOf(GameCore)`；失败 → 区分"幂等短路"（读 exe 的
    `hModule` 槽判断模块是否已加载）与真失败，只记日志。
@@ -233,7 +238,8 @@
    `&HookSite`；复位包括清空 capture 槽）；失败则打 `recordStale` 并拔掉 detour 槽。最后复位
    `g_origRegisterScriptData(/ForUI)`、16 个 PushMethods 槽位。**teardown 窗口不在这里清**：
    它要活到引擎真正换映像那一步（两个 detour 调完原函数再 `ClearGameCoreTeardownWindow()`）；
-10. 回到 detour，调 `g_origUnloadDLL()`，然后 `FreePendingPluginModules()`（见 §2.4）。
+10. 回到 detour，调 `g_origUnloadDLL()` → `ClearGameCoreTeardownWindow()` →
+    `FreePendingPluginModules()`（见 §2.4）；
 
 为什么是这个顺序：
 
@@ -267,7 +273,7 @@
 | `Civ6MessageBus::mtx_` | 消息总线的 handler 表 | 出锁后才 `Enter`/排空（总线 → lifecycle） |
 | `PluginInFlight::Owner::mtx` | `WaitAll` 的条件变量等待 | 等待时只持这一把 |
 | `g_pendingFreeMutex` | 待释放句柄队列 | 叶子 |
-| `g_detourDrainMutex` + `g_detourDrainCv` | 等 `g_activeSharedDetours` 归零 | **等待时不持任何其它锁** |
+| `g_detourDrainMutex` + `g_detourDrainCv` | 等 `g_activeSharedDetours` 归零 | 等待前已放掉 lifecycle / MinHook / capture 锁（**不得**持 lifecycle 等）；仍持最外层 `g_gameCoreTransitionMutex`——它只串行化阶段切换，不参与在途回调取锁 |
 
 固定顺序：`transition → lifecycle → pushState → MinHook → capture/ImageAddress`（消息总线自成一层：
 `mtx_ → lifecycle`，但它从不与站点锁嵌套）。
@@ -537,7 +543,7 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 ---
 
-## 6. 插件回调与 Lua / 事件数据流
+## 6. 插件回调、Lua 与 UI 数据流
 
 ### 6.1 PluginInFlight（在途登记与排空）
 
@@ -592,6 +598,34 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 ---
 
+### 6.7 UI 注入（`UiInject`）
+
+主菜单的前端 UI 不走插件 ABI：它是 loader 自己往游戏的 ForgeUI 树里挂 context。
+
+1. **资源**：`UiInject::ExtractResources()`（阶段 A，见 §1.4）把 RCDATA 103/104 的
+   `Civ6DllLoader_FrontEndUI.{lua,xml}` 释放到 `<exe 目录>\Civ6DllLoader\`；目标文件已存在就跳过
+   （用户可以在磁盘上改），写入用 `CREATE_NEW`，"已被别人放好"按良性竞态处理；
+2. **钩子**：`UiInject::Install()` detour `MainMenuState::LoadUI`（exe 域独立钩，与站点表无关，
+   见 §5.4）。detour 先调原函数（FrontEnd 与 InvitePopup 由游戏自己建），再 `RunInjectionSafely`；
+3. **注入**（`InjectFrontEndUi`，只在游戏/UI 线程执行；重入时置 `g_refreshRequested` 留到下次
+   `LoadUI`）：AOB 解出 `ForgeUI::UIManager` 全局槽 → 从 `MainMenuState + 0x230` 取 FrontEnd
+   context → `AllocateControl<LuaContext>(mgr)` 造根 context → `ChangeParent` 挂到 FrontEnd 下 →
+   取虚表 `+0x200` 调 `Initialize(baseName)`（虚拟槽位，不硬编码地址）加载
+   `Civ6DllLoader/Civ6DllLoader_FrontEndUI`（xml 的 `Name = AdditionalFrontEndUI`）；
+4. **Mod UI**：遍历启用 Mod 的 `.modinfo`，从 `<FrontEndActions><ImportFiles>` 收集
+   `FrontEndUI_*.xml` 的 base name，逐个同样注入到根 context 下。文件名有路径安全校验（相对路径、
+   无盘符、逐段非空/非 `.`/`..`、前缀必须是 `FrontEndUI_`、扩展名 `.xml`）；带条件的声明不加载，
+   但**条件是按 XML 出现顺序记的**：`<Criteria>` 必须排在 `<File>` 之前才生效；
+5. **刷新与回收**：`g_frontEndContext` 变化（换了 FrontEnd）时重建；同一个 FrontEnd 收到
+   `g_refreshRequested`（上次注入失败）时先用 exe 导出的 `DestroyChild` 销毁 loader 自己的根
+   context 再重建。销毁失败或子 context 注入失败时，指针登记在 `g_rootContext` / `outAllocated`
+   里交给下次刷新回收，不重复销毁、也不丢引用；
+6. **已知残留**：判"是不是新 FrontEnd"用的是**指针身份比较**；若游戏释放旧对象后新对象恰好落在同一
+   地址（ABA），这次刷新会被判成"同一对象"而早退，Mod UI 只会在下一次 FrontEnd 地址变化时回来。
+   改判据需要游戏侧的对象代次，loader 拿不到。
+
+---
+
 ## 7. 映像解析与符号库
 
 ### 7.1 ImageAddress（映像登记）
@@ -636,8 +670,11 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
   ① `SizeOfImage` + `TimeDateStamp` 相同 = 同一构建 → 恒等映射；
   ② 否则整表逐条 `(begin_rva, size, unwind_hash)` 相等（纯重建）→ 同样恒等映射；
   ③ 两者都不同 → 跨版本匹配：磁盘缓存（`LoadCache` / `SaveCache`，键 =
-  新表指纹 + sidecar 指纹）→ 窗口哈希锚点 + LIS 锚点链 + 锚点间插值 → 头 hash 局部恢复（`normHeadHash`，
-  生成端「无 hash」写 0，历史文件写的 FNV 初值 `0xcbf29ce484222325` 一并视为无）→ 函数体 AOB 恢复 →
+  新表指纹 + sidecar 指纹；两者都是各自 pdata 表 `(size, unwind_hash)` 序列的 FNV-1a64，**不含**
+  `begin_rva`、符号名与 AOB 数据）→ 窗口哈希锚点 + LIS 锚点链 + 锚点间插值 + **首尾锚点外推** →
+  **头 hash 校验**（sidecar 里带 `normHeadHash` 的 old 条目，按新映像同一函数的序言字节重算，
+  不等即剔除）→ 头 hash 局部恢复（`normHeadHash`，生成端「无 hash」写 0，仓库里旧生成端写的
+  FNV 初值 `0xcbf29ce484222325` 一并视为无）→ 函数体 AOB 恢复 →
   叶子 AOB 匹配 + vtable 槽位反推（结果并入同一张 `leafMap`）；
 - 缓存命中后按头/尾 + 最多 64 个等距条目做一次抽样自校验（`ValidateCachedMap`）。它只保证「结构上像
   本次匹配的产出」（索引不越界、签名/头 hash/AOB 至少一条成立），**不是对缓存可信度的保证**：缓存文件

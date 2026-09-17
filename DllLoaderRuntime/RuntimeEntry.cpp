@@ -61,7 +61,9 @@ std::wstring NormalizeDir(std::wstring path) {
 
 // 进程 exe 的文件名是否形如 CivilizationVI*.exe（DX11/DX12 两个变体都命中）。
 // 用"前缀 + 后缀"而不是精确两名白名单，是为了兼容将来的 CivilizationVI_*.exe 变体。
-// DllMain 早调用：只用 kernel32 + 栈/小串，不分配内存、不读文件。
+// DllMain 早调用：只碰 kernel32 与本进程堆，不读文件、不 LoadLibrary、不调其它模块导出。
+// 这里确实会构造 std::wstring（exe 名超出 SSO 时走堆，不是"不分配内存"）：从进程堆分配不会
+// 重入 loader lock，安全——但别在此基础上再加"加载/初始化别的模块"的活儿。
 bool ProcessExeIsGame() {
     wchar_t path[MAX_PATH]{};
     const DWORD len = GetModuleFileNameW(nullptr, path, MAX_PATH);

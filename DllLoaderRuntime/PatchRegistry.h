@@ -9,7 +9,8 @@
 //  - 首次 Apply(target, bytes, len, owner)：保存该地址的原始字节并记录 owner；
 //  - 重复 Apply 同一地址且长度相同：写入新字节，但保留最初存档（日志告警）；
 //    长度不同或与其它补丁区间重叠时拒绝；
-//  - Revert(target)：恢复原始字节并移除记录；无记录返回 false；
+//  - RevertOwned(target, owner)：仅当记录属于该 owner 时恢复原始字节并移除记录；
+//    无记录或 owner 不符返回 false；
 //  - RevertAllFor(owner)：回滚某 owner 的全部未回滚补丁（插件卸载时调用）。
 //
 // 线程安全：注册表以 CRITICAL_SECTION 保护（GameCore 重载循环在游戏线程、

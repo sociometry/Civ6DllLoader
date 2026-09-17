@@ -6,6 +6,7 @@
 #include <cstdarg>
 #include <chrono>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
 #pragma comment(lib, "Shell32.lib")
@@ -13,6 +14,14 @@
 static FILE* gLogFile = nullptr;
 static bool gUseDebugOutput = true;
 static std::wstring gLogPath;
+
+// gLogFile / gUseDebugOutput 的互斥：Log 可能来自游戏线程（detour）而 Init/Shutdown 来自
+// Loader 工作线程或薄壳 DllMain。无锁时 Init/Shutdown 关掉文件与 Log 写文件会撞成 UAF。
+// 函数内 static：避开跨 TU 的动态初始化顺序问题。
+static std::mutex& LogMutex() {
+    static std::mutex m;
+    return m;
+}
 
 // Kernel object kept for process lifetime so GameCore unload/reload still sees "already truncated".
 static HANDLE gLogSessionMarkers[4] = {};
@@ -71,29 +80,40 @@ static std::wstring ResolveLogPath(const wchar_t* logFileName) {
 }
 
 void Logger::Init(const wchar_t* logFileName, bool alsoOutputDebug) {
-    if (gLogFile) {
-        fclose(gLogFile);
-        gLogFile = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(LogMutex());
+        if (gLogFile) {
+            fclose(gLogFile);
+            gLogFile = nullptr;
+        }
+        gUseDebugOutput = alsoOutputDebug;
     }
 
-    gUseDebugOutput = alsoOutputDebug;
     gLogPath = ResolveLogPath(logFileName);
     // Truncate once per Civ6 process; append across frontend↔ingame / GameCore reloads.
     const bool truncate = ClaimFirstOpenThisProcess(logFileName);
-    gLogFile = _wfsopen(gLogPath.c_str(), truncate ? L"w" : L"a", _SH_DENYWR);
-    if (gLogFile) {
-        setvbuf(gLogFile, nullptr, _IONBF, 0);
+    FILE* opened = _wfsopen(gLogPath.c_str(), truncate ? L"w" : L"a", _SH_DENYWR);
+    if (opened) {
+        setvbuf(opened, nullptr, _IONBF, 0);
         OutputDebugStringW((L"[DllLoader] log -> " + gLogPath + L"\n").c_str());
+    } else {
+        OutputDebugStringW((L"[DllLoader] failed to open log: " + gLogPath + L"\n").c_str());
+    }
+    {
+        std::lock_guard<std::mutex> lock(LogMutex());
+        gLogFile = opened;
+    }
+    if (opened) {
         Log("=== Logger initialized (pid=%lu mode=%s) ===",
             GetCurrentProcessId(), truncate ? "truncate" : "append");
     } else {
-        OutputDebugStringW((L"[DllLoader] failed to open log: " + gLogPath + L"\n").c_str());
         Log("=== Logger initialized (open failed) ===");
     }
 }
 
 void Logger::Shutdown() {
     Log("=== Logger shutting down ===");
+    std::lock_guard<std::mutex> lock(LogMutex());
     if (gLogFile) {
         fclose(gLogFile);
         gLogFile = nullptr;
@@ -115,6 +135,8 @@ void Logger::Log(const char* format, ...) {
     out << "[" << std::put_time(&local, "%H:%M:%S") << "] " << buffer << "\n";
 
     const std::string line = out.str();
+    // 只有这一段碰共享状态：格式化与小字符串都在本线程自己的存储里。
+    std::lock_guard<std::mutex> lock(LogMutex());
     if (gLogFile) {
         fputs(line.c_str(), gLogFile);
         fflush(gLogFile);

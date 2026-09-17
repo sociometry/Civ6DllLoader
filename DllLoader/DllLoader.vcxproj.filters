@@ -64,9 +64,6 @@
     <ClInclude Include="..\common\RuntimePackage.h">
       <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="..\common\HookAPI.h">
-      <Filter>common</Filter>
-    </ClInclude>
     <ClInclude Include="..\common\ModScan.h">
       <Filter>common</Filter>
     </ClInclude>

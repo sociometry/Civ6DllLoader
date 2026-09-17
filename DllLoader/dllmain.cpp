@@ -71,8 +71,9 @@ extern "C" {
             return nullptr;
         }
 
-        // v2 shell: never starts the runtime. If the Loader (exe-dir version.dll)
-        // is missing, install it once from the highest-version enabled-mod runtime;
+        // v2 shell: never starts the runtime. If the Loader (exe-dir version.dll) is
+        // missing, install it once from the highest-version runtime found under the ModScan
+        // scan roots (no mod-enabled filter here: installation elects by version only);
         // either way this session passes through to the stock GameCore.
         if (ShellBootstrap::InstallLoaderIfMissing(g_hModule)) {
             Logger::Log("Loader present after installer (installed or already installed)");

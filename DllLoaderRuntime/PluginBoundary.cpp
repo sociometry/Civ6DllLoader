@@ -119,10 +119,6 @@ bool IsReadableWritable(const void* p, size_t len) {
 
 // ---------------------------------------------------------------- 锁深度
 
-int LockDepth() {
-    return g_lockDepth;
-}
-
 LoaderLockScope::LoaderLockScope() {
     ++g_lockDepth;
 }

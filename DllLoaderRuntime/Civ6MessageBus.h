@@ -15,7 +15,8 @@ class Civ6MessageBus {
 public:
     using MessageHandler = std::function<void(const char* topic, const void* data, size_t len)>;
 
-    // 覆盖/注销会停止旧 entry 的新调用，并等待其它线程的在途调用退出。
+    // 注销（UnregisterOwner）会摘掉旧 entry 的登记并等待其它线程的在途调用退出；同 owner
+    // 的覆盖不单独排空（在途按 owner 记账，由 owner 级 WaitAll 统一等，见 .cpp）。
     // 本线程回调栈上的调用（含嵌套祖先与递归）继续到自然返回，调用快照保活 entry。
     // 回调内清理返回不代表自身调用链已经退出，不能立即释放该调用链仍依赖的外部状态。
 

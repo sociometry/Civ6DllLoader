@@ -69,8 +69,6 @@ bool IsReadableWritable(const void* p, size_t len);
 //     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
 //     LoaderLockScope lockScope;
 // 不变量被违反时（持锁仍调用 Copy*/TryRead*）会低频告警，Debug 下断点。
-int LockDepth();
-
 struct LoaderLockScope {
     LoaderLockScope();
     ~LoaderLockScope();
