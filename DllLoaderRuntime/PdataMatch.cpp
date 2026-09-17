@@ -79,6 +79,13 @@ constexpr uint32_t kMaxSymbolCount = 4'000'000;
 constexpr uint64_t kMaxHeapBytes = 256ull * 1024 * 1024;
 constexpr uint32_t kMaxVtableSlots = 4'000'000;
 constexpr uint32_t kUnmatched = UINT32_MAX;
+// "没有头 hash"的标记：符号表的 normHeadHash 字段 0 = 无。生成端历史上还用过 FNV-1a64 的
+// 初值当占位（非 0），因此这里把它一并当成"无"——否则会对这类条目做一次注定不等的比对，
+// 把已经由 (size, unwind_hash) 确立的正确锚点删掉。
+constexpr uint64_t kNoHeadHashPlaceholder = 0xcbf29ce484222325ull;
+// 单条函数体 AOB 的字节数上限（生成端 tools/symdb.py 的 MAX_AOB 硬约束）。运行时用它做
+// "符号表与 AOB 块是否同步"的自洽探测：失步时读到的多半是函数体字节，值会越界。
+constexpr uint32_t kMaxAobBytes = 64;
 
 // ---- 磁盘缓存（exe 目录 Civ6DllLoader\pdata_cache.bin）----
 
@@ -171,7 +178,7 @@ std::mutex g_mutex;
 // 为什么必须串行：构建过程会把该映像的 old pdata / 符号表 / AOB 表从 ContextState【move 到】
 // 进程级 globals（见 BuildNewTable），构建结束再由 RestoreContextFromGlobals 搬回；两次构建
 // 并发就会互相搬错模块的数据。只罩"解析 + 构建"这条冷路径：CorrectRva / CorrectByName /
-// Fingerprint / CorrectVTableByName 仍只用 g_mutex，构建期间对应上下文已置 tableReady=false，
+// CorrectVTableByName 仍只用 g_mutex，构建期间对应上下文已置 tableReady=false，
 // 因此游戏线程的查询不会被这把锁挡住。
 std::mutex g_buildMutex;
 
@@ -223,7 +230,6 @@ struct ContextState {
     std::unordered_map<uint32_t, uint32_t> leafMap;
     std::vector<PdataSig> newPdata;
     std::vector<uint32_t> map;
-    uint64_t fingerprint = 0;
     bool tableReady = false;
 };
 static std::unordered_map<uint32_t, ContextState> g_contexts;  // imageId -> 上下文
@@ -282,6 +288,20 @@ bool LzmaDecodeRaw(const uint8_t* payload, size_t payloadLen, uint32_t origSize,
     };
     SzAllocator alloc;
 
+    // 在提交这块（可能很大的）输出缓冲之前先校验 .lzma 头：
+    //   payload[0] = lc/lp/pb 编码，必须 < 9*5*5（与 LzmaProps_Decode 同口径）；
+    //   payload[1..4] = 字典大小，0 视为无效（真实产物是 16MB）。
+    // 顺序很重要：坏头不再触发大分配（大小上限与比例校验已在 DecompressSidecar 做过）。
+    const uint8_t propsByte = payload[0];
+    const uint32_t dictSize = static_cast<uint32_t>(payload[1]) |
+        (static_cast<uint32_t>(payload[2]) << 8) |
+        (static_cast<uint32_t>(payload[3]) << 16) |
+        (static_cast<uint32_t>(payload[4]) << 24);
+    if (propsByte >= (9 * 5 * 5) || dictSize == 0) {
+        Logger::Log("PdataMatch: bad lzma header props=0x%02X dict=%u", propsByte, dictSize);
+        return false;
+    }
+
     out.resize(origSize);
     SizeT destLen = static_cast<SizeT>(origSize);
     SizeT srcLen = streamLen;
@@ -320,10 +340,23 @@ bool DecompressSidecar(const std::vector<uint8_t>& packed, std::vector<uint8_t>&
         Logger::Log("PdataMatch: unknown compress algo %u", algoTag);
         return false;
     }
-    if (origSize == 0 || origSize > 512u * 1024 * 1024) return false;  // 安全上限
+    if (origSize == 0 || origSize > 512u * 1024 * 1024) {
+        Logger::Log("PdataMatch: implausible envelope originalSize=%u", origSize);
+        return false;  // 安全上限
+    }
 
     const uint8_t* src = packed.data() + 12;
     const size_t srcLen = static_cast<size_t>(packed.size() - 12);
+    // 信封声明的原始大小必须与压缩流长度成合理比例才接受：真实载荷约 11:1，LZMA 对极端
+    // 重复数据可到数百倍，取 1024x + 64KB 已足够宽松。没有这条，一个几十字节的畸形文件
+    //（旁路文件 Civ6DllLoader.symdb.bin 就在 loader 同目录、可写）就能让 LzmaDecodeRaw 里
+    // 的 out.resize() 提交到 512MB。
+    const uint64_t maxPlausible = static_cast<uint64_t>(srcLen) * 1024ull + (64ull * 1024);
+    if (static_cast<uint64_t>(origSize) > maxPlausible) {
+        Logger::Log("PdataMatch: envelope originalSize=%u implausible for %zu-byte payload",
+            origSize, srcLen);
+        return false;
+    }
     if (!LzmaDecodeRaw(src, srcLen, origSize, out)) return false;
     Logger::Log("PdataMatch: sidecar decompressed algo=lzma %zu -> %u bytes", srcLen, origSize);
     return true;
@@ -427,7 +460,8 @@ bool ParseModuleData(const uint8_t* data, size_t size, const ModuleDesc& m, cons
             }
             slotCursor += slotCount;
             ++vtableSymbols;
-        } else if (sym.kind == 0 && sym.normHeadHash != 0 && sym.old_rva != 0) {
+        } else if (sym.kind == 0 && sym.normHeadHash != 0 &&
+                sym.normHeadHash != kNoHeadHashPlaceholder && sym.old_rva != 0) {
             headHashByRva.emplace(sym.old_rva, sym.normHeadHash);
         }
 
@@ -438,7 +472,15 @@ bool ParseModuleData(const uint8_t* data, size_t size, const ModuleDesc& m, cons
                 std::memcpy(&bodySize, data + aobCursor, 4);
                 aobCursor += 4;
                 const uint64_t span = static_cast<uint64_t>(bodySize) * 2;
-                if (aobCursor + span <= static_cast<uint64_t>(aobOffset) + aobSize) {
+                if (bodySize == 0 || bodySize > kMaxAobBytes) {
+                    // 生成端硬性 <= kMaxAobBytes。越界说明符号表与 AOB 块已经失步：继续按顺序读
+                    // 只会把函数体错配到别的 old_rva（AOB 恢复路径据此给出错误的矫正地址，
+                    // 且全程无日志）。丢弃剩余 AOB，符号表本身照常解析。
+                    Logger::Log("PdataMatch: %s AOB desync at symbol %u (bodySize=%u); "
+                                "remaining AOB records dropped",
+                        sourceTag, i, bodySize);
+                    aobSize = 0;
+                } else if (aobCursor + span <= static_cast<uint64_t>(aobOffset) + aobSize) {
                     const size_t off = aobData.size();
                     aobData.insert(aobData.end(), data + aobCursor, data + aobCursor + span);
                     aobByRva.emplace(sym.old_rva, AobInfo{ bodySize, off });
@@ -457,6 +499,16 @@ bool ParseModuleData(const uint8_t* data, size_t size, const ModuleDesc& m, cons
         if (!symbols[idx].mangled.empty()) byMangled.emplace(symbols[idx].mangled, idx);
     }
 
+    // AOB 块收尾校验：全部 Function 记录解析完必须正好停在块尾（生成端 append_block 只在
+    // 块与块之间补 8B 对齐，块内没有尾部填充）。不一致 = 符号表/AOB 不同步 -> 整块丢弃，
+    // 符号表与 pdata 表保留（AOB 恢复路径不再参与，fail-closed）。
+    if (aobSize != 0 && aobCursor != static_cast<uint64_t>(aobOffset) + aobSize) {
+        Logger::Log("PdataMatch: %s AOB cursor mismatch (consumed=%llu of %u); AOB table dropped",
+            sourceTag, static_cast<unsigned long long>(aobCursor - aobOffset), aobSize);
+        aobData.clear();
+        aobByRva.clear();
+    }
+
     std::lock_guard<std::mutex> lock(g_mutex);
     g_oldPdata = std::move(oldPdata);
     g_oldFingerprint = ComputeTableFingerprint(g_oldPdata);
@@ -469,7 +521,7 @@ bool ParseModuleData(const uint8_t* data, size_t size, const ModuleDesc& m, cons
     g_baseSizeOfImage = m.baseSizeOfImage;
     g_baseTimeDateStamp = m.baseTimeDateStamp;
     g_loaded = true;
-    Logger::Log("PdataMatch: %s loaded pdata=%zu symbols=%zu vtable_symbols=%zu vtable_slots=%u base=0x%08X timestamp=0x%08X",
+    Logger::Log("PdataMatch: %s loaded pdata=%zu symbols=%zu vtable_symbols=%zu vtable_slots=%u sizeOfImage=0x%08X timestamp=0x%08X",
         sourceTag, g_oldPdata.size(), g_symbols.size(), vtableSymbols, slotCursor,
         g_baseSizeOfImage, g_baseTimeDateStamp);
     return true;
@@ -1023,8 +1075,14 @@ std::unordered_map<uint32_t, uint32_t> BuildLeafMap(
     return leafMap;
 }
 
-// 矫正任意 old RVA（局部版本）：pdata 条目走 mapping，gap 走叶子 AOB 结果
-uint32_t CorrectRvaLocal(uint32_t rva,
+// old 表 -> new 表的 RVA 矫正核心：构建期（vtable 槽位反推）与运行期查询共用这一份口径。
+// 规则：二分定位"最后一个 begin_rva <= oldRva"的条目，再向前回扫（封顶 kMaxBackscan）找
+// 包含 oldRva 的那条（.pdata 允许嵌套）；命中且已映射时才允许内部偏移，且只在 size 不变时
+// 保留偏移；gap（第一个函数之前）或回扫耗尽 -> 退回 leafMap（叶子 AOB / vtable 的反推结果）。
+// 返回 0 = 无法矫正（fail-closed）。
+constexpr size_t kMaxBackscan = 64;   // 嵌套深度通常 <= 3，封顶防退化
+
+uint32_t CorrectRvaInTables(uintptr_t oldRva,
     const std::vector<PdataSig>& oldTable,
     const std::vector<uint32_t>& mapping,
     const std::vector<PdataSig>& newTable,
@@ -1033,7 +1091,7 @@ uint32_t CorrectRvaLocal(uint32_t rva,
     size_t lo = 0, hi = n;
     while (lo < hi) {
         const size_t mid = lo + (hi - lo) / 2;
-        if (oldTable[mid].begin_rva <= rva) lo = mid + 1;
+        if (oldTable[mid].begin_rva <= oldRva) lo = mid + 1;
         else hi = mid;
     }
     if (lo > 0) {
@@ -1041,21 +1099,21 @@ uint32_t CorrectRvaLocal(uint32_t rva,
         size_t scanned = 0;
         for (;;) {
             const PdataSig& oe = oldTable[idx];
-            if (rva < static_cast<uintptr_t>(oe.begin_rva) + oe.size) {
+            if (oldRva < static_cast<uintptr_t>(oe.begin_rva) + oe.size) {
                 const uint32_t newIdx = mapping[idx];
                 if (newIdx == kUnmatched || newIdx >= newTable.size()) return 0;
                 const PdataSig& ne = newTable[newIdx];
-                const uintptr_t offset = rva - oe.begin_rva;
+                const uintptr_t offset = oldRva - oe.begin_rva;
                 if (offset == 0) return ne.begin_rva;
                 if (ne.size == oe.size) return ne.begin_rva + static_cast<uint32_t>(offset);
-                return 0;
+                return 0;   // size 变了，内部偏移没有意义
             }
-            if (idx == 0 || scanned >= 64) break;
+            if (idx == 0 || scanned >= kMaxBackscan) break;
             --idx;
             ++scanned;
         }
     }
-    const auto lit = leafMap.find(rva);
+    const auto lit = leafMap.find(static_cast<uint32_t>(oldRva));
     return lit != leafMap.end() ? lit->second : 0;
 }
 
@@ -1127,7 +1185,7 @@ std::unordered_map<uint32_t, uint32_t> BuildVtableMap(
         std::vector<SlotC> all;
         all.reserve(vt.slots.size());
         for (const VtableSlot& s : vt.slots) {
-            const uint32_t f = CorrectRvaLocal(s.slotOldRva, oldTable, mapping, newTable, leafMap);
+            const uint32_t f = CorrectRvaInTables(s.slotOldRva, oldTable, mapping, newTable, leafMap);
             if (f == 0) continue;
             const bool leaf = leafMap.find(s.slotOldRva) != leafMap.end();
             all.push_back(SlotC{ s.slotOffset,
@@ -1280,7 +1338,9 @@ bool SaveCache(const std::wstring& path, uint64_t fingerprint, uint64_t oldFinge
     return ok;
 }
 
-// 在给定上下文中矫正 old_rva -> new_rva（需持有 g_mutex 调用）
+// 在给定上下文中矫正 old_rva -> new_rva（需持有 g_mutex 调用）。
+// 表就绪判定 + 恒等短路在这里；真正的映射规则只有 CorrectRvaInTables 一份，
+// 避免"运行期查询"与"构建期 vtable 反推"两套口径漂移。
 uintptr_t CorrectRvaLocked(const ContextState& ctx, uintptr_t oldRva) {
     // 版本一致：跳过一切 pdata 匹配，直接恒等解析（gap 符号/vtable 的 RVA 也有效）
     if (ctx.identical) return oldRva;
@@ -1288,42 +1348,7 @@ uintptr_t CorrectRvaLocked(const ContextState& ctx, uintptr_t oldRva) {
         ctx.map.size() != ctx.oldPdata.size()) {
         return 0;
     }
-    // 二分：最后一个 begin_rva <= oldRva 的条目（pdata 允许嵌套，先取最内层候选）
-    size_t lo = 0;
-    size_t hi = ctx.oldPdata.size();
-    while (lo < hi) {
-        const size_t mid = lo + (hi - lo) / 2;
-        if (ctx.oldPdata[mid].begin_rva <= oldRva) lo = mid + 1;
-        else hi = mid;
-    }
-    if (lo == 0) {
-        // gap（第一个函数之前）：查叶子 AOB 匹配结果
-        const auto lit = ctx.leafMap.find(static_cast<uint32_t>(oldRva));
-        return lit != ctx.leafMap.end() ? lit->second : 0;
-    }
-    // 从最内层候选向前回扫找包含 oldRva 的条目（嵌套深度通常 <= 3，封顶防退化）
-    constexpr size_t kMaxBackscan = 64;
-    size_t idx = lo - 1;
-    size_t scanned = 0;
-    for (;;) {
-        const PdataSig& oe = ctx.oldPdata[idx];
-        if (oldRva < static_cast<uintptr_t>(oe.begin_rva) + oe.size) break;  // 包含
-        if (idx == 0 || scanned >= kMaxBackscan) {
-            const auto lit = ctx.leafMap.find(static_cast<uint32_t>(oldRva));
-            return lit != ctx.leafMap.end() ? lit->second : 0;
-        }
-        --idx;
-        ++scanned;
-    }
-    const size_t oldIdx = idx;
-    const PdataSig& oe = ctx.oldPdata[oldIdx];
-    const uint32_t newIdx = ctx.map[oldIdx];
-    if (newIdx == kUnmatched || newIdx >= ctx.newPdata.size()) return 0;
-    const PdataSig& ne = ctx.newPdata[newIdx];
-    const uintptr_t offset = oldRva - oe.begin_rva;
-    if (offset == 0) return ne.begin_rva;                        // 函数开头
-    if (ne.size == oe.size) return ne.begin_rva + offset;        // size 不变才允许内部偏移
-    return 0;                                                    // deny
+    return CorrectRvaInTables(oldRva, ctx.oldPdata, ctx.map, ctx.newPdata, ctx.leafMap);
 }
 
 // 清空全部解析状态（上下文 + 构建用临时 globals）：Init 起始与候选重试前调用。
@@ -1367,9 +1392,9 @@ void ClearTempGlobals() {
 }
 }  // namespace
 
-bool Init(HMODULE runtimeModule) {
-    // 解析阶段会写进程级 globals（ParseModuleData），与 BuildNewTable 的暂存区互斥。
-    std::lock_guard<std::mutex> buildLock(g_buildMutex);
+// Init 的实现体。调用方（公开入口 Init）必须已持 g_buildMutex —— 这里不再重复取，
+// 因为 g_buildMutex 是普通 std::mutex（不可重入）。
+static bool InitImpl(HMODULE runtimeModule) {
     // 候选来源与优先级：
     //  1) 旁路文件 Civ6DllLoader.symdb.bin（开发用覆盖：测新符号库无需重编）。
     //  2) RCDATA 102：部署产物。
@@ -1412,6 +1437,21 @@ bool Init(HMODULE runtimeModule) {
     }
     Logger::Log("PdataMatch: no sidecar (Civ6DllLoader.symdb.bin or RCDATA 102) - pdata correction unavailable");
     return false;
+}
+
+// 公开入口：解析/分配异常必须在这里被吃掉。BuildNewTable 有同款保护（见其 try/catch），
+// Init 之前没有 —— 畸形 sidecar 触发的大分配（std::bad_alloc / length_error）会一路从
+// RuntimeEntry::WorkerMain 逃出工作线程入口 -> std::terminate -> 带崩游戏进程。
+bool Init(HMODULE runtimeModule) {
+    // 解析阶段会写进程级 globals（ParseModuleData），与 BuildNewTable 的暂存区互斥。
+    std::lock_guard<std::mutex> buildLock(g_buildMutex);
+    try {
+        return InitImpl(runtimeModule);
+    } catch (...) {
+        Logger::Log("PdataMatch: Init exception; sidecar unusable this session");
+        ResetAllParsedState();   // 不留半解析的上下文
+        return false;
+    }
 }
 
 // 磁盘缓存自校验：拒绝"结构上不可能是 AlignTables 产出"的映射。
@@ -1637,7 +1677,6 @@ static void RestoreContextFromGlobals(uint32_t imageId) {
         ctx.leafMap = std::move(g_leafMap);
         ctx.newPdata = std::move(g_newPdata);
         ctx.map = std::move(g_map);
-        ctx.fingerprint = g_fingerprint;
         ctx.identical = g_identical;
         ctx.tableReady = g_tableReady;
     }
@@ -1729,12 +1768,6 @@ uintptr_t CorrectByName(uint32_t imageId, const char* name) {
     const uint32_t oldRva = ctx.symbols[symIdx].old_rva;
     if (oldRva == 0) return 0;
     return CorrectRvaLocked(ctx, oldRva);
-}
-
-uint64_t Fingerprint(uint32_t imageId) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    const auto it = g_contexts.find(imageId);
-    return it != g_contexts.end() ? it->second.fingerprint : 0;
 }
 
 bool CorrectVTableByName(uint32_t imageId, const char* name, uint32_t& outRva, uint32_t& outSlotCount) {

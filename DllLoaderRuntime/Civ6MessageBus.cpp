@@ -105,8 +105,8 @@ void Civ6MessageBus::InvokeEntry(const HandlerPtr& entry, const char* topic,
                                  const void* data, size_t len, const char* name) {
     if (!entry) return;
     auto guard = PluginInFlight::Enter(entry->inFlight, PluginInFlight::Kind::Message);
-    // inFlight 为空 = 没有插件 owner（Loader 自身的处理器）：它没有状态机、没有
-    // 放行镜像，直接放行（这不是给 "Loader" 的特判）。非空时门禁由 allowed 镜像决定。
+    // inFlight 只为"有 owner 的 handler"解析出来（注册路径只接受被跟踪的插件），
+    // 判空是防御；门禁由 owner 的 allowed 镜像决定。
     if (entry->inFlight && !guard) return;
     InvokeHandler(entry->handler, topic, data, len, name);
 }

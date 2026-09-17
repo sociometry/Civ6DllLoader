@@ -200,7 +200,10 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);
 // 阶段 B 是否已完成（InitializeGameCorePhase 成功置 true；ResetForReload 复位）。
 static bool g_gameCorePhaseReady = false;
 
-// 规范化路径比较：小写 + '/'→'\\'（候选均为绝对路径，词法规范化即可）。
+// 插件身份用的路径规范化：小写 + '/'→'\\'。**故意只做词法处理**——它定义 ownerId、
+// CategoryForPath 与"按路径去重"，都在热路径上（每次 owner 探针/取址都可能走到），
+// 不能引入 I/O 或符号链接解析。需要"同一条路径的不同写法（8.3 短名/软链/大小写）"
+// 归一的场景（扫描根授权、排除自身）用 EnabledMods::NormalizePath（weakly_canonical）。
 static std::wstring NormalizePluginPath(const std::wstring& path) {
     std::wstring norm = path;
     for (wchar_t& ch : norm) {
@@ -574,7 +577,9 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
         site->minhookTrampoline = nullptr;
         site->activeDetour = nullptr;
         site->detourOwner.clear();
-        site->nextTarget = nullptr;
+        // 绝不可置 nullptr：recordStale 只证明"入口字节已还原"，不能证明"没有调用者停在 stub 里"。
+        // 指向 target = 让在途调用者直接执行原函数（与 RemoveHookSiteRecordLocked 的 b 步同理）。
+        site->nextTarget = target;
         std::lock_guard<std::mutex> captureLock(g_captureMutex);
         site->hasCapture = false;
         site->retiring = false;
@@ -769,10 +774,14 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
             target, site->detourOwner.c_str(), site->activeDetour);
         return false;
     }
+    // 顺序不可交换（与 InstallLoaderDetourOnSite 同一理由，见 docs/ARCHITECTURE.md §5.5）：
+    // 站点首建时 MinHook 侧已 enable，但那一刻 nextTarget 只是跳板（纯透传）——把 nextTarget
+    // 置为 detour 才是"插件 detour 开始生效"的那一刻。必须先备好跳板（*original）再发布，
+    // 否则另一线程可能在这两行之间进入 detour，读到的 original 还是插件侧的未初始化值。
+    if (original) *original = site->minhookTrampoline;
     site->activeDetour = detour;
     site->detourOwner = owner->ownerId;
     site->nextTarget = detour;
-    if (original) *original = site->minhookTrampoline;
     Logger::Log("InstallHook: target=%p detour=%p original=%p owner=%ls (hub stub=%p)",
         target, detour, original ? *original : nullptr, owner->ownerId.c_str(), site->stubCode);
     return true;
@@ -1190,10 +1199,11 @@ __declspec(noinline) static bool SafeWritePointer(void* dst, void* value) {
 extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr) {
     HookSite* site = static_cast<HookSite*>(sitePtr);
     if (!site || !regs) return;
+    // paramIndex 只为 stub 的调用约定保留（它直接把站点字段读进 edx）；一律以锁内站点字段为准。
+    (void)paramIndex;
     std::lock_guard<std::mutex> lock(g_captureMutex);
     if (!site->hasCapture || site->retiring) return;
-    uint32_t index = site->captureParamIndex;
-    if (index > 3) index = paramIndex;
+    const uint32_t index = site->captureParamIndex;
     if (index > 3) return;
     if (site->captureOuts.empty()) return;
     const void* val = static_cast<void* const*>(regs)[index];
@@ -1695,8 +1705,9 @@ static __declspec(noinline) bool GameEventPushArgsSeh(GameEventPushFn pushFn, vo
 }
 
 // Lua 序列段（含插件回调）：只做 Lua 操作，栈清理交给调用者（保证崩溃路径也执行）。
+// 只做 Lua 操作；栈清理由调用方（GameEventPopToBaseSeh）负责，所以这里不收 base。
 static bool GameEventInvokeLuaSeh(const char* name, GameEventPushFn pushFn,
-                                  const void* payload, void* L, int base) {
+                                  const void* payload, void* L) {
     bool ok = false;
     __try {
         auto* s = reinterpret_cast<hks::lua_State*>(L);
@@ -1711,7 +1722,6 @@ static bool GameEventInvokeLuaSeh(const char* name, GameEventPushFn pushFn,
             const int argc = (nargs < 0) ? 0 : nargs;
             ok = hks::pcall(s, argc, 0, 0) == 0; // Call(arg1, arg2, ...)
         }
-        (void)base;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("GameEvent: InvokeLua exception name=%s", name);
         ok = false;
@@ -1805,7 +1815,7 @@ static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
     //   本函数局部变量全是 POD，因此可以合法使用 __try/__finally（MSVC C2712）。
     bool ok = false;
     __try {
-        ok = GameEventInvokeLuaSeh(name, pushFn, payload, L, base);
+        ok = GameEventInvokeLuaSeh(name, pushFn, payload, L);
         GameEventPopToBaseSeh(L, base);   // 栈清理：崩溃路径同样执行（资源兜底）
     } __finally {
         if (released) {
@@ -3184,6 +3194,15 @@ static const HookAPI g_hookApi = {
     &LuaPushNilImpl,
 };
 
+// 编译期守卫（配套 common/HookAPI.h 的 CIV6_HOOK_API_ENTRY_COUNT）：
+//  1) sizeof 抓住"往 HookAPI 追加了字段，却没同步计数/初始化表"；
+//  2) 末尾字段的偏移抓住"重排或删除字段"（冻结前缀只允许尾部追加）。
+static_assert(sizeof(HookAPI) == sizeof(uint32_t) * 2 + CIV6_HOOK_API_ENTRY_COUNT * sizeof(void*),
+    "HookAPI 字段数与 CIV6_HOOK_API_ENTRY_COUNT 不一致：追加字段后必须同步更新计数并补齐 g_hookApi");
+static_assert(offsetof(HookAPI, LuaPushNil) ==
+        sizeof(uint32_t) * 2 + (CIV6_HOOK_API_ENTRY_COUNT - 1) * sizeof(void*),
+    "HookAPI 末尾字段位置变化：只允许在尾部追加，且必须同步 CIV6_HOOK_API_ENTRY_COUNT");
+
 // loader 内部复用 common/HookAPI.h 的 HookInfo 取址工具时的入口（LoaderHooks/UiInject 用），
 // 也是把这张表交给插件（OnLoad）的唯一出口。
 // 契约：只读。const_cast 只是为了配合既有 HookAPI* 签名（common/HookAPI.h 里的 inline
@@ -3192,8 +3211,11 @@ HookAPI* LoaderCore::RuntimeHookApi() {
     return const_cast<HookAPI*>(&g_hookApi);
 }
 
-// 启动自检：确认这张表真的落在只读页。MSVC 一般会把常量初始化的 const 对象放进 .rdata，
-// 但那是实现细节而非语言保证 —— 一旦落到可写段，"插件改表"就不会被拦，必须能在日志里看见。
+// 启动自检：确认这张表真的落在只读页，并且没有空项。MSVC 一般会把常量初始化的 const 对象
+// 放进 .rdata，但那是实现细节而非语言保证 —— 一旦落到可写段，"插件改表"就不会被拦。
+// 空项检查补的是编译器抓不到的那一半：追加字段、bump 了计数却漏填初始化的项，
+// 聚合初始化只会静默零填，等到插件按表调用就是空指针调用 —— 这里在启动时 fail-loud。
+// 前提由上面两条 static_assert 保证：入口字段从 offsetof(InstallHook) 起连续 8 字节一格。
 void LoaderCore::VerifyHookApiTableProtection() {
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(&g_hookApi, &mbi, sizeof(mbi)) == 0) {
@@ -3208,6 +3230,23 @@ void LoaderCore::VerifyHookApiTableProtection() {
                     "请检查 const 与段归属", protect, static_cast<const void*>(&g_hookApi));
     } else {
         Logger::Log("HookAPI 表只读保护已验证 (Protect=0x%lX)", protect);
+    }
+
+    // 空项扫描：入口字段在结构体里连续排列（由 static_assert 保证），逐格读一遍。
+    const uint8_t* slotBase = reinterpret_cast<const uint8_t*>(&g_hookApi) +
+        offsetof(HookAPI, InstallHook);
+    size_t nulls = 0;
+    for (uint32_t i = 0; i < CIV6_HOOK_API_ENTRY_COUNT; ++i) {
+        void* slot = nullptr;
+        std::memcpy(&slot, slotBase + static_cast<size_t>(i) * sizeof(void*), sizeof(void*));
+        if (!slot) {
+            ++nulls;
+            Logger::Log("[WARN] HookAPI 表第 %u 项为空（追加字段后忘了填 g_hookApi？）", i);
+        }
+    }
+    if (nulls != 0) {
+        Logger::Log("[WARN] HookAPI 表空项合计 %zu / %u：这些入口一旦被插件调用就是空指针调用",
+            nulls, CIV6_HOOK_API_ENTRY_COUNT);
     }
 }
 
@@ -3323,6 +3362,18 @@ static void CallOnUnloadSafe(OnUnloadFunc onUnload, const char* name) {
     }
 }
 
+// Civ6PluginKind 的调用同样是"执行插件代码"（按契约只是返回常量，但不带任何强约束）。
+// 独立 SEH 叶子：LoadPluginDllInternal 里全是需要展开的 C++ 对象，不能直接写 __try（C2712）。
+__declspec(noinline) static bool CallPluginKindSafe(uint64_t(*fn)(), uint64_t* outKind, DWORD* outCode) {
+    __try {
+        *outKind = fn();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (outCode) *outCode = GetExceptionCode();
+        return false;
+    }
+}
+
 // v2 统一插件加载流程：LoadLibraryExW + 类别/ABI 门禁(OnLoad 之前) + OnLoad(SEH) +
 // OnMessage 自动注册 + 记录跟踪项。
 // nameNarrow = 显示名（通常为文件名，内部取 stem 作 Patch owner / OnMessage 名）；已加载（同句柄）返回 false。
@@ -3330,6 +3381,13 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     LoaderCore::PluginCategory category) {
     lock_guard<std::recursive_mutex> transitionLock(g_gameCoreTransitionMutex);
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
+
+    // 下面几步都会执行"别人的代码"：LoadLibraryExW 的 DllMain（及其依赖链）、插件的
+    // Civ6PluginKind 导出。必须在**不持 lifecycle 锁**时做 —— 这把锁是最常被重入的
+    // （插件回调、owner 探针都要它），持着它去跑第三方 DllMain/导出会把插件回调路径一起卡住，
+    // 甚至自死锁。transition 锁仍罩全程：唯一的 teardown 入口 ResetForReload 拿的是同一把锁，
+    // 而"往 g_plugins 加条目"只发生在本函数（加载是单线程串行的），所以放宽这几步是安全的。
+    lifecycleLock.unlock();
 
     // 已驻留模块（更早的启用周期留下、未卸载）用 UNCHANGED_REFCOUNT 取回，"禁用→启用"
     // 循环不再累计引用计数；未映射才真正加载。ownsRef 标记引用是否归本调用所有，
@@ -3347,17 +3405,21 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         return false;
     }
 
+    lifecycleLock.lock();
     for (const auto& entry : g_plugins) {
         if (entry.handle == hPlugin) {
             if (ownsRef) FreeLibrary(hPlugin);
             return false;
         }
     }
+    lifecycleLock.unlock();
 
     // 类别门禁前置（OnLoad 之前）：插件头文件（common/HookAPI.h）自动发出 Civ6PluginKind 导出，
-    // 低 32 位 = kind（高 32 位 = apiVersion，只进日志、不参与判断）。在这里拒载永远安全——
-    // 插件一行代码都还没跑过，没有钩子/补丁/回调需要回滚，FreeLibrary 只释放本次自己
-    // LoadLibraryExW 拿到的引用（ownsRef）。ABI 版本兼容性由插件侧 HookAPI_IsCompatible 判。
+    // 低 32 位 = kind（高 32 位 = apiVersion，只进日志、不参与判断）。在这里拒载是安全的，
+    // 但注意它不等于"插件没跑过代码"：LoadLibraryExW 已经跑过它的 DllMain/CRT 初始化，
+    // 拒载安全的含义只是"没有任何经 Loader 账本的钩子/补丁/回调需要回滚"，
+    // 因此可以直接释放本次自己 LoadLibraryExW 拿到的引用（ownsRef）——这是信任边界，
+    // 不是安全保证。ABI 版本兼容性由插件侧 HookAPI_IsCompatible 判。
     using PluginKindFn = uint64_t(*)();
     auto kindFn = reinterpret_cast<PluginKindFn>(GetProcAddress(hPlugin, "Civ6PluginKind"));
     if (!kindFn) {
@@ -3366,7 +3428,14 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         if (ownsRef) FreeLibrary(hPlugin);
         return false;
     }
-    const uint64_t kindInfo = kindFn();   // 纯常量返回，不碰游戏状态
+    uint64_t kindInfo = 0;
+    DWORD kindCrash = 0;
+    if (!CallPluginKindSafe(kindFn, &kindInfo, &kindCrash)) {
+        Logger::Log("Plugin rejected: Civ6PluginKind crashed code=0x%08X: %s",
+            kindCrash, ModScan::WideToNarrow(wpath).c_str());
+        if (ownsRef) FreeLibrary(hPlugin);
+        return false;
+    }
     const uint32_t declaredKind = static_cast<uint32_t>(kindInfo & 0xFFFFFFFFu);
     const uint32_t declaredApi = static_cast<uint32_t>(kindInfo >> 32);   // 仅日志/诊断
     LoaderCore::PluginCategory declaredCategory = LoaderCore::PluginCategory::Global;
@@ -3385,6 +3454,8 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         return false;
     }
 
+    // 注册跟踪项（此后都在 lifecycle 锁内，直到需要调 OnLoad 时再放锁）。
+    lifecycleLock.lock();
     const std::string narrow = ModScan::WideToNarrow(wpath);
     std::string pluginFileName = nameNarrow;
     if (pluginFileName.empty()) {
@@ -3676,9 +3747,13 @@ void LoaderCore::UnloadPluginsOf(PluginCategory cat) {
     size_t remaining = 0;
     {
         lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
-        remaining = g_plugins.size();
+        // 只数本类别剩下的条目：Global / 被隔离的条目不属于这次卸载的口径，
+        // 混在一起报会让"remaining"看起来永远不为 0。
+        for (const auto& entry : g_plugins) {
+            if (entry.category == cat) ++remaining;
+        }
     }
-    Logger::Log("UnloadPluginsOf(%s): unloaded=%zu remaining=%zu",
+    Logger::Log("UnloadPluginsOf(%s): unloaded=%zu remaining-in-category=%zu",
         CategoryNameForLog(cat), owners.size(), remaining);
 }
 
@@ -3852,7 +3927,10 @@ static void RemoveGameCoreDomainSiteRecords(
                 site.minhookTrampoline = nullptr;
                 site.activeDetour = nullptr;
                 site.detourOwner.clear();
-                site.nextTarget = nullptr;
+                // 不能置 nullptr：RemoveHookSiteRecordLocked 的 b 步已把 nextTarget 设为 target，
+                // 好让仍停在 stub 里的在途调用者走原函数；这里覆盖成 nullptr 会让它们 jmp 0，
+                // 而"没有调用者停在 stub 内"无法证明（见 HookSite 顶部硬约束）。保持 target。
+                site.nextTarget = it->first;
                 {
                     // 锁序恒为 MinHook -> capture（本循环外层已持 MinHook 锁）。
                     lock_guard<mutex> captureLock(g_captureMutex);

@@ -15,18 +15,20 @@ inline bool LaunchAndExit() {
         return false;
     }
 
-    // 走 ShellExecuteW("open")：对 Steam 游戏，这等价于双击快捷方式，会经过 Steam 的启动协议
-    // （建立 overlay、准备 steamclient 握手）。不能用 CreateProcessW 直接拉 exe——
-    // 那样绕过了 Steam 启动链路，steam_api64.dll 的 SteamAPI_Init 会永久等待握手，游戏卡在
-    // 启动早期（无窗口、无日志、CPU 忙等），就是我们观察到的"后台残留"假象。
+    // ShellExecuteW("open") 只是"以 shell 的 open 动作执行这个 exe"，对 .exe 而言与
+    // CreateProcessW 同类，并不经过 Steam 启动协议（steam://rungameid/... 才会）。
+    // 它能工作的真实原因是**继承了本进程已有的 Steam 环境变量**（SteamAppId / SteamClientLaunch
+    // 等，由当初拉起游戏的那次 Steam 启动设置），steam_api64 因此能完成握手；
+    // CreateProcessW 同样继承这些变量，这里没有"必须走 shell"的硬要求。
     const HINSTANCE r = ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
     if (reinterpret_cast<INT_PTR>(r) <= 32) {
         return false;  // <=32 表示错误码
     }
 
-    // 用 TerminateProcess 而非 ExitProcess：本调用发生在 Loader 工作线程、游戏仍在早期初始化，
-    // 主线程可能持有 loader lock（仍在加载 DLL/跑 DllMain），或 steam_api64 等 DLL 的
-    // DLL_PROCESS_DETACH 回调阻塞 → ExitProcess 会挂起、进程残留在后台。
+    // 用 TerminateProcess 而非 ExitProcess：两条调用路径都在别人的加载流程里——
+    // LoaderUpdate 那条跑在阶段 A 的一次性工作线程、游戏仍在早期初始化；薄壳那条跑在引擎的
+    // GameCore 加载线程（正处在 LoadLibrary 官方 GameCore 之后）。主线程可能仍持有 loader lock，
+    // 或 steam_api64 等 DLL 的 DLL_PROCESS_DETACH 回调阻塞 → ExitProcess 会挂起、进程残留后台。
     // TerminateProcess 直接终止，跳过 loader lock 与 DETACH 回调；此处无需要清理的用户状态。
     TerminateProcess(GetCurrentProcess(), 0);
     return true;  // 不可达

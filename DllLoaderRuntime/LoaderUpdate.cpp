@@ -2,14 +2,13 @@
 #include "LoaderUpdate.h"
 #include "../common/LoaderProtocol.h"
 #include "../common/ModScan.h"
+#include "../common/EnabledMods.h"
 #include "../common/RestartGame.h"
 #include "../common/RuntimePackage.h"
 #include "../common/Logger.h"
 
 #include <algorithm>
 #include <cwchar>
-#include <cwctype>
-#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -53,17 +52,11 @@ bool GetSelfPath(std::wstring& outPath, std::wstring& outExeDir) {
     return _wcsicmp(fileName.c_str(), L"version.dll") == 0;
 }
 
-// 规范化（lexically_normal + 小写）后做大小写不敏感比较。
-std::wstring NormalizePath(const std::wstring& s) {
-    std::wstring out = std::filesystem::path(s).lexically_normal().wstring();
-    for (wchar_t& c : out) {
-        c = static_cast<wchar_t>(towlower(c));
-    }
-    return out;
-}
-
+// 路径比较统一走 common/EnabledMods.h 的 NormalizePath（weakly_canonical + 小写 + 反斜杠）。
+// 不要在这里再写一份"看起来一样"的实现：多一份就多一种"同一条路径被判成不同"的漂移
+//（典型的坑是符号链接 / 8.3 短名 / 大小写差异）。
 bool IsSamePath(const std::wstring& a, const std::wstring& b) {
-    return NormalizePath(a) == NormalizePath(b);
+    return EnabledMods::NormalizePath(a) == EnabledMods::NormalizePath(b);
 }
 
 // 选举：版本大者优先；同版本路径字典序小者优先。
@@ -97,7 +90,9 @@ void CheckAndApplyUpdate() {
         }
     }
 
-    // b. 扫描启用 Mod 中的候选（FindRuntimeCandidates 内部已含 EnabledMods 过滤），排除自身
+    // b. 扫描各内容根（游戏根 / Documents Mods / Workshop）与 loader 自身目录的候选，排除自身。
+    //    注意 FindRuntimeCandidates【故意】不按 Mod 启用集过滤（安装/自更新只比版本），
+    //    与"插件只从启用的 Mod 加载"是两条独立通路。
     const std::vector<std::wstring> candidates = ModScan::FindRuntimeCandidates(GetModuleHandleW(nullptr));
     std::vector<std::wstring> pool;
     pool.reserve(candidates.size());

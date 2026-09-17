@@ -153,7 +153,26 @@ bool PublishStaged(const std::wstring& staged, const std::wstring& installed,
         DeleteFileW(staged.c_str());
         return false;
     }
-    if (!DeleteIfPresent(backup) || !MoveFileW(installed.c_str(), backup.c_str())) {
+    // 首选：ReplaceFile 单次原子替换 —— 被替换文件被重命名到 backup，替换文件顶替它的名字。
+    // 旧实现在 MoveFileW(installed -> backup) 与 MoveFileW(staged -> installed) 之间存在
+    // "version.dll 不存在"的窗口：进程恰好在此被杀/断电，磁盘上就只剩 version_Old.dll，
+    // 下次启动 exe 的静态导入只能回退到 System32 的系统 version.dll，loader 静默消失一个会话。
+    if (!DeleteIfPresent(backup)) {
+        Logger::Log("RuntimePackage: stale backup cleanup failed err=%lu", GetLastError());
+        DeleteFileW(staged.c_str());
+        return false;
+    }
+    if (ReplaceFileW(installed.c_str(), staged.c_str(), backup.c_str(),
+            REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr)) {
+        Logger::Log("RuntimePackage: published via ReplaceFile (atomic) -> %ls", installed.c_str());
+        return true;
+    }
+    const DWORD replaceError = GetLastError();
+    Logger::Log("RuntimePackage: ReplaceFileW failed err=%lu; falling back to rename dance", replaceError);
+
+    // 回退路径：ReplaceFile 在"被替换文件正被映射为映像"等场合可能被拒，此时退回旧的两步
+    // 改名（已被实际使用验证过），行为不比旧版本更差；backup 已在上面清掉，不会撞名字。
+    if (!MoveFileW(installed.c_str(), backup.c_str())) {
         Logger::Log("RuntimePackage: backup failed err=%lu", GetLastError());
         DeleteFileW(staged.c_str());
         return false;

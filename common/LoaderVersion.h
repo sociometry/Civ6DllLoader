@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared by C++ and RC so metadata and GetLoaderVersion use the same version.
+// Shared by C++ and RC: the RCDATA 105 version resource and kLoaderRuntimeVersion come from these.
 #define CIV6_DLL_LOADER_VERSION_MAJOR 1
 #define CIV6_DLL_LOADER_VERSION_MINOR 0
 #define CIV6_DLL_LOADER_VERSION_PATCH 0

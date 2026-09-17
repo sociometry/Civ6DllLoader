@@ -5,8 +5,9 @@
 //   - DllMain：DisableThreadLibraryCalls → 休眠检测（自身父目录 == 游戏 exe 目录，且宿主进程是
 //     CivilizationVI*.exe）通过才 spawn 工作线程；其它任何加载场合（别的进程加载了这份
 //     version.dll、或开发中直接 LoadLibrary 本模块）→ 直接返回 TRUE，什么都不做。
-//   - WorkerMain（阶段 A）：LoaderCore::InitEarly → LoaderHooks::InstallAll
-//     → LoaderUpdate::CheckAndApplyUpdate → LoadPluginsOf(Global) → 线程退出。
+//   - WorkerMain（阶段 A）：LoaderCore::InitEarly → UiInject::ExtractResources
+//     → LoaderHooks::InstallAll → UiInject::Install → LoaderUpdate::CheckAndApplyUpdate
+//     → LoadPluginsOf(Global) → 线程退出。
 //   - 阶段 B（LoadDLL detour）在游戏线程 detour 内同步执行（LoaderCore::InitializeGameCorePhase）。
 //   - Global 插件仅启动时加载一次：运行期不再卸载/重装、也不再被 park；
 //     主菜单开关 mod 需要重启才生效。
@@ -59,7 +60,7 @@ std::wstring NormalizeDir(std::wstring path) {
 }
 
 // 进程 exe 的文件名是否形如 CivilizationVI*.exe（DX11/DX12 两个变体都命中）。
-// 用"前缀 + 后缀"而不是精确两名白名单，是为了兼容将来的 CivilizatonVI_*.exe 变体。
+// 用"前缀 + 后缀"而不是精确两名白名单，是为了兼容将来的 CivilizationVI_*.exe 变体。
 // DllMain 早调用：只用 kernel32 + 栈/小串，不分配内存、不读文件。
 bool ProcessExeIsGame() {
     wchar_t path[MAX_PATH]{};
@@ -196,9 +197,5 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_runtimeModule = nullptr;
     }
     return TRUE;
-}
-
-extern "C" __declspec(dllexport) uint32_t __cdecl GetLoaderVersion(void) {
-    return kLoaderRuntimeVersion;
 }
 

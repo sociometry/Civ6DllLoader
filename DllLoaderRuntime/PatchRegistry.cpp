@@ -19,7 +19,7 @@ namespace {
 
 struct Entry {
     std::vector<uint8_t> original;  // 首次 Patch 时的原始字节（单层存档）
-    std::wstring owner;             // 所属插件（去扩展名的文件名 stem）
+    std::wstring owner;             // 所属插件 ownerId（规范化全路径，见 PluginEntry::ownerId）
 };
 
 std::map<void*, Entry>& Registry() {
@@ -106,7 +106,9 @@ DWORD WritableVariant(DWORD protect) {
         case PAGE_WRITECOPY:
             return PAGE_READWRITE;
         default:
-            return PAGE_READWRITE;
+            // PAGE_NOACCESS / PAGE_GUARD / 未知属性没有"带写权限的等价属性"：返回 0 让
+            // VirtualProtect 失败，调用方按既有失败路径拒绝这次补丁，绝不把不可访问页变成可写。
+            return 0;
     }
 }
 
@@ -248,37 +250,6 @@ bool OverlapsRegistered(const void* target, size_t len) {
     }
     LeaveCriticalSection(&Cs());
     return false;
-}
-
-bool Revert(void* target) {
-    if (!target) {
-        return false;
-    }
-    EnterCriticalSection(&Cs());
-    const auto it = Registry().find(target);
-    if (it == Registry().end()) {
-        LeaveCriticalSection(&Cs());
-        Logger::Log("PatchRegistry::Revert: no patch record for target=%p", target);
-        return false;
-    }
-
-    const size_t origSize = it->second.original.size();
-    const std::wstring owner = it->second.owner;
-    std::vector<SavedProtection> saved;
-    if (!MakeWritableRecording(target, origSize, saved)) {
-        RestoreProtections(saved);
-        LeaveCriticalSection(&Cs());
-        Logger::Log("PatchRegistry::Revert: protect failed target=%p err=%lu", target, GetLastError());
-        return false;
-    }
-    memcpy(target, it->second.original.data(), origSize);
-    RestoreProtections(saved);
-    FlushInstructionCache(GetCurrentProcess(), target, origSize);
-
-    Registry().erase(it);
-    LeaveCriticalSection(&Cs());
-    Logger::Log("PatchRegistry::Revert: restored target=%p (%zu bytes) owner=%ls", target, origSize, owner.c_str());
-    return true;
 }
 
 bool RevertOwned(void* target, const wchar_t* owner) {

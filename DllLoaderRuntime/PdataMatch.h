@@ -26,9 +26,6 @@ namespace PdataMatch {
     // 按名矫正（name 是 demangled 或 mangled 名）；无法矫正返回 0。
     uintptr_t CorrectByName(uint32_t imageId, const char* name);
 
-    // 版本指纹（全表 (size,unwind_hash) 聚合 hash），供缓存键。
-    uint64_t Fingerprint(uint32_t imageId);
-
     // 按 vtable 符号名（demangled/mangled）查矫正后的 vtable RVA 与槽位数。
     bool CorrectVTableByName(uint32_t imageId, const char* name, uint32_t& outRva, uint32_t& outSlotCount);
 }

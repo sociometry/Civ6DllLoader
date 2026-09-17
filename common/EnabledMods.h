@@ -1,7 +1,6 @@
 #pragma once
 #include <Windows.h>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace EnabledMods {
@@ -9,7 +8,6 @@ namespace EnabledMods {
 struct Snapshot {
     bool ok = false;
     std::string error;
-    std::unordered_set<std::string> modIds;          // lowercase ModId from Mods.sqlite
     std::vector<std::wstring> enabledModRoots;       // normalized absolute mod roots
 };
 

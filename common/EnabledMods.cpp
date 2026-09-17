@@ -14,13 +14,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-std::string ToLowerAscii(std::string s) {
-    for (auto& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return s;
-}
-
 std::wstring Utf8ToWide(const char* utf8) {
     if (!utf8 || !*utf8) return {};
     const int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
@@ -135,7 +128,7 @@ Snapshot Load() {
     sqlite3_busy_timeout(db, 500);
 
     const char* sql =
-        "SELECT m.ModId, sf.Path "
+        "SELECT sf.Path "
         "FROM ModGroupItems mgi "
         "JOIN ModGroups mg ON mg.ModGroupRowId = mgi.ModGroupRowId AND mg.Selected = 1 "
         "JOIN Mods m ON m.ModRowId = mgi.ModRowId "
@@ -151,11 +144,7 @@ Snapshot Load() {
 
     int stepRc = SQLITE_OK;
     while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        const char* modId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        const char* pathUtf8 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        if (modId && *modId) {
-            snap.modIds.insert(ToLowerAscii(modId));
-        }
+        const char* pathUtf8 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         if (pathUtf8 && *pathUtf8) {
             std::wstring modinfoPath = Utf8ToWide(pathUtf8);
             fs::path root = fs::path(modinfoPath).parent_path();
@@ -175,7 +164,6 @@ Snapshot Load() {
     if (stepRc != SQLITE_DONE) {
         snap.error = "Mods.sqlite query failed (" + std::to_string(stepRc) + "): " +
             sqlite3_errmsg(db);
-        snap.modIds.clear();
         snap.enabledModRoots.clear();
     }
 

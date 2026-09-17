@@ -14,7 +14,8 @@ enum class PluginCategory {
 };
 
 // 阶段 A 基础初始化（工作线程内调用）：Logger::Init(L"Civ6DllLoader_Loader.log")
-// + PdataMatch::Init + Runtime::InitMinHook。实现于 RuntimeEntry.cpp。
+// + VerifyHookApiTableProtection + PdataMatch::Init（含给当前 exe 建 pdata 表）+ Runtime::InitMinHook。
+// 实现于 RuntimeEntry.cpp。
 void InitEarly();
 
 // Loader 自身模块句柄（version.dll）。实现于 RuntimeEntry.cpp；供插件扫描作锚。

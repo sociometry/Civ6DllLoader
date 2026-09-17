@@ -5,10 +5,13 @@
 #include "Logger.h"
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <set>
 #include <shlobj.h>
 
 #pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Advapi32.lib")   // RegGetValueW（Steam 安装路径）
 
 namespace ModScan {
 
@@ -71,6 +74,68 @@ std::wstring FindWorkshopContentRoot(const std::wstring& binariesWin64Dir) {
     return {};
 }
 
+// ---- Steam 库发现（注册表 + libraryfolders.vdf）----
+// 为什么需要它：FindWorkshopContentRoot 是从锚目录向上找 steamapps，只有锚在游戏安装目录
+// 附近时才命中。薄壳的锚是 Mod 自己的 Binaries\Win64（Mod 常在 Documents\...\Mods），
+// 从那里上溯永远碰不到 steamapps —— 于是"三个内容根"在首次补装时只剩两个。
+// 这里改成问 Steam 自己：先读安装路径（HKCU\Software\Valve\Steam\SteamPath，退回
+// HKLM WOW6432Node\...\InstallPath），再扫 <steam>\steamapps\libraryfolders.vdf 里的
+// 每个库根，逐个拼 <lib>\steamapps\workshop\content\289070。
+std::wstring ReadRegistryString(HKEY root, const wchar_t* subKey, const wchar_t* value) {
+    wchar_t buf[1024] = {};
+    DWORD size = sizeof(buf);
+    DWORD type = 0;
+    if (RegGetValueW(root, subKey, value, RRF_RT_REG_SZ, &type, buf, &size) != ERROR_SUCCESS) {
+        return {};
+    }
+    return std::wstring(buf);
+}
+
+std::wstring FindSteamInstallPath() {
+    std::wstring path = ReadRegistryString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
+    if (!path.empty()) return path;
+    path = ReadRegistryString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath");
+    if (!path.empty()) return path;
+    return ReadRegistryString(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Valve\\Steam", L"InstallPath");
+}
+
+// <libraryRoot> 下的 Workshop 内容根（不存在或不是目录则返回空）。
+std::wstring WorkshopRootUnder(const std::wstring& libraryRoot) {
+    if (libraryRoot.empty()) return {};
+    std::error_code ec;
+    const fs::path candidate =
+        fs::path(libraryRoot) / L"steamapps" / L"workshop" / L"content" / kCiv6SteamAppId;
+    return fs::is_directory(candidate, ec) ? candidate.wstring() : std::wstring{};
+}
+
+// 从 <steam>\steamapps\libraryfolders.vdf 收集所有库根（只认 "path" 键；写入值里的
+// 反斜杠是 vdf 转义，这里做最小反转义）。文本扫描，不引 JSON/vdf 依赖。
+void CollectLibraryRootsFromVdf(const std::wstring& steamPath, std::vector<std::wstring>& out) {
+    if (steamPath.empty()) return;
+    std::ifstream in(fs::path(steamPath) / L"steamapps" / L"libraryfolders.vdf", std::ios::binary);
+    if (!in) return;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string key = "\"path\"";
+    size_t pos = 0;
+    while ((pos = text.find(key, pos)) != std::string::npos) {
+        pos += key.size();
+        while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t')) ++pos;
+        if (pos >= text.size() || text[pos] != '"') continue;
+        const size_t end = text.find('"', pos + 1);
+        if (end == std::string::npos) break;
+        std::string value;
+        value.reserve(end - pos - 1);
+        for (size_t i = pos + 1; i < end; ++i) {
+            if (text[i] == '\\' && i + 1 < end) ++i;   // 反转义 \ 与 \"
+            value.push_back(text[i]);
+        }
+        pos = end + 1;
+        if (value.empty()) continue;
+        const std::wstring wide = NarrowToWide(value);
+        if (!wide.empty()) AddUnique(out, wide);
+    }
+}
+
 void CollectRuntimesUnderContentRoot(const fs::path& contentRoot, std::vector<std::wstring>& out) {
     std::error_code rootEc;
     if (!fs::is_directory(contentRoot, rootEc)) return;
@@ -94,7 +159,9 @@ void DedupPluginsByFilename(std::vector<std::wstring>& paths) {
         for (auto& c : name) c = towlower(c);
         if (seenNames.count(name)) {
             const std::string narrow = WideToNarrow(path);
-            Logger::Log("Skipping duplicate plugin basename (kept earlier path): %s", narrow.c_str());
+            // 保留的是大小写不敏感字典序里的第一个（扫描结果在去重前已按该顺序排好）
+            Logger::Log("Skipping duplicate plugin basename (kept the lexicographically first path): %s",
+                narrow.c_str());
             continue;
         }
         seenNames.insert(name);
@@ -118,9 +185,7 @@ void FilterByEnabledMods(std::vector<std::wstring>& paths, HMODULE shellModule, 
         localOnly.reserve(paths.size());
         for (const auto& path : paths) {
             const bool keep = (!shellModRoot.empty() && EnabledMods::PathIsUnderRoot(path, shellModRoot))
-                || EnabledMods::PathIsUnderRoot(path, shellDir)
-                || EqualsIgnoreCase(fs::path(path).parent_path().wstring(), shellDir)
-                || EqualsIgnoreCase(fs::path(path).parent_path().parent_path().wstring(), shellDir);
+                || EnabledMods::PathIsUnderRoot(path, shellDir);
             if (keep) {
                 localOnly.push_back(path);
             } else {
@@ -131,8 +196,8 @@ void FilterByEnabledMods(std::vector<std::wstring>& paths, HMODULE shellModule, 
         return;
     }
 
-    Logger::Log("EnabledMods: %zu mod id(s), %zu root(s) for %s filter",
-        snap.modIds.size(), snap.enabledModRoots.size(), what);
+    Logger::Log("EnabledMods: %zu root(s) for %s filter",
+        snap.enabledModRoots.size(), what);
 
     std::vector<std::wstring> filtered;
     filtered.reserve(paths.size());
@@ -259,9 +324,18 @@ std::vector<std::wstring> CollectScanRoots(HMODULE shellModule) {
         AddUnique(roots, docsMods);
     }
 
-    const std::wstring workshop = FindWorkshopContentRoot(shellDir);
-    if (!workshop.empty()) {
-        AddUnique(roots, workshop);
+    // Workshop 内容根：① 从锚目录上溯（锚就在游戏安装树里时最快命中）；② 注册表拿 Steam
+    // 安装路径 + libraryfolders.vdf 里的每个库根（锚在 Documents\Mods 时只有这条能命中，
+    // 见 FindSteamInstallPath 的说明）。
+    AddUnique(roots, FindWorkshopContentRoot(shellDir));
+    const std::wstring steamPath = FindSteamInstallPath();
+    if (!steamPath.empty()) {
+        AddUnique(roots, WorkshopRootUnder(steamPath));
+        std::vector<std::wstring> libraries;
+        CollectLibraryRootsFromVdf(steamPath, libraries);
+        for (const auto& library : libraries) {
+            AddUnique(roots, WorkshopRootUnder(library));
+        }
     }
 
     return roots;

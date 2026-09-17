@@ -23,7 +23,10 @@
 //     The plugin KIND needs no call at all: this header emits a "Civ6PluginKind" export
 //     (low 32 = kind, high 32 = apiVersion) that the loader reads with GetProcAddress BEFORE
 //     calling OnLoad. A plugin built from an older header has no such export and is rejected
-//     without ever running (so a rejected plugin can always be FreeLibrary'd safely). The kind
+//     before OnLoad - i.e. before any loader-mediated hook / patch / callback is registered.
+//     That is NOT the same as "its code never ran": LoadLibraryExW already ran the plugin's
+//     DllMain and CRT initializers, so a rejected module may already own threads or raw
+//     OS-level hooks. It is a trust boundary, not a safety guarantee. The kind
 //     gate at the bottom makes GameCore-only entries uncompilable in a Global plugin.
 /* Loader 侧（非插件 TU）：Loader 自己的两个工程在 vcxproj 预处理宏里【显式】定义
    CIV6_HOOKAPI_BUILD_IMPL（DllLoaderRuntime.vcxproj / DllLoader.vcxproj 两侧的
@@ -170,7 +173,7 @@ enum {
 
 typedef enum HookApiPushMethodsResult {
     kHookApiPushMethodsFailed = 0,
-    kHookApiPushMethodsInstalled = 2
+    kHookApiPushMethodsInstalled = 1
 } HookApiPushMethodsResult;
 
 typedef struct HookAPI {
@@ -216,8 +219,7 @@ typedef struct HookAPI {
     void* (*ResolveByVTable)(HookImageId image, const char* vtableSymbol, uint32_t index);
 
     // Failed：本次没有安装任何方法（GameCore 未就绪、符号解析失败，或与同一 target 上
-    //   的既有定义冲突）；Installed：本次已安装。没有"延迟登记"取值 —— Loader 不为下一代
-    //   GameCore 保存登记表，登记只在当次安装内生效。
+    //   的既有定义冲突）；Installed：本次已安装。
     // 同 owner + target + exposedName 的相同定义重复调用幂等；同 target 的同名
     // 不同定义（包括不同 owner）整批拒绝。函数和 internalName/exposedName 均须非空。
     // 参数由 Loader 复制。原 PushMethods 由 Loader 自动调用，本接口不再返回其
@@ -351,16 +353,13 @@ static inline int HookAPI_IsCompatible(const HookAPI* api) {
     return 1;
 }
 
-// Optional: probe whether runtime exposes fields past minStructSize
-// (pass sizeof(HookAPI) from a newer header copy if you dual-target).
-static inline int HookAPI_HasMinSize(const HookAPI* api, uint32_t minStructSize) {
-    if (!api) return 0;
-    if (api->apiVersion != CIV6_HOOK_API_VERSION) return 0;
-    return api->structSize >= minStructSize ? 1 : 0;
-}
-
 #ifdef __cplusplus
 }  // extern "C"
+
+// HookAPI 里"入口"（函数指针）字段的数量。它是追加字段时唯一需要同步的计数：
+// 追加字段 -> 改这个常量 -> Civ6DLLHookLoaderAPI.cpp 的 static_assert 会逼着你把
+// g_hookApi 的位置初始化补齐（聚合初始化少写几项只会静默零填，运行时就是空指针调用）。
+constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT = 76;
 
 template <typename T>
 T ResolveByName(HookAPI* api, HookImageId image, const char* name) {

@@ -143,18 +143,10 @@ __declspec(noinline) const char* GetRuleSetName() {
 
 // 规则集名 → 官方 GameCore DLL 相对路径（相对游戏根 = exe 目录上溯三级）。
 // 返回 nullptr = 未知（透传原路径兜底）。
+// 本项目只支持 XP2：LoadDllDetour 已对非 EXPANSION_2 早退，所以这里只可能拿到 XP2 规则集。
 const wchar_t* OfficialGameCoreRelPath(const char* ruleset) {
-    if (!ruleset) {
-        return nullptr;
-    }
-    if (strstr(ruleset, "EXPANSION_2")) {
+    if (ruleset && strstr(ruleset, "EXPANSION_2")) {
         return L"DLC\\Expansion2\\Binaries\\Win64\\GameCore_XP2_FinalRelease.dll";
-    }
-    if (strstr(ruleset, "EXPANSION_1")) {
-        return L"DLC\\Expansion1\\Binaries\\Win64\\GameCore_XP1_FinalRelease.dll";
-    }
-    if (strstr(ruleset, "STANDARD")) {
-        return L"Base\\Binaries\\Win64Steam\\GameCore_Base_FinalRelease.dll";
     }
     return nullptr;
 }

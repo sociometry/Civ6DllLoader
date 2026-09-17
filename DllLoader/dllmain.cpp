@@ -1,6 +1,7 @@
 // dllmain.cpp : thin GameCore proxy shell. v2: when the Loader (exe-dir
-// version.dll) is missing, install it once from the highest-version enabled-mod
-// runtime; always pass through to the real Expansion2 GameCore this session.
+// version.dll) is missing, install it once from the highest-version runtime found
+// under the scan roots (deliberately NOT filtered by mod-enabled state); always
+// pass through to the real Expansion2 GameCore this session.
 #include "pch.h"
 
 #include <Windows.h>
@@ -93,10 +94,6 @@ extern "C" {
 
         if (base_DllDestroyGameContext) {
             base_DllDestroyGameContext(context);
-        } else if (g_realGameCore) {
-            auto fn = reinterpret_cast<ProxyTypes::DllDestroyGameContext>(
-                GetProcAddress(g_realGameCore, "DllDestroyGameContext"));
-            if (fn) fn(context);
         }
 
         if (g_realGameCore) {
@@ -265,8 +262,8 @@ extern "C" {
 #pragma comment(linker,"/export:?setEmitStruct@HksCompilerSettings@@QEAAXH@Z=GameCore_XP2_FinalRelease.?setEmitStruct@HksCompilerSettings@@QEAAXH@Z,@152")
 #pragma comment(linker,"/export:?setGlobalMemoization@HksCompilerSettings@@QEAAXH@Z=GameCore_XP2_FinalRelease.?setGlobalMemoization@HksCompilerSettings@@QEAAXH@Z,@153")
 #pragma comment(linker,"/export:?setIntLiteralsEnabled@HksCompilerSettings@@QEAAXW4IntLiteralOptions@1@@Z=GameCore_XP2_FinalRelease.?setIntLiteralsEnabled@HksCompilerSettings@@QEAAXW4IntLiteralOptions@1@@Z,@154")
-// #pragma comment(linker,"/export:DllCreateGameContext=GameCore_XP2_FinalRelease.DllCreateGameContext,@155")
-// #pragma comment(linker,"/export:DllDestroyGameContext=GameCore_XP2_FinalRelease.DllDestroyGameContext,@156")
+// 注意：DllCreateGameContext / DllDestroyGameContext 由本模块自己实现（见文件顶部），
+// 不转发给官方 GameCore；官方导出表里的 155/156 号在这里留空。
 #pragma comment(linker,"/export:EXP_GetTelemetrySessionHash=GameCore_XP2_FinalRelease.EXP_GetTelemetrySessionHash,@157")
 #pragma endregion
 

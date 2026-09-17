@@ -26,8 +26,7 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner);
 // 会互相覆盖，最终恢复出第三种状态。调用方不得持注册表的锁（内部自己取）。
 bool OverlapsRegistered(const void* target, size_t len);
 
-// Revert：恢复原始字节并移除记录；无记录返回 false。
-bool Revert(void* target);
+// RevertOwned：仅当记录属于该 owner 时恢复原始字节并移除记录。
 bool RevertOwned(void* target, const wchar_t* owner);
 
 // RevertAllFor：回滚某 owner 的全部未回滚补丁（插件卸载时调用）。返回回滚条数。

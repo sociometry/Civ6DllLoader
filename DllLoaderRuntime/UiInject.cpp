@@ -144,8 +144,10 @@ bool ReadResourceData(HMODULE module, int id, std::vector<uint8_t>& out) {
 }
 
 // 写文件（覆盖）。失败返回 false。
+// CREATE_NEW：只在文件不存在时创建。调用方的语义本来就是"已存在则跳过"，
+// 这样同时消掉 GetFileAttributesW -> CreateFileW 之间的 TOCTOU，也不会跟到 junction/symlink 目标。
 bool WriteWholeFile(const std::wstring& path, const void* data, size_t len) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
@@ -175,6 +177,8 @@ void ExtractOne(HMODULE module, int id, const wchar_t* fileName) {
     }
     if (WriteWholeFile(target, data.data(), data.size())) {
         Logger::Log("UiInject: 释放 %ls (%zu bytes)", fileName, data.size());
+    } else if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        // 与前面那次存在性检查之间被别的进程抢先创建：语义上等同"已存在则跳过"。
     } else {
         Logger::Log("UiInject: 写 %ls 失败 err=%lu", fileName, GetLastError());
     }
@@ -658,7 +662,7 @@ void InjectFrontEndUi(void* state) {
 
     const bool newFrontEnd = g_frontEndContext != frontEnd;
     if (!newFrontEnd && !refresh && g_rootContext) {
-        return;  // 当前 FrontEnd 已经注入，且没有 Mod toggle 请求
+        return;  // 当前 FrontEnd 已经注入，且没有（失败路径置位的）重试请求
     }
 
     // LoadUI 重建时旧 FrontEnd 通常已经由游戏销毁；不能再访问旧指针。

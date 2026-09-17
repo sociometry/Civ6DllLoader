@@ -722,24 +722,21 @@ def build_module(image_id, json_path, pe_path, bin_path,
     print("      {} entries".format(len(pdata)))
 
     print("[3/5] normHeadHash ...")
-    records, indices, placeholders = [], [], {}
+    # normHeadHash = 0 表示"无头 hash"（非 pdata 函数，或 SizeOfProlog <= 0），运行时按 != 0
+    # 判定；不要再写 FNV 初值之类占位常量（运行时会把它当真实 hash，见 PdataMatch.cpp 的
+    # kNoHeadHashPlaceholder 说明——那里为了兼容历史文件仍然容忍该值）。
+    records, indices = [], []
     for idx, s in enumerate(func_syms):
         rva = int(s["rva"], 16)
         if rva in pdata_begins:
             ln = min(pdata_begins[rva][2], 32)
-            if ln <= 0:
-                placeholders[idx] = 0xcbf29ce484222325
-            else:
+            if ln > 0:
                 records.append((ln, pe.get_data(rva, ln)))
                 indices.append(idx)
-        else:
-            placeholders[idx] = 0xcbf29ce484222325
     hashes = run_normhash(normhash_helper, records)
     nhh = [0] * len(func_syms)
     for pos, idx in enumerate(indices):
         nhh[idx] = hashes[pos]
-    for idx, h in placeholders.items():
-        nhh[idx] = h
     print("      {} functions".format(len(func_syms)))
 
     print("[4/5] AOB ...")

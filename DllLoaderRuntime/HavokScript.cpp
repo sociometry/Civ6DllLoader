@@ -47,8 +47,9 @@ namespace hks {
 	hksi_lua_gethookmaskType gethookmask;
 	hksi_lua_gethookcountType gethookcount;
 
-	// 官方导出优先（存在时无 lua_State 布局依赖）；仅当全部候选都缺失才走原始栈写入兜底。
-	hksi_lua_pushbooleanType pushbooleanReal = nullptr;
+	// pushlightuserdata 有官方导出（存在时无 lua_State 布局依赖），优先用它；
+	// pushboolean 在 HavokScript_FinalRelease.dll 里【没有任何导出】（导出表实证），
+	// 因此不存在"官方导出优先"的候选可解析。
 	hksi_lua_pushlightuserdataType pushlightuserdataReal = nullptr;
 
 	// 本次 Init 缺失的导入名清单（含重复解析失败）；InitHavokScript 据此判定整体失败。
@@ -116,23 +117,14 @@ namespace hks {
 		RESOLVE_IMPORT(gethookmask, "?hksi_lua_gethookmask@@YAHPEAUlua_State@@@Z");
 		RESOLVE_IMPORT(gethookcount, "?hksi_lua_gethookcount@@YAHPEAUlua_State@@@Z");
 
-		// pushboolean / pushlightuserdata：尝试官方导出（精确 mangling 匹配，不存在即返回空）。
-		static const char* kPushBooleanCandidates[] = {
-			"?hksi_lua_pushboolean@@YAXPEAUlua_State@@_N@Z",
-			"?hksi_lua_pushboolean@@YAXPEAUlua_State@@H@Z",
-			"?lua_pushboolean@@YAXPEAUlua_State@@H@Z",
-		};
+		// pushlightuserdata：尝试官方导出（精确 mangling 匹配，不存在即返回空）。
+		// pushboolean 没有候选：该 DLL 不导出任何 pushboolean（见 pushboolean 的实现）。
 		static const char* kPushLightUserDataCandidates[] = {
 			"?hksi_lua_pushlightuserdata@@YAXPEAUlua_State@@PEAX@Z",
 			"?lua_pushlightuserdata@@YAXPEAUlua_State@@PEAX@Z",
 		};
-		pushbooleanReal = ResolveFirst<hksi_lua_pushbooleanType>(
-			hksDll, kPushBooleanCandidates, _countof(kPushBooleanCandidates));
 		pushlightuserdataReal = ResolveFirst<hksi_lua_pushlightuserdataType>(
 			hksDll, kPushLightUserDataCandidates, _countof(kPushLightUserDataCandidates));
-		if (!pushbooleanReal) {
-			Logger::Log("InitHavokScript: no pushboolean export; raw-stack fallback (offset-locked)");
-		}
 		if (!pushlightuserdataReal) {
 			Logger::Log("InitHavokScript: no pushlightuserdata export; raw-stack fallback (offset-locked)");
 		}
@@ -151,16 +143,18 @@ namespace hks {
 		// 非法 ID 也走判空：checkinteger 与 error 是两个独立导入，可能一有一无。
 		if (error) {
 			std::string errorMessage = "Invalid playerId: ";
-			hks::error(L, errorMessage.append(std::to_string(playerId)).c_str());
+			errorMessage.append(std::to_string(playerId));
+			hks::error(L, "%s", errorMessage.c_str());   // 走 %s，别把拼接结果当 format
 		}
 		return -1;
 	}
 
-	// ---- 原始栈写入兜底（仅当 HavokScript 未导出对应 push 函数时使用）----
-	// lua_State::top 指针槽偏移：版本锁定值（对当前 GameCore 布局硬编码）。官方导出
-	// 可用时本路径不会执行；一旦 lua_State 布局变动，这个偏移就不再指向 top 槽，
-	// pushboolean / pushlightuserdata 会【静默丢值】——下面的可写探测只挡得住“写不
-	// 进去”的情形（所以不会崩），挡不住“写到别处可写内存”，故换游戏版本必须重验此值。
+	// ---- 原始栈写入（pushboolean 的唯一实现；pushlightuserdata 缺官方导出时的兜底）----
+	// lua_State::top 指针槽偏移：版本锁定值（对当前 GameCore 布局硬编码）。
+	// pushboolean 必然走这条路（HavokScript_FinalRelease.dll 没有任何 pushboolean 导出）。
+	// 一旦 lua_State 布局变动，这个偏移就不再指向 top 槽，写入会落到别处可写内存 ——
+	// 下面的可写探测只挡得住“写不进去”（所以不会崩），挡不住“写到别处可写内存”。
+	// 因此换游戏版本必须重验此值；这是 LuaPushBoolean 唯一的结构体布局依赖。
 	constexpr uintptr_t kLuaStateTopSlotOffset = 0x48;
 
 	// 写入一个 16 字节 TValue（tt(4)+pad(4)+value(8)）并把 top 指针推进一个槽位。
@@ -172,16 +166,16 @@ namespace hks {
 		int* stackTop = *topSlotPtr;
 		if (!Runtime::IsWritableSpan(stackTop, 16)) return false;
 		stackTop[0] = typeTag;                                    // tt
+		stackTop[1] = 0;                                          // tt 与 value 之间的 4 字节 padding
 		*reinterpret_cast<uintptr_t*>(stackTop + 2) = valueBits;  // value（+8）
 		*topSlotPtr = stackTop + 4;                               // top += sizeof(TValue)
 		return true;
 	}
 
 	void pushboolean(lua_State* L, bool value) {
-		if (pushbooleanReal) {
-			pushbooleanReal(L, value ? 1 : 0);
-			return;
-		}
+		// 没有"官方导出优先"的分支：HavokScript_FinalRelease.dll 不导出
+		// pushboolean / hksi_lua_pushboolean / lua_pushboolean 中的任何一个（导出表实证），
+		// 裸栈写入是唯一实现。
 		RawPushTValue(L, 1, value ? 1u : 0u);  // LUA_TBOOLEAN
 	}
 
@@ -193,12 +187,15 @@ namespace hks {
 		RawPushTValue(L, 2, reinterpret_cast<uintptr_t>(ptr));  // LUA_TLIGHTUSERDATA
 	}
 
-	// Should only ever be called once. 返回 false = 有导入缺失，
-	// 调用方（InitializeGameCorePhase）据此停用 GameCore 插件加载（宁缺毋崩）。
+	// 每次阶段 B 重新解析（模块是 exe 的静态导入、常驻；重新解析的是导入地址），可重复调用。
+	// 返回 false = 有导入缺失，调用方（InitializeGameCorePhase）据此停用 GameCore 插件加载（宁缺毋崩）。
 	bool InitHavokScript() {
 		HMODULE hksDll = GetModuleHandle(TEXT("HavokScript_FinalRelease.dll"));
 		if (hksDll == NULL) {
-			Logger::Log("Failed to load HavokScript err=%lu", GetLastError());
+			// 不打 GetLastError：GetModuleHandle 失败不保证设置 last error。
+			// 不清旧导入指针也是安全的：该模块是 exe 静态导入、进程内不会卸载，
+			// "缺失"只可能发生在首次解析之前（那时所有指针都还是 nullptr）。
+			Logger::Log("HavokScript_FinalRelease.dll not found; lua API unavailable");
 			return false;
 		}
 		InitHavokScriptImports(hksDll);

@@ -1,30 +1,20 @@
 #pragma once
 
-#include <cstddef>
-
-#ifndef LOCALIZATION_STRING_BYTES
-#define LOCALIZATION_STRING_BYTES 256u
-#endif
+#include "../common/HookAPI.h"   // CIV6_HOOK_API_LOC_STRING_BYTES：ABI 头里的唯一尺寸口径
 
 namespace Localization {
 
-// Opaque storage matching Firaxis Localization::String layout size (over-allocated safely).
+// 不透明的 Firaxis 对象：Loader 只把它 reinterpret_cast 成 API 期望的指针，从不构造/析构
+// （生命周期走 HookAPI 的 LocCreate/LocDestroy）。尺寸直接取 ABI 头，避免两处常量漂移。
 class String {
 public:
-    String();
-    ~String();
-
-    // opaque 游戏对象不能按字节复制或移动；只允许通过 out-param API 原地构造/使用。
+    String() = delete;
+    ~String() = delete;
     String(const String&) = delete;
     String& operator=(const String&) = delete;
-    String(String&& other) = delete;
-    String& operator=(String&& other) = delete;
-
-    bool PushArgument(const char* arg);
-    const char* toUTF8() const;
 
 private:
-    alignas(8) unsigned char storage_[LOCALIZATION_STRING_BYTES];
+    alignas(8) unsigned char storage_[CIV6_HOOK_API_LOC_STRING_BYTES];
 };
 
 using LookupFunc = String*(__cdecl*)(String* pThis, const char* key);

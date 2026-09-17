@@ -1,7 +1,7 @@
 # Civ6DllLoader 架构总览
 
 - 状态：**当前有效**（对齐 HEAD 的历次重构之后：kind 门禁、域门正面规则、teardown 物理摘挂钩记录、
-  站点原地复位、插件释放延后、tools 单入口化）。最后校订：2026-09-16。
+  站点原地复位、插件释放延后、tools 单入口化）。最后校订：2026-09-17。
 - 适用版本：预发布 `1.0.0`（`common/LoaderVersion.h`），插件 ABI `CIV6_HOOK_API_VERSION = 1`。
 - 这份文档是**唯一权威的架构说明**；逆向取证类材料（原始反汇编/字节/映射表）在 `docs/analysis/`，
   本文在需要处引用它们。历史设计文档已删除。
@@ -69,7 +69,7 @@
 
 1. **Loader 靠静态导入进进程**：exe 的导入表里有 `version.dll`，Windows 会从 exe 目录解析它——
    我们把 `Civ6DllLoader.runtime.dll` 复制成 exe 目录的 `version.dll`，于是 Loader 在进程启动**最早**
-   阶段就进来了（`DllLoader/ProxyExports.cpp`）。这份 `version.dll` 的导出表逐条转给系统真正的
+   阶段就进来了（`DllLoaderRuntime/ProxyExports.cpp`）。这份 `version.dll` 的导出表逐条转给系统真正的
    `version.dll`，所以"查文件版本"这类系统行为不受影响。
 2. **薄壳靠游戏自己的加载器进进程**：官方在 `DLC/Expansion2/Config/Expansion2_Config.xml` 里登记
    `GameCores(GameCore='Expansion2', PackageId=<Expansion2 的 GUID>, DllPrefix='GameCore_XP2')`，
@@ -128,7 +128,9 @@
 - 前提：自己的文件名必须是 `version.dll`（否则视为开发中的直接加载，跳过自更新）；
 - 启动时若发现 `version_Old.dll` 存在，说明**上一会话刚做完一次自更新**，直接删掉它（自愈）；
 - 候选走同一个 `ModScan::FindRuntimeCandidates`，但锚点是 **exe 模块**；排除自己（规范化路径比较）后
-  选更新的版本 → 备份成 `version_Old.dll` → 替换；失败则回滚，当前安装保持不变；
+  选更新的版本 → **先备份成 `version_Old.dll` 再原子替换**（`ReplaceFileW`：被替换文件被重命名到备份名、
+  替换文件顶替它的名字，磁盘上不会出现 "`version.dll` 不存在" 的中间态；`ReplaceFileW` 被拒时退回
+  旧的两步改名 + 失败回滚）→ 失败则回滚，当前安装保持不变；
 - 换完这一会话**仍在用内存里的旧版本**，必须重启才生效（日志写 `update applied ... (restart to take effect)`）。
 
 版本号与协议常量在 `common/LoaderProtocol.h` + `common/LoaderVersion.h`（`1.0.0`、RC 资源 id 105）。
@@ -137,7 +139,10 @@
 候选**不按 Mod 启用集过滤**（`ModScan::FindRuntimeCandidates` 故意不调 `FilterByEnabledMods`）：
 安装/自更新 loader 只看版本（RC 资源 105），与"插件只从启用的 Mod 加载"是两条独立通路。
 代价与前提：候选来自三个内容根（游戏根 / `Documents\...\Mods` / Workshop）下的
-`<mod>\Binaries\Win64\` 以及锚模块同级目录，而 `RuntimePackage::ProbeVersion` 只验 PE + RC 105、
+`<mod>\Binaries\Win64\` 以及锚模块同级目录。游戏根由锚目录上溯得到，Workshop 根另有"问 Steam 自己"的
+发现方式（注册表 `HKCU\Software\Valve\Steam\SteamPath`，退回 `HKLM\...\Valve\Steam\InstallPath`；
+再扫 `<steam>\steamapps\libraryfolders.vdf` 里的每个库根）——薄壳的锚在 `Documents\...\Mods` 时
+只有这条路能命中 Workshop。而 `RuntimePackage::ProbeVersion` 只验 PE + RC 105、
 **没有发行者签名**——能装成 `version.dll` 的候选就是这些目录里任意名字对得上的 runtime DLL。
 插件侧的启用集过滤（`FilterByEnabledMods` + `EnabledMods::AllowsPath`）见 §3.1。
 
@@ -147,7 +152,7 @@
 
 1. `LoaderCore::InitEarly()`：`Logger::Init` + `VerifyHookApiTableProtection`（HookAPI 表必须落在只读页）
    + `PdataMatch::Init`（加载 sidecar）+ `Runtime::InitMinHook`；
-2. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 exe 目录；
+2. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
 3. `LoaderHooks::InstallAll()`：exe 域钩子。**`LoadDLL` 是必需项**（它失败会把本次已建的钩子全部回滚），
    `UnloadDLL` 是**可选项**（失败只放弃它一个，`LoadDLL` 照常留着——丢一个可选功能不等于丢全部）；
 4. `UiInject::Install()`：主菜单 UI 注入钩，失败静默降级；
@@ -240,13 +245,13 @@
 
 ### 2.4 插件模块的释放时机
 
-- `UnloadPluginByOwnerId` 与"未声明类别"的拒载路径都**只把句柄入队**（`g_pendingFreeModules`，
-  由 `g_pendingFreeMutex` 保护）；
+- `UnloadPluginByOwnerId`（GameCore 类别）**只把句柄入队**（`g_pendingFreeModules`，由 `g_pendingFreeMutex`
+  保护）。类别/ABI 不符的拒载不走这条：那种拒载发生在 `OnLoad` 之前，直接释放引用（§3.3）；
 - `LoaderCore::FreePendingPluginModules()` 在两个 detour 里调用：`UnloadDllDetour` 的
   `g_origUnloadDLL()` **之后**、`LoadDllDetour` 的 `g_origLoadDLL()` **之后**；
 - 于是"插件映像已释放、而它的 Lua 闭包还能被调用"这个前提不存在：gamecore 的 gameplay/ui Lua 环境
   是引擎卸载里拆的，闭包所在的 state 已经没了；
-- 代价与边界：拒载的 GameCore 模块会一直映射到下一次 Load/Unload；Global 插件本来就永不卸载。
+- 代价与边界：`OnLoad` 崩溃被隔离的 GameCore 模块会一直映射到下一次 Load/Unload；Global 插件本来就永不卸载。
 
 ### 2.5 锁与锁序
 
@@ -259,10 +264,13 @@
 | `g_captureMutex` | 站点上的捕获派发数据（`captureOuts`/`retiring`/`captureParamIndex`） | 最内层 |
 | `ImageAddress::g_mutex` | 映像登记（base/size/id） | 叶子 |
 | `g_scriptStateMutex` | ScriptGlobals 的两个注册表 | 叶子 |
+| `Civ6MessageBus::mtx_` | 消息总线的 handler 表 | 出锁后才 `Enter`/排空（总线 → lifecycle） |
+| `PluginInFlight::Owner::mtx` | `WaitAll` 的条件变量等待 | 等待时只持这一把 |
 | `g_pendingFreeMutex` | 待释放句柄队列 | 叶子 |
 | `g_detourDrainMutex` + `g_detourDrainCv` | 等 `g_activeSharedDetours` 归零 | **等待时不持任何其它锁** |
 
-固定顺序：`transition → lifecycle → pushState → MinHook → capture/ImageAddress`。
+固定顺序：`transition → lifecycle → pushState → MinHook → capture/ImageAddress`（消息总线自成一层：
+`mtx_ → lifecycle`，但它从不与站点锁嵌套）。
 凡是"插件代码可能被调用"的地方（`OnLoad`/`OnUnload`/回调/`WaitAll`）都必须**先放掉 lifecycle 锁**。
 
 ### 2.6 日志
@@ -273,7 +281,7 @@
   薄壳另有 `Civ6DllLoader_Shell.log`；
 - 排查时优先看的几行：`LoadDLL: ruleset=...`、`InstallAll: exe image=...`、
   `GameCore attached image=.. base=.. SizeOfImage=..`、`HookSite: installed hub stub ...`、
-  `ResetForReload: ...`、`RemoveGameCoreDomainSiteRecords: reset N site(s) in place (node kept), marked recordStale=M`、
+  `ResetForReload: ...`、`RemoveGameCoreDomainSiteRecords: reset N site(s) in place (MinHook record + trampoline released; node kept: stubs embed &HookSite), marked recordStale=M; ...`、
   `Plugin deactivated, module queued for free after engine GameCore unload`、
   `Plugin module freed after engine GameCore unload: <handle>`、`Plugin deactivated, module parked (kept mapped)`。
 
@@ -289,6 +297,8 @@
 按文件名去重，再用 `common/EnabledMods.*`（读 `Mods.sqlite` 的启用集）过滤：**路径必须落在某个启用 Mod
 的根下**，且**只认 SQL 返回的那个精确 mod root**（`AllowsPath` 不沿路径向上找 `.modinfo` 再放宽：
 外层 mod 目录即使包着某个启用 root，也不因此获得授权）。只比 GUID 不够：同一 GUID 可能有多份安装副本。
+例外是**锚本地**：位于锚模块自身 mod 根（`FindModRoot(锚目录)`）或锚目录之下的插件无条件放行
+（`FilterByEnabledMods` 的 `shellLocal`）——薄壳/开发期直接加载时仍要能加载自己那一份插件。
 
 类别判定（`Civ6DLLHookLoaderAPI.cpp:CategoryForPath`）：把路径规范化（全小写、`/`→`\`）后含
 `\plugins\global\` → `Global`，**其余一律 `GameCore`**。注意默认方向：放到预期之外的位置会被当成
@@ -300,13 +310,18 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 1. 拿 `g_gameCoreTransitionMutex` + `g_pluginLifecycleMutex`；
 2. `GetModuleHandleExW(UNCHANGED_REFCOUNT, path)` 先看模块是否已驻留；没有再 `LoadLibraryExW`,
-   用 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`。`ownsRef` 标记引用是否归本次调用；
+   用 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`。`ownsRef` 标记引用是否归本次调用。
+   这一步（以及紧接着的 `Civ6PluginKind` 调用）都在**不持 `g_pluginLifecycleMutex`** 时做：它们会执行
+   第三方 `DllMain`/插件导出，而那把锁是最常被重入的（插件回调、owner 探针都要它），持着它跑别人的代码
+   会把插件回调路径一起卡住甚至自死锁；`g_gameCoreTransitionMutex` 仍罩整个加载过程，所以不会被 teardown 穿插；
 3. 句柄重复（同一模块已在跟踪表里）→ 释放自己拿到的引用并返回 false；
 4. **类别门禁（在 OnLoad 之前）**：读插件的 `Civ6PluginKind` 导出（低 32 = kind；高 32 = apiVersion
    只进日志，由 `common/HookAPI.h` 自动发出）。缺导出（旧头文件编出来的插件）或 kind 与"安装路径
    推出的类别"不符 → 记日志 + 释放本次自己拿到的引用（`ownsRef`）后拒载；apiVersion **不参与**这里的
    判断，ABI 兼容性由插件侧 `HookAPI_IsCompatible`（版本 + `structSize`）决定。
-   **所有拒载都发生在 OnLoad 之前**：插件一行代码都没跑过，没有钩子/补丁/回调要回滚，`FreeLibrary` 永远安全；
+   **所有拒载都发生在 OnLoad 之前**：此时没有任何**经 Loader 账本**的钩子/补丁/回调需要回滚，`FreeLibrary`
+   只释放本次自己拿到的引用。注意这不等于「插件一行代码都没跑过」——`LoadLibraryExW` 已经执行过它的
+   `DllMain`/CRT 初始化，`Civ6PluginKind` 的调用也在 SEH 叶子里执行；那是信任边界，不是安全保证；
 5. 找 `OnLoad` 导出；缺失 → 拒载（释放引用）；
 6. 组装 `PluginEntry`（handle / path / stem 名 / `ownerId` = 规范化全路径 / category），
    `SetPluginState(Loading)`（同步 `PluginInFlight` 放行镜像）并 push 进 `g_plugins`；
@@ -583,7 +598,9 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 `ImageAddress` 是"进程里哪些 PE 映像可用 + 怎么把 RVA 换成实址"的唯一入口：
 
-- `HookImageId`：`1=ExeDx11`、`2=ExeDx12`、`3=GameCoreBase`、`4=GameCoreXP1`、`5=GameCoreXP2`；
+- `HookImageId`：`1=ExeDx11`、`2=ExeDx12`、`3=GameCoreBase`、`4=GameCoreXP1`、`5=GameCoreXP2`
+  （3/4 只是 ABI 里的取值：sidecar 容器只接受 1/2/5，也只有 EXPANSION_2 会走到 `AttachGameCore`，
+  所以这两个 id 运行期不可达）；
 - exe 在首次查询时按文件名自动识别（`CivilizationVI.exe` / `CivilizationVI_DX12.exe`）；
 - GameCore 由生命周期代码显式登记：`AttachGameCore(HMODULE)` / `DetachGameCore()` / `LoadedGameCore()`；
 - `Contains(image, addr)` / `GetInfo(image, out)`（id/base/sizeOfImage）/ `ResolveByRva(image, rva, span)`。
@@ -602,23 +619,32 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 - **容器 `C6SD`（只有 v1 一种，没有 v2/v3/v4 分支）**：32B 头 + `ModuleDesc[]`（64B/条，含 imageId/baseSizeOfImage/baseTimeDateStamp
   与各块偏移）+ 每模块 5 个数据块（pdata / 符号表 / vtable 槽 / 名字堆 / AOB），全部 8B 对齐；
 - **压缩信封 `C6XC`**：`b"C6XC" + algo(=1, LZMA1) + originalSize + .lzma 头 + 流`；裸 `C6SD` 直接透传。
-  LZMA1 参数（preset 9|EXTREME、dict 16MB、lc3/lp0/pb2）必须与 runtime 的解码端一致。
+  LZMA1 参数（preset 9|EXTREME、dict 16MB、lc3/lp0/pb2）由生成端固定；runtime 只把 `.lzma` 头的 5 字节
+  props 原样交给 `LzmaDecode`（`dest` 即字典，字典不会越界），但**解码前先校验**：props/字典合法、
+  信封 `originalSize` 与压缩流长度成合理比例、512MB 硬上限——畸形 sidecar 不会触发大分配，
+  `Init` 另有 `try/catch` 兜底。
 
 ### 7.3 PdataMatch（跨版本 RVA 矫正）
 
 游戏更新后 GameCore 的 RVA 会变，而符号库里存的是**旧 RVA**（配旧 pdata 签名）。`PdataMatch` 负责把
 `old_rva` 矫正成当前映像里的 `new_rva`：
 
-- `Init(runtimeModule)`：读 sidecar（文件 → 资源）→ 解信封 → 逐模块建上下文；
+- `Init(runtimeModule)`：读 sidecar（文件 → 资源）→ 解信封 → 逐模块建上下文。整段有 `try/catch` 兜底：
+  畸形 sidecar 触发的分配/解析异常只让本次加载失败，绝不逃出工作线程；
 - `BuildNewTable(imageId, target)`：解析目标映像的 `.pdata`（PE 异常目录），对每条算签名
-  （`(begin_rva, size, unwind_hash)`，`unwind_hash` 是 FNV-1a64）→ 与 sidecar 里的旧表比对：
-  **指纹一致 = 版本相同 → 恒等映射短路**（不做匹配）；否则走跨版本匹配；
-- 结果可按 `CorrectRva` / `CorrectByName` / `CorrectVTableByName` 查询；`Fingerprint(imageId)` 作为缓存键，
-  缓存在磁盘上（`LoadCache` / `SaveCache`），命中就省掉一次全量匹配；**命中后仍做一次抽样自校验**
-  （`ValidateCachedMap`：头/尾 + 最多 64 个等距条目必须满足"签名相等 ∨ 头 hash 相等 ∨ 该 old_rva 带 AOB"
-  三条不变量的并集），不通过就丢弃重算——缓存文件在游戏目录里、可被改写，这是 fail-closed 兜底；
-- `Init` 与 `BuildNewTable` 由一把专门的构建锁串行化（构建期会把模块数据 move 进进程级暂存 globals，
-  并发构建会互相搬错模块；查询路径只用 `g_mutex`，不受影响）；
+  （`(begin_rva, size, unwind_hash)`，`unwind_hash` 是 FNV-1a64），再按顺序判定：
+  ① `SizeOfImage` + `TimeDateStamp` 相同 = 同一构建 → 恒等映射；
+  ② 否则整表逐条 `(begin_rva, size, unwind_hash)` 相等（纯重建）→ 同样恒等映射；
+  ③ 两者都不同 → 跨版本匹配：磁盘缓存（`LoadCache` / `SaveCache`，键 =
+  新表指纹 + sidecar 指纹）→ 窗口哈希锚点 + LIS 锚点链 + 锚点间插值 → 头 hash 局部恢复（`normHeadHash`，
+  生成端「无 hash」写 0，历史文件写的 FNV 初值 `0xcbf29ce484222325` 一并视为无）→ 函数体 AOB 恢复 →
+  叶子 AOB 匹配 + vtable 槽位反推（结果并入同一张 `leafMap`）；
+- 缓存命中后按头/尾 + 最多 64 个等距条目做一次抽样自校验（`ValidateCachedMap`）。它只保证「结构上像
+  本次匹配的产出」（索引不越界、签名/头 hash/AOB 至少一条成立），**不是对缓存可信度的保证**：缓存文件
+  与 sidecar 同在游戏目录、权限相同，能改写它的人也能直接换掉 runtime；
+- `CorrectRva` / `CorrectByName` / `CorrectVTableByName` 只查表；构建期（vtable 反推）与运行期查询共用
+  同一份 `CorrectRvaInTables` 口径（二分 + 封顶 64 条回扫；只有 `size` 不变时才允许函数内偏移；
+  gap / 回扫耗尽退回 `leafMap`）；
 - 返回 0 / nullptr = 矫正失败（调用方按各自失败路径处理）。
 
 ### 7.4 取址入口与回退顺序
@@ -637,8 +663,10 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 - `Localization_FinalRelease.dll`：按**导出名**解析 `Lookup` / `PushArgument` / `String` 析构 / `toUTF8` 等；
   缺任何一个只降级对应包装（返回空串/nullptr），不影响其它功能；
-- `HavokScript_FinalRelease.dll`：解析约 40 个 `hksi_lua*` / `hks*` 导出，作为所有 `Lua*` 原语的实现；
-  **每次阶段 B 重新解析**（它跟着 GameCore 一起装卸）；缺导入 → Lua API 降级 + 停用 GameCore 插件加载。
+- `HavokScript_FinalRelease.dll`：解析约 40 个 `hksi_lua*` / `hks*` 导出，作为绝大多数 `Lua*` 原语的实现；
+  **每次阶段 B 重新解析**（模块本身是 exe 静态导入、常驻，重新解析的是导入地址）；缺导入 → Lua API
+  降级 + 停用 GameCore 插件加载。唯一的例外是 `LuaPushBoolean`：该 DLL 不导出任何 `pushboolean`，
+  实现是硬编码 `lua_State + 0x48` 的原始栈写入（`RawPushTValue`），换游戏版本必须重验该偏移。
 
 ### 7.6 工具链：`tools/symdb.py`（唯一入口）
 
@@ -674,6 +702,9 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 - `DllLoaderRuntime`：`ASMJIT_STATIC`（静态链接 asmjit）+ **`CIV6_HOOKAPI_BUILD_IMPL`**（声明"我是 loader 侧"，
   这样 `common/HookAPI.h` 的类别门禁不会 `#error`、也不会把成员名重命名）；
 - 两者都有 `_CRT_SECURE_NO_WARNINGS` / `_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS`；
+- 两个工程的 Release 都用静态 CRT（`MultiThreaded` = /MT），Debug 用 `MultiThreadedDebugDLL`（/MDd）。
+  因此 HookAPI 只允许传 POD/指针：**不能跨模块传 `std::` 容器或"谁分配谁释放"以外的堆内存**
+  （`LocCreate`/LocDestroy 这类成对接口就是按这条约束设计的）；
 - Debug 配置下会有既存的 `LNK4075` / `LNK4098` 警告，属正常。
 
 ### 8.2 third_party 与链接依赖
@@ -703,7 +734,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | `x64\<cfg>\Civ6DllLoader.runtime.dll`（改名 `version.dll`） | 游戏 exe 目录（`Base\Binaries\Win64Steam\` 或 `Win64\`） |
 | `x64\<cfg>\GameCore_XP2_Shell_FinalRelease.dll` + `Civ6DllLoader.runtime.dll` | 启用 Mod 的 `Binaries\Win64\` |
 | `DllLoaderRuntime\Civ6DllLoader.symdb.bin.xp` | 由 `symdb.py all` 直接部署（编进 runtime 的 RCDATA 102） |
-| `DllLoaderRuntime\Resources\Civ6DllLoader_FrontEndUI.{lua,xml}` | RCDATA 103/104，由 `UiInject::ExtractResources` 释放到 exe 目录 |
+| `DllLoaderRuntime\Resources\Civ6DllLoader_FrontEndUI.{lua,xml}` | RCDATA 103/104，由 `UiInject::ExtractResources` 释放到 `<exe 目录>\Civ6DllLoader\` |
 | `x64\<cfg>\Civ6DllLoader.runtime.dll` 的版本资源 | RCDATA **105**（`CIV6_DLL_LOADER_VERSION_RESOURCE_ID`）：安装/自更新只读它，不执行候选 DLL 的 `DllMain`/TLS/导出 |
 
 ---
@@ -715,7 +746,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | # | 现象 | 原因 / 机制 | 影响 | 状态 |
 |---|---|---|---|---|
 | 1 | 站点 stub 的 JIT 内存永不回收 | asmjit 的 `CodeHolder` 只能整块释放，做不到逐站点回收 | 每次 reinstall 累积几十字节虚拟内存，量级可忽略 | 接受。若将来站点数量爆炸，可把 stub 改成"每站点 `VirtualAlloc`/`VirtualFree`"，顺带去 asmjit 依赖 |
-| 2 | `recordStale` 重建时，可能把**旧映像**备份下来的字节写进**新映像**的同地址 | 旧记录只有 5 字节原始字节，不含版本信息 | 同版本 GameCore 完全一致；跨版本才可能写坏 | 接受（同一次游戏版本内 GameCore 布局稳定） |
+| 2 | `recordStale` 重建时的**旧映像字节写回**风险 | 旧 MinHook 记录里只有建记录时的前导字节副本，不含版本信息 | 重建前先比对当前前导字节与副本（`HookSite::prologueBackup`）：不一致就 poison 该站点、拒绝触碰记录（fail-closed） | 已加护栏（§5.7） |
 | 3 | Global 插件永不卸载 | 域模型：Global 钩的是常驻 exe | 插件静态状态跨对局、跨读档存活 | 约定：Global 插件的 `OnLoad` 必须幂等，不得假设"只执行一次" |
 | 4 | 插件自建线程 / 前端 Lua 闭包不受 loader 保护 | 这些不在 HookAPI 覆盖范围内 | 卸载瞬间的并发调用会踩空 | 文档告知；不做"线程登记"就无法根治 |
 | 5 | 域门只装在"换地址 / 给地址"这类入口 | 设计原则是**按目标地址授权**，不是限制插件行为 | 注册、回调类入口不设门 | 有意：边界靠"GameCore 专属入口 + 域规则"共同成立 |
@@ -772,6 +803,9 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
    并在实现里调用 `RequireGameCoreOwner`；
 3. 若它是"换地址 / 给地址"类：实现必须过 `IsTargetOpenToCaller` / `IsRangeOpenToCaller`；
 4. 在 `Civ6DLLHookLoaderAPI.cpp` 的 `Impl` 里实现，并**按顺序**填进 `g_hookApi` 的位置初始化表；
+   追加入口还必须同步 `common/HookAPI.h` 的 `CIV6_HOOK_API_ENTRY_COUNT`：`g_hookApi` 上方的两条
+   `static_assert`（`sizeof` + 末尾字段偏移）挡住「加了字段却没改计数/没补初始化」，
+   `VerifyHookApiTableProtection` 启动时还会扫描空项；
 5. 编译 loader 侧需要 `CIV6_HOOKAPI_BUILD_IMPL`（工程里已定义）；
 6. **不要**动已有字段的顺序，也不要改 `apiVersion`（见 10.4）。
 

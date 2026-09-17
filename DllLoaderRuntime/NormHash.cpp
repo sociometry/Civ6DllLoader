@@ -88,7 +88,7 @@ uint64_t NormalizedHeadHash(const uint8_t* code, size_t codeLen) {
         hde64s hs;
         const unsigned int len = hde64_disasm(buf + off, &hs);
         if (hs.flags & F_ERROR) break;                     // 解码失败 -> 停止
-        if (len == 0 || len > 15 || hs.len != len) break;  // 防御：长度异常 -> 停止
+        if (len == 0 || len > 15) break;                   // 长度异常 -> 停止（hde64 恒返回 hs.len）
         if (off + len > n) break;                          // 指令超界 -> 停止
         NormalizeInstruction(buf + off, hs);
         off += len;

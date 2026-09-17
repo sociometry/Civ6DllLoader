@@ -21,6 +21,43 @@ struct RuntimeCandidate {
     uint32_t version = 0;
 };
 
+// ---- 路径辅助：按需增长缓冲，绝不把 MAX_PATH 截断当成成功 ----
+// 这两个 API 的坑：GetModuleFileNameW 截断时返回缓冲区大小（不设 last error）；
+// GetFullPathNameW 缓冲区不足时返回**所需长度**（> 0）。只判 "> 0" 就会把截断/残缺内容
+// 当成功继续用（拼出的路径随即被 LoadLibraryExW 拿去加载）。这里统一改成"不够就翻倍重试"。
+constexpr DWORD kMaxPathChars = 32768;   // 与长路径上限对齐，纯防御
+
+bool GetModuleFileNameChecked(HMODULE module, std::wstring& out) {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD n = GetModuleFileNameW(module, buf.data(), static_cast<DWORD>(buf.size()));
+        if (n == 0) return false;
+        if (n < buf.size()) {
+            buf.resize(n);
+            out = std::move(buf);
+            return true;
+        }
+        if (buf.size() >= kMaxPathChars) return false;
+        buf.resize(buf.size() * 2, L'\0');
+    }
+}
+
+bool GetFullPathChecked(const std::wstring& path, std::wstring& out) {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD n = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buf.size()),
+            buf.data(), nullptr);
+        if (n == 0) return false;
+        if (n < buf.size()) {
+            buf.resize(n);
+            out = std::move(buf);
+            return true;
+        }
+        if (buf.size() >= kMaxPathChars) return false;
+        buf.resize(buf.size() * 2, L'\0');
+    }
+}
+
 HMODULE LoadModuleFromPath(const std::wstring& path) {
     return LoadLibraryExW(path.c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -34,10 +71,8 @@ bool BetterThan(const RuntimeCandidate& a, const RuntimeCandidate& b) {
 
 // Full path of the running process executable (e.g. ...\CivilizationVI.exe).
 std::wstring GetProcessExePath() {
-    wchar_t buf[MAX_PATH]{};
-    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return {};
-    return std::wstring(buf, n);
+    std::wstring path;
+    return GetModuleFileNameChecked(nullptr, path) ? path : std::wstring{};
 }
 
 }  // namespace
@@ -45,8 +80,8 @@ std::wstring GetProcessExePath() {
 HMODULE LoadRealGameCore() {
     // Prefer an already-mapped module (export forwarders often load it by basename).
     if (HMODULE existing = GetModuleHandleW(L"GameCore_XP2_FinalRelease.dll")) {
-        wchar_t path[MAX_PATH];
-        if (GetModuleFileNameW(existing, path, MAX_PATH) > 0) {
+        std::wstring path;
+        if (GetModuleFileNameChecked(existing, path)) {
             if (HMODULE bumped = LoadModuleFromPath(path)) {
                 return bumped;
             }
@@ -54,35 +89,25 @@ HMODULE LoadRealGameCore() {
     }
 
     // Resolve from CivilizationVI.exe dir: Base\Binaries\Win64Steam (or Win64) -> DLC\Expansion2\...
-    wchar_t exePath[MAX_PATH];
-    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
-        std::wstring dir(exePath);
-        const size_t slash = dir.find_last_of(L"\\/");
+    std::wstring exePath;
+    if (GetModuleFileNameChecked(nullptr, exePath)) {
+        const size_t slash = exePath.find_last_of(L"\\/");
         if (slash != std::wstring::npos) {
-            dir.resize(slash);
+            const std::wstring dir = exePath.substr(0, slash);
             const std::wstring candidate =
                 dir + L"\\..\\..\\..\\DLC\\Expansion2\\Binaries\\Win64\\GameCore_XP2_FinalRelease.dll";
-            wchar_t full[MAX_PATH];
-            if (GetFullPathNameW(candidate.c_str(), MAX_PATH, full, nullptr) > 0) {
+            std::wstring full;
+            if (GetFullPathChecked(candidate, full)) {
                 if (HMODULE gameCore = LoadModuleFromPath(full)) {
                     return gameCore;
                 }
-                Logger::Log("LoadRealGameCore absolute failed: %ls (err=%lu)", full, GetLastError());
+                Logger::Log("LoadRealGameCore absolute failed: %ls (err=%lu)", full.c_str(), GetLastError());
             }
         }
     }
 
-    // Legacy CWD-relative fallback (works when cwd is game Win64).
-    wchar_t legacyFull[MAX_PATH]{};
-    HMODULE gameCore = nullptr;
-    if (GetFullPathNameW(L"../../../DLC/Expansion2/Binaries/Win64/GameCore_XP2_FinalRelease.dll",
-            MAX_PATH, legacyFull, nullptr) > 0) {
-        gameCore = LoadModuleFromPath(legacyFull);
-    }
-    if (!gameCore) {
-        Logger::Log("Failed to load real GameCore_XP2_FinalRelease.dll (err=%lu)", GetLastError());
-    }
-    return gameCore;
+    Logger::Log("Failed to load real GameCore_XP2_FinalRelease.dll (err=%lu)", GetLastError());
+    return nullptr;
 }
 
 bool InstallLoaderIfMissing(HMODULE shellModule) {
@@ -111,9 +136,11 @@ bool InstallLoaderIfMissing(HMODULE shellModule) {
         return s_installed;
     }
 
-    // c. Collect candidates from enabled mods (ModScan applies the EnabledMods
-    //    filter internally), probe versions, elect the highest
-    //    (tie -> lexicographically smaller path).
+    // c. Collect candidates from the scan roots (game root / Documents Mods / Workshop) plus the
+    //    loader's own directory. FindRuntimeCandidates deliberately does NOT filter by
+    //    mod-enabled state - installation elects by version only (RCDATA 105), which is a
+    //    separate path from "plugins load only from enabled mods". Probe versions, elect the
+    //    highest (tie -> lexicographically smaller path).
     const auto paths = ModScan::FindRuntimeCandidates(shellModule);
     Logger::Log("InstallLoaderIfMissing: found %zu runtime candidate(s)", paths.size());
 

@@ -8,6 +8,7 @@ namespace NormHash {
     uint64_t Fnv1a64(const uint8_t* data, size_t len);
 
     // 归一化函数头哈希：对函数头字节做 x86-64 归一化后取前 16 字节算 FNV-1a 64
-    // code: 函数头字节指针；codeLen: 字节数（调用方保证 = min(size, 32)）
+    // code: 函数头字节指针；codeLen: 字节数（PdataMatch 传 min(SizeOfProlog, 32)）。
+    // 跨版本比较的前提是两边 SizeOfProlog 相同；sidecar 里的 normHeadHash 也按该口径生成。
     uint64_t NormalizedHeadHash(const uint8_t* code, size_t codeLen);
 }

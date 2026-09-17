@@ -101,16 +101,15 @@ namespace hks {
 	typedef int(__cdecl* hksi_lua_gethookcountType)(lua_State*);
 	extern hksi_lua_gethookcountType gethookcount;
 
-	// 官方导出优先的 pushboolean/pushlightuserdata（缺失时 HavokScript.cpp 内部走
-	// 带防护的原始栈写入兜底，不对外暴露）。
-	typedef void(__cdecl* hksi_lua_pushbooleanType)(lua_State*, int);
+	// pushlightuserdata：官方导出优先，缺失时 HavokScript.cpp 内部走带防护的原始栈写入兜底。
+	// pushboolean：该 DLL 没有对应导出，唯一实现就是原始栈写入（细节见 HavokScript.cpp）。
 	typedef void(__cdecl* hksi_lua_pushlightuserdataType)(lua_State*, void*);
 
 	extern int checkplayerid(lua_State*, int);
 	extern void pushboolean(lua_State* L, bool value);
 	extern void pushlightuserdata(lua_State* L, void* ptr);
 
-	// Should only ever be called once. false = HavokScript 模块缺失或有导入未解析，
-	// 调用方应停用依赖 Lua API 的插件加载。
+	// 每次阶段 B 重新解析（模块常驻，重新解析的是导入地址），可重复调用。
+	// false = HavokScript 模块缺失或有导入未解析，调用方应停用依赖 Lua API 的插件加载。
 	extern bool InitHavokScript();
 }
