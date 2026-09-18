@@ -4,6 +4,14 @@ Civilization VI DLL hook loader: thin GameCore shell + versioned runtime + HookA
 
 This repository contains **loader infrastructure only**. Plugin examples live in a separate repo (`Civ6DllLoader-Examples`).
 
+## 代码阅读与审查
+
+- [代码阅读指南](docs/CODE_READING_GUIDE.md)：按启动、生命周期、Hook、地址解析和发布流程精读，附源码导航与所有权说明。
+- [2026-09-18 代码审查报告](docs/CODE_REVIEW_2026-09-18.md)：已复现缺陷、静态发现、旧文档差异、构建结果和待验证清单。
+- [既有架构文档](docs/ARCHITECTURE.md)：保留作背景参考；与当前实现不一致的部分已在审查报告中列出。
+
+审查针对该日期的工作区快照（含当时的暂存修改），不表示后续版本已修复所列问题。
+
 ## Layout
 
 ```text

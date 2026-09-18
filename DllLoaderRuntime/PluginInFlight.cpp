@@ -17,6 +17,16 @@ namespace {
 // 用 Owner* 做键线性扫描：插件数只有个位数，比宽字符串哈希快，且不产生分配。
 thread_local std::vector<std::pair<const Owner*, uint32_t>> g_depth;
 
+struct Registry {
+    std::mutex mutex;
+    std::unordered_map<std::wstring, Owner*> current;
+};
+
+Registry& Owners() {
+    static Registry registry;
+    return registry;
+}
+
 // 在本线程 depth 表里找该 owner 的槽位；没有返回 -1。
 int FindDepthSlot(const Owner* o) {
     for (size_t i = 0; i < g_depth.size(); ++i) {
@@ -70,22 +80,31 @@ void ReleaseCount(Owner* o, Kind kind) {
 
 Owner* Resolve(const std::wstring& owner) {
     if (owner.empty()) return nullptr;
-    // 函数内 static：首次调用时构造，进程退出时由 CRT 析构。
-    static std::mutex s_mtx;
-    static std::unordered_map<std::wstring, Owner*> s_owners;
-    std::lock_guard<std::mutex> lk(s_mtx);
-    auto it = s_owners.find(owner);
-    if (it != s_owners.end()) return it->second;
-    // 条目常驻不删：删条目会引入“某线程刚查到 owner、还没真正 Enter，条目就被
-    // 删掉并重建”的竞态（那一瞬间的计数落在旧对象上，等待者看不到）。条目数
-    // = 插件数，常驻的内存代价可以忽略。
+    auto& registry = Owners();
+    std::lock_guard<std::mutex> lk(registry.mutex);
+    auto it = registry.current.find(owner);
+    if (it != registry.current.end()) return it->second;
     Owner* o = new Owner();
-    s_owners.emplace(owner, o);
+    registry.current.emplace(owner, o);
     return o;
 }
 
+Owner* BeginLifetime(const std::wstring& owner) {
+    if (owner.empty()) return nullptr;
+    auto& registry = Owners();
+    std::lock_guard<std::mutex> lk(registry.mutex);
+    Owner*& current = registry.current[owner];
+    Owner* next = new Owner();
+    next->allowed.store(false, std::memory_order_relaxed);
+    if (current) SetAllowed(current, false);
+    // 旧对象不能删除或重新放行：消息/注册表的锁外快照可能还握着它。
+    current = next;
+    return next;
+}
+
 void SetAllowed(Owner* o, bool allowed) {
-    if (o) o->allowed.store(allowed, std::memory_order_release);
+    // 与 Enter 的加计数/读门禁及 WaitAll 的读计数建立同一个全序，避免双方都读到旧值。
+    if (o) o->allowed.store(allowed, std::memory_order_seq_cst);
 }
 
 uint32_t LocalDepth(const Owner* o) {
@@ -117,7 +136,7 @@ void WaitAll(Owner* o, const wchar_t* ownerName) {
     // 不会自等（自己等自己永远等不到）。
     const uint32_t local = LocalDepth(o);
     std::unique_lock<std::mutex> lk(o->mtx);
-    auto ready = [&] { return o->activeCalls.load(std::memory_order_acquire) <= local; };
+    auto ready = [&] { return o->activeCalls.load(std::memory_order_seq_cst) <= local; };
     int warns = 0;
     while (!o->cv.wait_for(lk, std::chrono::seconds(5), ready)) {
         if (warns == 0 || warns % 6 == 0) {
@@ -171,9 +190,9 @@ void Guard::Release() {
 // 看不到这次在途，照样 UAF。
 Guard Enter(Owner* o, Kind kind) {
     if (!o) return Guard();
-    o->activeCalls.fetch_add(1, std::memory_order_acq_rel);
+    o->activeCalls.fetch_add(1, std::memory_order_seq_cst);
     o->byKind[(uint32_t)kind].fetch_add(1, std::memory_order_relaxed);
-    if (!o->allowed.load(std::memory_order_acquire)) {
+    if (!o->allowed.load(std::memory_order_seq_cst)) {
         ReleaseCount(o, kind);   // 回退；此时还没进 depth
         return Guard();
     }

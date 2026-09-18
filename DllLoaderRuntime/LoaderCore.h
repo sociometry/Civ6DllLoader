@@ -52,7 +52,7 @@ void* ResolveExeTarget(const HookInfoExe& info, size_t span = 1);
 void LoadPluginsOf(PluginCategory cat);
 void UnloadPluginsOf(PluginCategory cat);
 
-// 引擎卸完 GameCore 之后调用（LoadDLL / UnloadDLL detour 在调到原函数之后）：真正
+// 仅在 UnloadDLL 原函数返回且确认引擎模块槽从非空变空后调用：真正
 // FreeLibrary 那些在 ResetForReload 里排队的 GameCore 插件模块。见实现处的时机说明。
 void FreePendingPluginModules();
 
@@ -67,11 +67,11 @@ bool LoadSinglePlugin(const std::wstring& path);   // 已加载返回 false
 bool InitializeGameCorePhase();
 
 // GameCore 重载循环：IsInitialized = 阶段 B 是否已完成；
-// ResetForReload = 卸载全部 GameCore 插件 + 复位初始化标志（再次进入 LoadDLL detour 时调用）。
+// ResetForReload = 卸载全部 GameCore 插件 + 复位初始化标志（引擎 UnloadDLL 之前调用）。
 bool IsInitialized();
 void ResetForReload();
 
-// teardown 窗口的清零点：LoaderHooks 的两个 detour 在引擎原函数返回后调用（§2.2/§2.3）。
+// teardown 窗口的清零点：UnloadDLL 原函数返回且确认模块槽从非空变空后调用。
 // 不要在 ResetForReload 内部提前清：窗口是"旧映像区间"，必须活到引擎真正换映像那一步，
 // 否则仍映射着的旧映像会重新对 Global 插件变成可钩的已加载模块。
 void ClearGameCoreTeardownWindow();

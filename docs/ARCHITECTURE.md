@@ -1,7 +1,7 @@
 # Civ6DllLoader 架构总览
 
-- 状态：**当前有效**（对齐 HEAD 的历次重构之后：kind 门禁、域门正面规则、teardown 物理摘挂钩记录、
-  站点原地复位、插件释放延后、tools 单入口化）。最后校订：2026-09-17。
+- 状态：**当前有效**（对齐插件类别导出、休眠门禁、侧载解析和自更新修复，并合并生命周期修复：
+  teardown 保留跳板、延后释放插件、回调加载代隔离）。最后校订：2026-09-18。
 - 适用版本：预发布 `1.0.0`（`common/LoaderVersion.h`），插件 ABI `CIV6_HOOK_API_VERSION = 1`。
 - 这份文档是**唯一权威的架构说明**；逆向取证类材料（原始反汇编/字节/映射表）在 `docs/analysis/`，
   本文在需要处引用它们。历史设计文档已删除。
@@ -22,9 +22,8 @@
    与 `GameCore`（随对局加载/卸载、只许动**当前 GameCore 映像**）。这条同时由编译期、加载期、
    运行期三层保证（§3.5、§4）。
 2. **站点表是唯一的挂钩账本**：同一个目标地址只挂一次 MinHook，挂到 Loader 自己生成的 stub；
-   站点、stub、capture 订阅都记账在 `g_hookSites` 里。日常退役只"拔插槽"，**只有 GameCore teardown
-   才会物理摘除 MinHook 记录/跳板**（§5）；**站点节点与 stub 一律不释放**（stub 的机器码里内嵌了
-   `&HookSite`，teardown 只把节点原地复位以便下次复用）。
+   站点、stub、capture 订阅都记账在 `g_hookSites` 里。日常退役只"拔插槽"；GameCore teardown
+   停用入口，但已发布的节点、stub 与跳板保留到进程退出（§5）。
 3. **释放顺序**：摘钩（还原入口字节）→ 卸载插件（OnUnload / 回滚补丁 / 注销回调）→ 交给引擎
    `UnloadDLL` 卸掉 GameCore（连同它的 Lua 环境）→ **之后**才 `FreeLibrary` 插件模块（§2.4）。
 
@@ -152,9 +151,9 @@
 
 1. `LoaderCore::InitEarly()`：`Logger::Init` + `VerifyHookApiTableProtection`（HookAPI 表必须落在只读页）
    + `PdataMatch::Init`（加载 sidecar）+ `Runtime::InitMinHook`；
-2. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
-3. `LoaderHooks::InstallAll()`：exe 域钩子。**`LoadDLL` 是必需项**（它失败会把本次已建的钩子全部回滚），
-   `UnloadDLL` 是**可选项**（失败只放弃它一个，`LoadDLL` 照常留着——丢一个可选功能不等于丢全部）；
+2. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 exe 目录；
+3. `LoaderHooks::InstallAll()`：`LoadDLL`、`UnloadDLL` 均为必需项。在入口被改写前解析并缓存
+   `hModule` 数据槽，两个 original 都准备好后批量启用；失败回滚本次安装；
 4. `UiInject::Install()`：主菜单 UI 注入钩，失败静默降级；
 5. `LoaderUpdate::CheckAndApplyUpdate()`：runtime 级自更新检查（薄壳之外的第二道）；
 6. `LoaderCore::LoadPluginsOf(PluginCategory::Global)`：扫描并加载 **Global 插件**。
@@ -173,7 +172,7 @@
 `LoaderHooks::InstallAll()` 与 `UiInject::Install()` 都在阶段 A（那条一次性线程里）装钩子；两者失败都只
 记日志。`LoadUI` 的钩子归 `UiInject::Install()` 管，和 `LoadDLL`/`UnloadDLL` 是两套独立的事务。
 
-> 顺序上的一个细节：`InstallAll()` 排在自更新检查**之前**，所以日志里会先看到 "LoadDLL hook installed"，
+> 顺序上的一个细节：`InstallAll()` 排在自更新检查**之前**，所以日志里会先看到 "LoadDLL + UnloadDLL installed"，
 > 再看到 "LoaderUpdate: ..."。**不要**按这个顺序推断成"自更新只在下一次启动才装钩子"。
 
 ---
@@ -193,65 +192,39 @@
 
 ### 2.2 LoadDLL / UnloadDLL 的编排（`LoaderHooks.cpp`）
 
-`LoadDllDetour`：
+`LoadDllDetour` 先检查 XP2 规则集和加载路径，再调用原函数。若当前阶段已初始化，重复加载保持
+现有插件；若没有尚未完成的卸载，且缓存的 `hModule` 槽确认模块已加载，才初始化 GameCore 阶段
+并加载插件。LoadDLL 返回不代表发生过卸载，不能据此释放插件。
 
-1. `GetRuleSetName()` 为空 → 还没进游戏，原样透传；非 `EXPANSION_2` → 透传（只支持 XP2）；
-2. 把入参（Mod 顶替 `GameCores` 后引擎请求的**薄壳**路径）**改写成官方 GameCore 的绝对路径**
-   （`OfficialGameCoreRelPath` 给官方相对路径、`BuildOfficialPath` 拼到游戏根下；官方文件不存在才
-   透传原路径）。方向别记反：**引擎槽位=官方**，薄壳只在 Loader 缺席、没有这个 detour 时才被加载；
-3. 若 `IsInitialized()` 仍为真（说明 `UnloadDLL` 钩子没生效 / 没清场）→ 先 `ResetForReload()` 兜底；
-4. 调原函数 `g_origLoadDLL(target)`；
-5. `ClearGameCoreTeardownWindow()`：**引擎这一步才真正换映像**，旧的 teardown 窗口（旧映像区间）
-   到此失效——提前清会让仍映射着的旧映像重新对 Global 插件变成"可钩的已加载模块"（§2.3 第 9 步）；
-6. `FreePendingPluginModules()`：这次调用可能顺带卸掉了旧的 GameCore，排队中的插件模块此刻才释放；
-7. 成功 → `InitializeGameCorePhase()` + `LoadPluginsOf(GameCore)`；失败 → 区分"幂等短路"（读 exe 的
-   `hModule` 槽判断模块是否已加载）与真失败，只记日志。
+`UnloadDllDetour` 读取卸载前的 `hModule`，先执行 `ResetForReload()`，再调用引擎原函数。
+只有确认槽位从非空变为空，才清除 teardown 地址保护窗口并调用 `FreePendingPluginModules()`。
+卸载未完成时保留窗口与插件映像，并阻止新一轮插件初始化。Load/Unload 编排沿用引擎游戏线程的调用约定。
 
-`UnloadDllDetour`：
+### 2.3 ResetForReload 的完整顺序
 
-1. `IsInitialized()` → `ResetForReload()`（清理 + 把 GameCore 插件模块**入队**）；
-2. 调原函数 `g_origUnloadDLL()`——**引擎在这里卸掉 GameCore 映像连同它的 gameplay/ui Lua 环境**；
-3. `ClearGameCoreTeardownWindow()`：映像已经没了，teardown 窗口可以清（§2.3 第 9 步）；
-4. `FreePendingPluginModules()`：真正 `FreeLibrary` 那些插件模块。
+1. 持阶段切换锁与生命周期锁，清除 ready 标志并记录待拆除的 GameCore 地址区间；
+2. 放掉生命周期锁，将 GameCore 域站点批量停用；逐项确认结果，重试批处理未完成的项。
+   不可读或停用失败的站点禁止后续复用；
+3. 清理该域的 capture 订阅，卸载 GameCore 插件（停用并排空回调、OnUnload、回滚补丁、注销注册项）；
+   插件模块句柄仅入队，暂不 FreeLibrary；
+4. `ParkGameCoreDomainSites()` detach 映像，释放生命周期锁等待已进入的共享 detour，再复位
+   ScriptData / UI / PushMethods 状态。保留所有已发布的节点、stub 和 MinHook 跳板；
+5. 返回引擎的原卸载函数；确认模块槽位从非空变为空后，在生命周期锁内清除 teardown 窗口，再释放插件。
 
-### 2.3 ResetForReload 的完整顺序（每一步的位置都有理由）
+保护窗口必须跨越 `ResetForReload()` 返回到原卸载函数结束这一段；否则 detach 后仍映射着的旧
+GameCore 会重新被当作 Global 插件可修改的普通模块。重复 LoadDLL 和失败的 UnloadDLL 都不清窗口。
 
-1. 拿 `g_gameCoreTransitionMutex` + `g_pluginLifecycleMutex`；
-2. `g_gameCorePhaseReady = false`（此后 `EnsureScriptHooksInstalled` 等入口会自行早退）；
-3. 进入 teardown 窗口（写 `g_gameCoreTeardownAddress/SizeOfImage`；`ImageAddress` 仍 attach）；
-4. 放掉 lifecycle 锁（下面要等回调、要加载/卸载插件，持锁等会锁反转）；
-5. `DisableGameCoreDomainSites()`：趁旧映像仍映射，把 GameCore 域**全部已挂钩站点**
-   `MH_QueueDisableHook` 后**一次** `MH_ApplyQueued` → 所有入口字节还原、不会再有人进入 stub 或插件 detour。
-   不可读的目标（映像已经没了的兜底路径）不排队，改打 `recordStale`；
-6. `CleanupAllCaptureSites()`：只清**落在 GameCore 域内**的捕获订阅，exe / 常驻模块域上的保留；
-7. `UnloadPluginsOf(PluginCategory::GameCore)`：逐个插件走卸载流程（§3.3），GameCore 的模块句柄**只入队**；
-8. 重新拿 lifecycle 锁；
-9. `RemoveGameCoreDomainSiteRecords()`：进 teardown 窗口（在 `RemoveGameCoreDomainSiteRecords` 内部，
-   此时 `ResetForReload` 第 3 步已经写过一次）+ `ImageAddress::DetachGameCore()` → 放锁
-   **排空在途共享 detour**（`g_activeSharedDetours` 归零）→ 重锁，**重扫站点表**摘记录：
-   成功即 `MH_RemoveHook` + **把站点原地复位**（节点/stub 保留并复用，**绝不 erase**——stub 内嵌
-   `&HookSite`；复位包括清空 capture 槽）；失败则打 `recordStale` 并拔掉 detour 槽。最后复位
-   `g_origRegisterScriptData(/ForUI)`、16 个 PushMethods 槽位。**teardown 窗口不在这里清**：
-   它要活到引擎真正换映像那一步（两个 detour 调完原函数再 `ClearGameCoreTeardownWindow()`）；
-10. 回到 detour，调 `g_origUnloadDLL()`，然后 `FreePendingPluginModules()`（见 §2.4）。
-
-为什么是这个顺序：
-
-- **第 5 步必须在第 7 步之前**：入口字节还原之后才谈得上"Free 插件不会留下入口跳向已释放代码的窗口"；
-- **第 9 步重扫而不是沿用第 5 步的地址列表**：第 5～9 步之间还跑过插件卸载，而 `PushLuaMethods` 这类
-  注册入口按设计不过域门，理论上仍可能往正在拆除的映像上装钩——重扫能一并收掉；
-- **不再需要"补丁区间清账"**：唯一的补丁来源是插件的 `PatchImpl`，它已过正面域规则（§4.1），
-  拆映像时不可能存在落在旧映像区间里的记录。
+共享 detour 的计数不包含仍在 JIT stub、capture 或插件 detour 里的线程，因此计数归零不能作为
+释放站点或跳板的依据。GameCore 自身映像的执行结束仍由引擎保证，插件自建线程由插件负责停止。
 
 ### 2.4 插件模块的释放时机
 
-- `UnloadPluginByOwnerId`（GameCore 类别）**只把句柄入队**（`g_pendingFreeModules`，由 `g_pendingFreeMutex`
-  保护）。类别/ABI 不符的拒载不走这条：那种拒载发生在 `OnLoad` 之前，直接释放引用（§3.3）；
-- `LoaderCore::FreePendingPluginModules()` 在两个 detour 里调用：`UnloadDllDetour` 的
-  `g_origUnloadDLL()` **之后**、`LoadDllDetour` 的 `g_origLoadDLL()` **之后**；
-- 于是"插件映像已释放、而它的 Lua 闭包还能被调用"这个前提不存在：gamecore 的 gameplay/ui Lua 环境
-  是引擎卸载里拆的，闭包所在的 state 已经没了；
-- 代价与边界：`OnLoad` 崩溃被隔离的 GameCore 模块会一直映射到下一次 Load/Unload；Global 插件本来就永不卸载。
+GameCore 插件正常卸载或 OnLoad 异常隔离后，句柄先进入 `g_pendingFreeModules`。只有 `UnloadDllDetour` 在原函数
+返回后确认 `hModule` 从非空变为空，才在 Loader 锁外调用 FreeLibrary。空操作、卸载失败、重复
+LoadDLL 均不会清空队列；Lua 环境结束前插件映像保持有效。Global 插件保持常驻。
+
+类别导出或入口检查在 OnLoad 之前拒载时，直接释放本次持有的模块引用。排队释放后，隔离条目里
+对应的旧句柄清零，但保留按路径的隔离记录，避免同基址复用误命中，也不自动重试崩溃插件。
 
 ### 2.5 锁与锁序
 
@@ -281,7 +254,7 @@
   薄壳另有 `Civ6DllLoader_Shell.log`；
 - 排查时优先看的几行：`LoadDLL: ruleset=...`、`InstallAll: exe image=...`、
   `GameCore attached image=.. base=.. SizeOfImage=..`、`HookSite: installed hub stub ...`、
-  `ResetForReload: ...`、`RemoveGameCoreDomainSiteRecords: reset N site(s) in place (MinHook record + trampoline released; node kept: stubs embed &HookSite), marked recordStale=M; ...`、
+  `ResetForReload: ...`、`ParkGameCoreDomainSites: retained N site(s)`、
   `Plugin deactivated, module queued for free after engine GameCore unload`、
   `Plugin module freed after engine GameCore unload: <handle>`、`Plugin deactivated, module parked (kept mapped)`。
 
@@ -458,8 +431,9 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 - **capture 槽**：`hasCapture` / `captureParamIndex` / `captureOuts`（同一地址 1 个 detour + N 个捕获订阅共存）；
 - **MinHook 侧**：`stubCode` / `minhookTrampoline` / `hookInstalled`。
 
-`nextTarget` 是 stub 的尾跳目标（有 detour 时=detour，否则=跳板）；`recordStale` 表示"上一次 teardown
-没能摘掉这条 MinHook 记录"（下次同地址取站时强制重建）。
+`nextTarget` 是原子尾跳目标（detour 或跳板）：先写 original 槽，再以 release 发布 detour，
+x64 stub 用对齐 MOV 读取。`hookInstalled` 表示记录存在，`hookEnabled` 表示入口启用，
+`reuseBlocked` 表示不再允许复用该地址的旧记录。
 
 ### 5.2 stub（loader 生成的中转代码）
 
@@ -513,27 +487,19 @@ stub 的慢路径把第 `paramIndex` 个寄存器参数写到所有 `out`。
 用的同一入口：detourOwner 恒空、同一 detour 幂等、与插件 detour 双向互斥。
 Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过站点表，直接 `MH_CreateHook`。
 
-### 5.6 退役、摘除与 teardown
+### 5.6 退役与 teardown
 
-- **拔槽**（插件卸载）：`RetireHookSiteDetoursForOwnerLocked(owner)`——只把 `activeDetour` 清空、
-  `nextTarget` 回落到跳板。插件代码马上要被 `FreeLibrary`，所以必须先让 stub 不再指向它；
-- **摘除**（GameCore teardown）：`RemoveHookSiteRecordLocked` 的 a→b→c：
-  a) `MH_DisableHook`（**失败就整体放弃**——此时入口字节没还原，若把 nextTarget 指向 target，
-  入口仍跳 stub、stub 又跳 target，会打转）；b) `nextTarget = target`（在途调用改走原函数）；
-  c) `MH_RemoveHook`（释放跳板）；然后清站点记账；
-- **teardown 两阶段**（§2.3 第 5、9 步）：先"批量停用"（一次 `ApplyQueued` 还原全部入口字节），
-  排空在途共享 detour，再重扫站点表"摘记录 + 原地复位站点"（**不 erase 节点**：stub 的机器码里
-  永久内嵌 `&HookSite`，而"没有调用者停在 stub 内"无法证明）；摘不掉的打 `recordStale`，
-  下次同地址取站强制重建。
+插件卸载时只拔掉 detour/capture 槽，GameCore teardown 额外恢复入口字节。已发布的节点、stub 和
+MinHook 跳板均不释放，以保护停在 stub 中或已经保存 original 的调用者。
 
-### 5.7 不变量与已知残留
+同址重载时比较原始前导字节（32 字节，若前方 5 字节可读则包括 hotpatch 区），完全一致才重新
+启用保留的 MinHook 记录。字节不一致、读取失败或之前停用失败时拒绝复用，不用旧备份覆盖新代码。
+尚未启用过的安装失败项可以回滚并删除。
 
-| 项 | 现状 | 说明 |
-|---|---|---|
-| 站点 / stub 一律不释放 | **硬约束** | teardown 只摘 MinHook 记录 + 原地复位站点；节点与 stub 保留并复用（stub 内嵌 `&HookSite`，erase 会让在途线程读到已释放 map 节点） |
-| stub 的 JIT 内存 | **回收不了** | asmjit 只能整体 release，且多 stub 共用块。站点复用后"每代新建 stub"的累积**已消失**（每个地址最多一块 stub）；要彻底回收需改成自建 `VirtualAlloc`/`VirtualFree`（顺带可去掉 asmjit 依赖）——**未做** |
-| `recordStale` 重建 | 保留 + 已加护栏 | 重建前先比对目标当前前导字节与建记录时的副本（`HookSite::prologueBackup`）：**不一致就 poison 该站点、拒绝触碰 MinHook 记录**（fail-closed），避免把旧映像的字节写进当前映像；一致时才 `MH_DisableHook`/`MH_RemoveHook` |
-| 换基址重载 | 站点复用 | teardown 原地复位站点（`hookInstalled=false`，stub 与 `prologueBackup` 保留待重建）；只有"摘不掉"的残留会留下 `recordStale`（或 poison） |
+### 5.7 保留资源的代价
+
+每个不同的目标地址保留一个节点、stub 与 MinHook 跳板。同址且字节匹配的重载复用旧记录；
+换基址或新增目标会增加进程生命周期内的内存占用。只有证明所有执行路径静止后，才可另行设计回收。
 
 ---
 
@@ -541,21 +507,24 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 ### 6.1 PluginInFlight（在途登记与排空）
 
-`PluginInFlight::Owner`：owner 的放行镜像 + 在途计数；`SetAllowed` 是镜像的**唯一写者**（只由
-`SetPluginState` 调用）。守卫入口用 `Enter(owner, kind)`（先增量再检查、失败回滚）与 `ReleaseCount`；
-卸载/隔离用 `WaitAll(owner, name)`：谓词是「本 owner 的在途计数 ≤ 本线程自己的深度」，5 秒未满足就
-限次记日志但**继续等**（不放弃）。
+每次加载由 `BeginLifetime(owner)` 分配独立的 `Owner`，`PluginEntry` 和回调快照保存该指针。
+旧 Owner 永久停用并保留；同名插件重载不会重新放行旧快照。`SetPluginState` 更新当前代的门禁。
 
-被它守卫的入口：消息 handler、`RegisterScriptGlobals`（含 UI）、`GameEvent` 触发、`PushLuaMethods` 推送。
-**不**被它守卫的：插件 detour（靠 teardown 顺序保证）、以及已经交给引擎的 Lua 函数指针。
+`Enter` 先增计数再检查门禁，`SetAllowed`、入场检查与 `WaitAll` 使用顺序一致的原子操作。
+`WaitAll` 等到计数不超过当前线程自身的嵌套深度，避免自注销死锁；超时仅记日志，继续等待。
+回调内注销返回不表示当前回调已退出，不能立即释放当前调用链依赖的外部状态。
+
+覆盖消息、ScriptGlobals、GameEvent，以及完整的 PushLuaMethod 注入调用；不覆盖任意签名的插件
+detour、自建线程或引擎调用的 Lua 函数指针。
 
 ### 6.2 消息总线（`Civ6MessageBus`）
 
-按 owner 注册 handler、`Broadcast`、`SendMessageTo`、`UnregisterOwner`；handler 调用走
-`PluginInFlight::Enter`（owner 已停用则直接跳过）；注销在锁外 `WaitAll`。
-总线**没有** Loader 自己的处理器，也没有"按名字注销单个 handler"的入口：v1 的 `load-plugin`
-消息入口（任何插件都能让 Loader 去 `LoadLibrary` 任意路径并调其 `OnLoad`，绕过启用集过滤）
-已连同 `InitializeLoader` 一起删除，插件只能经 `LoaderCore::LoadSinglePlugin` 的扫描路径加载。
+每个 handler entry 除了插件代的 Owner，还有独立的门禁与计数。覆盖和 `UnregisterOwner` 先在总线锁内
+停用旧 entry，再在锁外排空该 entry；旧广播快照因此不会在同名重新注册后执行，也不会误等新 handler。
+调用快照持有 shared_ptr，保证 entry 及其计数存活。已删除的 `UnregisterHandler` / `Clear` 及任意路径
+加载插件的旧 Loader handler 不恢复。
+
+插件注册在总线锁内复查 owner、加载代及状态；卸载或跨代重载发生后，旧的待发布注册会被拒绝。
 
 ### 6.3 ScriptGlobals（+ ForUI）
 
@@ -745,12 +714,12 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 | # | 现象 | 原因 / 机制 | 影响 | 状态 |
 |---|---|---|---|---|
-| 1 | 站点 stub 的 JIT 内存永不回收 | asmjit 的 `CodeHolder` 只能整块释放，做不到逐站点回收 | 每次 reinstall 累积几十字节虚拟内存，量级可忽略 | 接受。若将来站点数量爆炸，可把 stub 改成"每站点 `VirtualAlloc`/`VirtualFree`"，顺带去 asmjit 依赖 |
-| 2 | `recordStale` 重建时的**旧映像字节写回**风险 | 旧 MinHook 记录里只有建记录时的前导字节副本，不含版本信息 | 重建前先比对当前前导字节与副本（`HookSite::prologueBackup`）：不一致就 poison 该站点、拒绝触碰记录（fail-closed） | 已加护栏（§5.7） |
+| 1 | 已发布的节点、stub、跳板保留到进程退出 | 缺少覆盖任意 detour / JIT stub 的完整静止证明 | 每个不同目标地址增加内存占用，同址可复用 | 以保留资源避免提前释放导致 UAF |
+| 2 | 同址重载字节变化时拒绝复用 | 原始前导字节校验失败 | 对应钩子不可用，需重启进程 | 保守失败，不覆盖新映像代码 |
 | 3 | Global 插件永不卸载 | 域模型：Global 钩的是常驻 exe | 插件静态状态跨对局、跨读档存活 | 约定：Global 插件的 `OnLoad` 必须幂等，不得假设"只执行一次" |
 | 4 | 插件自建线程 / 前端 Lua 闭包不受 loader 保护 | 这些不在 HookAPI 覆盖范围内 | 卸载瞬间的并发调用会踩空 | 文档告知；不做"线程登记"就无法根治 |
 | 5 | 域门只装在"换地址 / 给地址"这类入口 | 设计原则是**按目标地址授权**，不是限制插件行为 | 注册、回调类入口不设门 | 有意：边界靠"GameCore 专属入口 + 域规则"共同成立 |
-| 6 | teardown 依赖"有在途 GameCore 调用就已经完蛋"这个弱假设 | 引擎自己 `UnloadDLL` 同样会 unmap 那块内存 | 做不到绝对安全 | 接受：与引擎原生行为等价 |
+| 6 | Loader 不负责 GameCore 自身执行路径的静止 | 引擎仍会卸载 GameCore 映像 | 插件自建线程必须在 OnUnload 停止 | Loader 保留跳板仅解决自身资源提前回收问题 |
 | 7 | exe 域的站点永不摘钩 | exe 常驻，摘了反而引入额外状态 | 钩子活到进程退出 | 有意 |
 | 8 | 开关 Mod 不生效，必须重启 | 没有 reconcile 通路 | 操作体验 | 有意：状态一致性优先于便利 |
 | 9 | UI 注入依赖特征码，匹配失败静默降级 | 游戏更新改了目标代码 | 面板不出现（日志有记录），其余功能正常 | 接受 |

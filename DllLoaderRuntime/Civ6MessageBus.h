@@ -8,8 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
-
-namespace PluginInFlight { struct Owner; }
+#include "PluginInFlight.h"
 
 class Civ6MessageBus {
 public:
@@ -40,11 +39,14 @@ private:
         MessageHandler handler;
         // 在途记账 / 门禁统一走 PluginInFlight（注册时解析一次，见 .cpp）。
         PluginInFlight::Owner* inFlight = nullptr;
+        // entry 独立停用，覆盖/注销后不可复活；shared_ptr 快照保活本计数。
+        PluginInFlight::Owner calls;
     };
 
     using HandlerPtr = std::shared_ptr<HandlerEntry>;
     static void InvokeEntry(const HandlerPtr& entry, const char* topic,
                             const void* data, size_t len, const char* name);
+    static void DrainEntries(const std::vector<HandlerPtr>& entries);
 
     std::mutex mtx_;
     std::unordered_map<std::string, HandlerPtr> handlers_;

@@ -43,6 +43,7 @@ bool Civ6MessageBus::RegisterHandler(const std::string& name, MessageHandler han
     replacement->handler = std::move(handler);
     // 登记时解析一次：运行时的在途守卫按 owner 记账，不再做宽字符串哈希。
     replacement->inFlight = PluginInFlight::Resolve(owner);
+    std::vector<HandlerPtr> replaced;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         if (canRegister && !canRegister()) return false;
@@ -51,29 +52,39 @@ bool Civ6MessageBus::RegisterHandler(const std::string& name, MessageHandler han
             Logger::Log("Message handler name conflict rejected: %s", name.c_str());
             return false;
         }
+        if (existing != handlers_.end()) {
+            PluginInFlight::SetAllowed(&existing->second->calls, false);
+            replaced.push_back(existing->second);
+        }
         handlers_[name] = std::move(replacement);
     }
-    // 覆盖旧 entry 不单独排空：异 owner 的覆盖已被拒绝，新旧 entry 同 owner，
-    // 在途调用按 owner 记账，由 owner 级 WaitAll 统一等。
+    DrainEntries(replaced);
     return true;
 }
 
 void Civ6MessageBus::UnregisterOwner(const std::wstring& owner) {
     if (owner.empty()) return;
+    std::vector<HandlerPtr> removed;
     {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto it = handlers_.begin(); it != handlers_.end(); ) {
             if (it->second->owner == owner) {
+                PluginInFlight::SetAllowed(&it->second->calls, false);
+                removed.push_back(it->second);
                 it = handlers_.erase(it);
             } else {
                 ++it;
             }
         }
     }
-    // 先摘表项，再在总线锁外排空该 owner 的在途回调：等待期间绝不能持 mtx_
-    // （回调线程的 Enter / 注册路径都要进总线锁，持锁等待会成环）。
-    // 调用方通常已经 SetAllowed(false)；此处只负责等干净。
-    PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
+    DrainEntries(removed);
+}
+
+void Civ6MessageBus::DrainEntries(const std::vector<HandlerPtr>& entries) {
+    // 不持总线锁或 lifecycle 锁等待。只排空被替换/移除的 entry，避免等待新 handler。
+    for (const auto& entry : entries) {
+        PluginInFlight::WaitAll(&entry->calls, entry->owner.c_str());
+    }
 }
 
 void Civ6MessageBus::Broadcast(const char* topic, const void* data, size_t len) {
@@ -104,6 +115,8 @@ void Civ6MessageBus::SendTo(const std::string& targetName, const char* topic, co
 void Civ6MessageBus::InvokeEntry(const HandlerPtr& entry, const char* topic,
                                  const void* data, size_t len, const char* name) {
     if (!entry) return;
+    auto entryGuard = PluginInFlight::Enter(&entry->calls, PluginInFlight::Kind::Message);
+    if (!entryGuard) return;
     auto guard = PluginInFlight::Enter(entry->inFlight, PluginInFlight::Kind::Message);
     // inFlight 只为"有 owner 的 handler"解析出来（注册路径只接受被跟踪的插件），
     // 判空是防御；门禁由 owner 的 allowed 镜像决定。
