@@ -79,8 +79,10 @@ constexpr uint32_t kMaxSymbolCount = 4'000'000;
 constexpr uint64_t kMaxHeapBytes = 256ull * 1024 * 1024;
 constexpr uint32_t kMaxVtableSlots = 4'000'000;
 constexpr uint32_t kUnmatched = UINT32_MAX;
-// "没有头 hash"的标记：符号表的 normHeadHash 字段 0 = 无。生成端（tools/symdb.py）
-// 只用 0 表示无；Fnv1a64 至少哈希 1 个字节，不可能退回 FNV 初值，故无需兼容历史占位常量。
+// "没有头 hash"的标记：符号表的 normHeadHash 字段 0 = 无。生成端历史上还用过 FNV-1a64 的
+// 初值当占位（非 0），因此这里把它一并当成"无"——否则会对这类条目做一次注定不等的比对，
+// 把已经由 (size, unwind_hash) 确立的正确锚点删掉。
+constexpr uint64_t kNoHeadHashPlaceholder = 0xcbf29ce484222325ull;
 // 单条函数体 AOB 的字节数上限（生成端 tools/symdb.py 的 MAX_AOB 硬约束）。运行时用它做
 // "符号表与 AOB 块是否同步"的自洽探测：失步时读到的多半是函数体字节，值会越界。
 constexpr uint32_t kMaxAobBytes = 64;
@@ -462,7 +464,8 @@ bool ParseModuleData(const uint8_t* data, size_t size, const ModuleDesc& m, cons
             }
             slotCursor += slotCount;
             ++vtableSymbols;
-        } else if (sym.kind == 0 && sym.normHeadHash != 0 && sym.old_rva != 0) {
+        } else if (sym.kind == 0 && sym.normHeadHash != 0 &&
+                sym.normHeadHash != kNoHeadHashPlaceholder && sym.old_rva != 0) {
             headHashByRva.emplace(sym.old_rva, sym.normHeadHash);
         }
 

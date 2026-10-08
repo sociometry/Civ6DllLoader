@@ -65,10 +65,6 @@ tools/*.symdb.bin
 tools/*.symdb.pack.bin
 tools/*.symdb.pack.bin.xp
 
-# rva_to_symbol 的输入（GameCore.symdb.json 的派生物，17 MB；需要时用
-# `python symdb.py rva-map` 重新生成，rva_to_symbol.exe 只读自己旁边的这份）
-tools/rva_map.json
-
 # exe 站点定位工具的输出（本地产物）
 tools/exe_site_map.json
 
