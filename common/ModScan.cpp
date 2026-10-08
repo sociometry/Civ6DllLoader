@@ -56,15 +56,6 @@ void AddRootUnique(std::vector<std::wstring>& roots, const std::wstring& path) {
     AddUnique(roots, norm);
 }
 
-// 模块所在目录。仅本文件使用（CollectScanRoots 取 exe 目录）。
-std::wstring GetModuleDirectory(HMODULE module) {
-    wchar_t path[MAX_PATH]{};
-    const DWORD n = GetModuleFileNameW(module, path, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return {};
-    fs::path p(path);
-    return p.parent_path().wstring();
-}
-
 std::wstring GetDocumentsModsRoot() {
     wchar_t* docs = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs)) || !docs) {
@@ -281,6 +272,14 @@ std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdi
 }
 
 }  // namespace
+
+std::wstring GetModuleDirectory(HMODULE module) {
+    wchar_t path[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(module, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    fs::path p(path);
+    return p.parent_path().wstring();
+}
 
 std::wstring NarrowToWide(const std::string& s) {
     if (s.empty()) return {};

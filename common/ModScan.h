@@ -8,6 +8,8 @@ namespace ModScan {
 
 namespace fs = std::filesystem;
 
+// 模块所在目录（传 nullptr = 当前进程 exe 的目录）。空串表示取不到。
+std::wstring GetModuleDirectory(HMODULE module);
 std::wstring NarrowToWide(const std::string& s);
 std::string WideToNarrow(const std::wstring& s);
 
