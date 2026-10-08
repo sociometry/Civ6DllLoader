@@ -723,8 +723,9 @@ def build_module(image_id, json_path, pe_path, bin_path,
 
     print("[3/5] normHeadHash ...")
     # normHeadHash = 0 表示"无头 hash"（非 pdata 函数，或 SizeOfProlog <= 0），运行时按 != 0
-    # 判定；不要再写 FNV 初值之类占位常量（运行时会把它当真实 hash，见 PdataMatch.cpp 的
-    # kNoHeadHashPlaceholder 说明——那里为了兼容历史文件仍然容忍该值）。
+    # 判定。**必须写 0，不要写 FNV 初值之类占位常量**：Fnv1a64 至少哈希 1 个字节，取不到初值，
+    # 所以非 0 的值在运行时一律被当作真实 hash；填错会让这些条目进入头 hash 校验并在
+    # PdataMatch.cpp 的 mapping[oi] = kUnmatched 处抹掉本已正确的锚点。
     records, indices = [], []
     for idx, s in enumerate(func_syms):
         rva = int(s["rva"], 16)

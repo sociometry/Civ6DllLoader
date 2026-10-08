@@ -792,8 +792,7 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
   新表指纹 + sidecar 指纹；两者都是各自 pdata 表 `(size, unwind_hash)` 序列的 FNV-1a64，**不含**
   `begin_rva`、符号名与 AOB 数据）→ 窗口哈希锚点 + LIS 锚点链 + 锚点间插值 + **首尾锚点外推** →
   **头 hash 校验**（sidecar 里带 `normHeadHash` 的 old 条目，按新映像同一函数的序言字节重算，
-  不等即剔除）→ 头 hash 局部恢复（`normHeadHash`，生成端「无 hash」写 0，仓库里旧生成端写的
-  FNV 初值 `0xcbf29ce484222325` 一并视为无）→ 函数体 AOB 恢复 →
+  不等即剔除）→ 头 hash 局部恢复（`normHeadHash`，生成端「无 hash」一律写 0）→ 函数体 AOB 恢复 →
   叶子 AOB 匹配 + vtable 槽位反推（结果并入同一张 `leafMap`）；
 - 缓存命中后按头/尾 + 最多 64 个等距条目做一次抽样自校验（`ValidateCachedMap`）。它只保证「结构上像
   本次匹配的产出」（索引不越界、签名/头 hash/AOB 至少一条成立），**不是对缓存可信度的保证**：缓存文件
