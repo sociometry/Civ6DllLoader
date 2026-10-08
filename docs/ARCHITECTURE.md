@@ -49,7 +49,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `common/HookAPI.h` | 插件 ABI：HookAPI 表、类型、冻结前缀规则、类别门禁、`HookAPI_IsCompatible` |
+| `common/HookAPI.h` | 插件 ABI：HookAPI 表、类型、类别门禁、`HookAPI_IsCompatible` |
 | `DllLoaderRuntime/Civ6DLLHookLoaderAPI.cpp` | 一切的核心：站点表、capture、插件生命周期、
 |  |  HookAPI 实现、域门、teardown |
 | `DllLoaderRuntime/LoaderHooks.cpp` | exe 域钩子（LoadDLL / UnloadDLL）的安装与 detour 编排 |
@@ -422,12 +422,11 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 - **表的形状由两条 `static_assert` + 一个计数常量钉死**：`CIV6_HOOK_API_ENTRY_COUNT`（当前 76）
   必须与 `sizeof(HookAPI)` 和末尾成员偏移同时吻合，否则编译失败；启动时 `VerifyHookApiTableProtection`
   再扫一遍空项；
-- **当前 `CIV6_HOOK_API_VERSION = 1`。** `common/HookAPI.h` 顶部还留着一整段"冻结前缀 /
-  向后兼容契约"的说明（"老插件不用因为 loader 更新而重编"），**那段在当前阶段是失效的、且有误导性**：
-  同文件稍后明写"预发布阶段从未对外发布过任何插件，删改前缀不升版本号"，两次破坏前缀
-  （① 删掉 `GetCivilizationDescription` / `RegisterGameCoreReady` / `RegisterGameCoreTeardown`；
-  ② 类别声明从表尾字段 `DeclarePluginKind` 改成插件自带导出 `Civ6PluginKind`，79 字段变 78）
-  都没有 bump。**在预发布阶段，插件必须用当前头文件重新编译**；给外部发布之后才按规则递增；
+- **当前 `CIV6_HOOK_API_VERSION = 1`，且预发布阶段删改前缀不升版本号** —— 从未对外发布过插件，
+  `1` 是它唯一出现过的值。已发生过两次破坏前缀都没 bump（① 删掉
+  `GetCivilizationDescription` / `RegisterGameCoreReady` / `RegisterGameCoreTeardown`；
+  ② 类别声明从表尾字段 `DeclarePluginKind` 改成插件自带导出 `Civ6PluginKind`，79 字段变 78）。
+  **在预发布阶段，插件必须用当前头文件重新编译**；首次对外发布之后才需要递增版本号；
 - **类别走一条独立于表的通路**：`common/HookAPI.h` 为插件自动发出 `Civ6PluginKind` 导出
   （`extern "C" __declspec(dllexport) inline`，低 32 = kind、高 32 = `CIV6_HOOK_API_VERSION`），
   loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 32 位只进日志）。插件作者一行都不用写；
@@ -1003,9 +1002,11 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 ### 10.4 改 ABI 的规则
 
-- **只追加**：`HookAPI` 是"冻结前缀"。新增函数只能追加到尾部，旧插件凭 `structSize` 继续工作，`apiVersion` 不动；
-- **破坏前缀就要升版本**：删字段 / 改顺序 / 改语义 → 提升 `CIV6_HOOK_API_VERSION`，旧插件会被拒（而不是崩）。
-  例外只有一个：**首次对外发布之前**不递增（现在就是这种情况，值停在 `1`；已发生的两次见 §3.4）；
+- **预发布阶段（当前）不升版本号**：从未对外发布过插件，删字段 / 改顺序 / 改语义直接做，
+  `CIV6_HOOK_API_VERSION` 停在 `1`（唯一出现过的值）；插件必须用当前头文件重新编译。
+  已发生的两次破坏前缀见 §3.4；
+- **对外发布之后**：只追加（新增函数追加到尾部，`apiVersion` 不动）；破坏前缀才提升版本号，
+  旧插件会被拒而不是崩；
 - **类别门在表外**：`Civ6PluginKind` 导出负责"OnLoad 之前"按类别快速拒绝（旧头文件编出来的插件没有这个
   导出 → 在 OnLoad 之前就被拒）；ABI 版本兼容仍由表内的 `apiVersion` + `structSize`（插件侧
   `HookAPI_IsCompatible`）判；
