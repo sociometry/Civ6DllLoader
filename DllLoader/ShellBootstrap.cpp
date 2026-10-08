@@ -194,38 +194,41 @@ bool InstallLoaderIfMissing(HMODULE shellModule) {
     const std::wstring& bestPath = ranked.front().path;
     Logger::Log("InstallLoaderIfMissing: elected %ls (version=0x%08X)", bestPath.c_str(), ranked.front().version);
 
-    // d. 复制到 exe-dir\version.tmp，再原子替换成 version.dll，清理，然后提示。
+    // d. 复制到 exe-dir\version.tmp，再原子替换成 version.dll，然后提示。
     //    替换的两种入口：
     //      - 首次安装（目录里没有 version.dll）：PublishStaged 用 MoveFileW，不覆盖已有文件；
     //      - 接管外来文件：走与 runtime 侧自更新【完全相同】的带备份原子替换
     //        （RuntimePackage::PublishStaged(..., backup) → ReplaceFileW，被拒时回退两步改名 + 回滚）。
     //
-    //    备份名【不能】用 version_Old.dll：LoaderUpdate.cpp 启动时会无条件删除它
-    //    （视作自己上次自更新的残留），那样会把用户的原文件静默销毁。
-    //    这里用 version.foreign.dll 独立命名，与自更新的备份互不干扰。
+    //    为什么必须用 ReplaceFileW 而不是"先删再拷"：此时 version.dll 正被映像映射
+    //    （游戏启动了它），DeleteFileW 会因共享冲突失败；ReplaceFileW 能把被替换文件
+    //    重命名到备份名再让新文件顶上，被映射的文件也能改名 —— 这正是自更新选它的原因。
+    //
+    //    备份名沿用自更新那套 version_Old.dll，语义统一：它只是"被顶掉的旧文件"，
+    //    进程内不会被任何人加载（游戏只静态导入 version.dll），需要时由用户自行取用。
     const std::wstring tmp = exeDir + L"\\version.tmp";
+    const std::wstring oldPath = exeDir + L"\\version_Old.dll";
     if (!RuntimePackage::StageCandidate(bestPath, tmp, ranked.front().version)) {
         Logger::Log("InstallLoaderIfMissing: staging failed for %ls", bestPath.c_str());
         return false;
     }
 
     if (foreignPresent) {
-        const std::wstring backup = exeDir + L"\\version.foreign.dll";
-        // 保留用户原文件：先清掉上次可能残留的备份，再原子替换（失败会自动回滚）。
-        if (!RuntimePackage::PublishStaged(tmp, versionDll, backup)) {
+        if (!RuntimePackage::PublishStaged(tmp, versionDll, oldPath)) {
             Logger::Log("InstallLoaderIfMissing: takeover of foreign version.dll failed; "
                         "original file left in place (or restored)");
             return false;
         }
         Logger::Log("InstallLoaderIfMissing: took over foreign version.dll "
-                    "(original backed up as %ls)", backup.c_str());
+                    "(previous file moved to %ls)", oldPath.c_str());
     } else {
+        // 首次安装：目录里没有 version.dll，用不带备份的发布（MoveFileW，不覆盖已有文件）。
         if (!RuntimePackage::PublishStaged(tmp, versionDll)) {
             return false;
         }
+        // 此时 version_Old.dll 只可能是上次自更新/接管的残留，且本次发布没用它 → 清掉。
+        DeleteFileW(oldPath.c_str());
     }
-    // Best-effort stale-backup cleanup; failure is ignored.
-    DeleteFileW((exeDir + L"\\version_Old.dll").c_str());
 
     MessageBoxW(nullptr,
         L"Civ6 DLL Loader 已安装，点击确定立即重启游戏。\nCiv6 DLL Loader installed. Click OK to restart the game now.",
