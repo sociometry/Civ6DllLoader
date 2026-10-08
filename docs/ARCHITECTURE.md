@@ -30,8 +30,8 @@
    `&HookSite`，teardown 只把节点原地复位以便下次复用）。
 3. **释放顺序**：摘钩（还原入口字节）→ 卸载插件（OnUnload / 注销回调）→ 交给引擎
    `UnloadDLL` 卸掉 GameCore（连同它的 Lua 环境）→ **之后**才 `FreeLibrary` 插件模块（§2.4）。
-   ⚠️ 补丁的自动回滚**已决定删除但尚未实施**（当前仍会回滚）；目标语义是"补丁进程内不可撤销，
-   由插件自己在 `OnUnload` 里 `Unpatch`"，见 §5.8。
+   ⚠️ 补丁**不由 Loader 自动回滚**：语义是"补丁进程内不可撤销，由插件自己在 `OnUnload` 里
+   `Unpatch`"，见 §5.8。
 
 进程里有哪些东西（详见 §1.1）：
 
@@ -57,7 +57,7 @@
 | `DllLoaderRuntime/UiInject.cpp` | 主菜单 UI 注入（LoadUI detour + LuaContext） |
 | `DllLoaderRuntime/ImageAddress.cpp` | PE 映像注册与 RVA 换算 |
 | `DllLoaderRuntime/PdataMatch.cpp` | sidecar 解析 + pdata 匹配 + RVA 矫正 |
-| `DllLoaderRuntime/PatchRegistry.cpp` | 补丁账本（按地址存原始字节）；**自动回滚已决定删除但尚未实施**，见 §5.8 |
+| `DllLoaderRuntime/PatchRegistry.cpp` | 补丁账本（按地址存原始字节）；**Loader 不自动回滚**，见 §5.8 |
 | `DllLoaderRuntime/PluginInFlight.*` | 插件回调的在途登记与排空 |
 | `DllLoaderRuntime/Civ6MessageBus.*` | 插件间消息 |
 | `common/ModScan.cpp` / `common/EnabledMods.*` | 插件扫描与"启用 Mod"过滤（**只作用于插件**；安装/自更新 loader 的候选不看启用集） |
@@ -386,8 +386,8 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 ### 3.3 卸载 / 隔离 / 驻留
 
-**崩溃隔离 `QuarantinePluginByOwner`**（标记 + 回滚全部注册）：
-`SetPluginState(Quarantined)` → 注销消息 → `PluginInFlight::WaitAll` → `PatchRegistry::RevertAllFor` →
+**崩溃隔离 `QuarantinePluginByOwner`**（标记 + 回滚除补丁外的全部注册）：
+`SetPluginState(Quarantined)` → 注销消息 → `PluginInFlight::WaitAll` →
 `RemovePluginHooks`（拔 detour 槽）→ `CleanupCaptureSitesForOwner` → `RemovePluginOwnedRegistrations`。
 隔离后阶段 B 不会再重试它：条目留在 `g_plugins`（状态不是 `Active`），`LoadSinglePlugin` 的按路径去重会拦住。
 
@@ -401,17 +401,18 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 **正常卸载 `UnloadPluginByOwnerId(ownerId, freeModule)`**：
 `SetPluginState(Deactivating)` → 放锁 → 注销消息 → `WaitAll` → `OnUnload`（SEH）→
-`PatchRegistry::RevertAllFor`（先 OnUnload 后回滚：OnUnload 可能还依赖自己的补丁）→
 `RemovePluginHooks`（拔槽，绝不在插件卸载时物理摘 MinHook 记录）→ `CleanupCaptureSitesForOwner` →
 `RemovePluginOwnedRegistrations` → 重锁 → 从 `g_plugins` 摘除 → 放锁 → `freeModule` 时**入队待释放**，
 否则记"module parked"（驻留）。
 
+> **补丁不在上面这条链里**：Loader 不再自动回滚（§5.8）。要撤销的插件应在 `OnUnload` 里自己调
+> `Unpatch` —— 那时 GameCore 映像还活着、插件也知道自己的状态。
+
 - **Global 永远驻留**（含 OnLoad 崩溃隔离之后，见上面的释放策略）：只在启动时加载（禁用 Mod 需要重启），
   且游戏线程可能仍停在它某个 exe 域 detour 里；驻留的代价是插件静态状态跨会话保留，所以 `OnLoad`
   必须可重入（重新注册它的钩/回调）。
-  ⚠️ **隔离（`QuarantinePluginByOwner`）不调 `OnUnload`**，所以隔离时插件打的补丁不会被它自己撤销。
-  当前实现仍会调 `RevertAllFor` 自动回滚；**已决定删除该自动回滚（§5.8），尚未实施** ——
-  届时补丁会留在游戏里直到进程退出。
+  ⚠️ **隔离（`QuarantinePluginByOwner`）不调 `OnUnload`**，所以隔离时插件打的补丁既不会被它自己
+  撤销、Loader 也不自动回滚（§5.8）——**补丁会留在游戏里直到进程退出**。
 - **GameCore 真卸载**：它的钩/补丁只允许落在当前 GameCore 映像内（§4.1），加上重载时整套 teardown，
   所以静态状态不会跨局残留。
 
@@ -626,15 +627,11 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 | `recordStale` 重建 | 保留 + 已加护栏 | 重建前先比对目标当前前导字节与建记录时的副本（`HookSite::prologueBackup`）：**不一致就 poison 该站点、拒绝触碰 MinHook 记录**（fail-closed），避免把旧映像的字节写进当前映像；一致时才 `MH_DisableHook`/`MH_RemoveHook` |
 | 换基址重载 | 站点复用 | teardown 原地复位站点（`hookInstalled=false`，stub 与 `prologueBackup` 保留待重建）；只有"摘不掉"的残留会留下 `recordStale`（或 poison） |
 
-### 5.8 补丁的撤销（`PatchRegistry`）—— **已决定改为"不自动回滚"，尚未实施**
-
-> ⚠️ **本节描述的是已确认的目标状态，代码尚未改动。** 当前实现里 `RevertAllFor` 仍会在插件
-> 卸载（`UnloadPluginByOwnerId`）与崩溃隔离（`QuarantinePluginByOwner`）时被调用。
-> 实施前请以代码为准。
+### 5.8 补丁的撤销（`PatchRegistry`）—— **Loader 不自动回滚**
 
 `Patch` / `Unpatch` 是插件对游戏内存的**原始字节修改**，账本按地址存"第一次 Apply 之前的字节"。
 
-**决定：删除 Loader 侧的自动回滚**（`RevertAllFor`、`RevertOwned` 的自动调用，以及两个调用点
+**已实施：删除 Loader 侧的自动回滚**（`RevertAllFor` 及其两个调用点
 `UnloadPluginByOwnerId` / `QuarantinePluginByOwner` 里的还原步骤），理由：
 
 - **两个调用点里只有一个有意义，而那个恰好最危险。** `UnloadPluginByOwnerId` 那条针对 GameCore 插件，
@@ -646,15 +643,18 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
   存下来的就是跳板字节，日后写回等于把别的机制的跳板又塞回去；
 - **还原本身也在改页保护**，而恢复保护属性的返回值被忽略，一次失败就会把页永久留在可写状态（破坏 W^X）。
 
-**目标约定**：
+**约定**：
 
-- `Unpatch(target)` **保留**，供插件在**自己还活着的时候**主动撤销（典型位置是 `OnUnload`）。
-  这时插件知道自己的状态，也知道自己的补丁是否还被调用；
+- `Unpatch(target)` **保留**（底层 `PatchRegistry::RevertOwned`），供插件在**自己还活着的时候**
+  主动撤销（典型位置是 `OnUnload`）。这时插件知道自己的状态，也知道自己的补丁是否还被调用；
 - **Loader 不再替插件自动撤销补丁**。隔离/卸载后的补丁留在游戏里，直到进程退出——
   插件作者应把 `Patch` 视为"进程生命周期内不可撤销"的默认语义，需要可撤销就自己管好 `Unpatch` 时机；
 - `PatchRegistry::OverlapsRegistered` **保留**：即使补丁不可撤销，也必须禁止两个插件往**重叠**区间
   打补丁（否则一方的补丁会不可逆地踩坏另一方）。`InstallHook` 的前导窗口仲裁 `OverlapsHookPrologue`
   同理保留。
+
+> 副作用（已知且接受）：`PatchRegistry` 的记录只增不减（`Apply` 加、`RevertOwned` 减），
+> 隔离或未调 `Unpatch` 的插件会让记录在其后驻留到进程退出。
 
 ---
 
@@ -917,7 +917,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | 9 | UI 注入依赖特征码，匹配失败静默降级 | 游戏更新改了目标代码 | 面板不出现（日志有记录），其余功能正常 | 接受 |
 | 10 | 数据槽定位依赖 AOB 兜底指令序列 | 编译器 / 游戏更新 | 定位失败返回 0，对应功能降级 | 接受（有日志） |
 | 11 | 休眠检测要求宿主 exe 名形如 `CivilizationVI*.exe` | 防止"别的进程从 exe 目录加载这份 version.dll"时把 Loader + Global 插件拉进去 | 用改名 exe / 第三方启动器的会话里 Loader 静默休眠（不装钩）；`OutputDebugString` 有留痕 | 有意（严格优先） |
-| 12 | 插件打的补丁**将**不再自动回滚 | 自动回滚要在"插件已崩"的时刻往可能正执行的代码里写还原字节，且无 quiesce；存档还可能是别人的跳板字节 | 隔离/卸载后补丁留在游戏里直到进程退出；插件需自己管 `Unpatch` 时机 | ⚠️ **已决定（§5.8），尚未实施** —— 当前代码仍会回滚 |
+| 12 | 插件打的补丁**不再自动回滚** | 自动回滚要在"插件已崩"的时刻往可能正执行的代码里写还原字节，且无 quiesce；存档还可能是别人的跳板字节 | 隔离/卸载后补丁留在游戏里直到进程退出；插件需自己管 `Unpatch` 时机 | 有意（§5.8，已实施） |
 
 ### 9.1 已知未处理的问题（不是取舍，是待修）
 
@@ -931,7 +931,9 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | D | `MakeHash` 是唯一既不做探针、也不做归属校验的指针入口 | `MakeHashImpl` | 先探长度、再重新读同一段内存（非原子），且返回值 0 有二义性 |
 | E | 状态码 `3`（预留 Frontend）与若干空槽 | `common/HookAPI.h` | 未实现的功能不应留在核心枚举里 |
 | F | `ShouldSkipPluginFile` 用文件名黑名单而非白名单 | `common/ModScan.cpp` | 会把将来新增的官方 DLL 当插件加载（`FindContentRoot` 那条已于本次提交删除：它接受任意 `Win64*` 前缀，且唯一的调用点会引入"游戏安装根"这个恒空的内容根） |
-| G | 补丁自动回滚尚未按 §5.8 删除 | `UnloadPluginByOwnerId` / `QuarantinePluginByOwner` | 目标态是"补丁进程内不可撤销、由插件自己 `Unpatch`"，当前仍在自动回滚 |
+
+> 曾经的 G（"补丁自动回滚尚未按 §5.8 删除"）**已解决**：Loader 侧自动回滚已删除，
+> 见 §5.8 与 §9 表第 12 行。
 
 ---
 
