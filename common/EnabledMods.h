@@ -15,9 +15,8 @@ struct Snapshot {
 // 查询必须完整结束才返回 ok=true；失败返回错误和空集合，不暴露部分启用集。
 Snapshot Load();
 
-// Walk up from a file/dir path to the folder that contains a *.modinfo.
-std::wstring FindModRoot(const std::wstring& anyPathUnderMod);
-
+// 路径规范化：全小写、'/'\''->\、去尾分隔符。规范化失败（weakly_canonical 置
+// error_code）返回空串 —— 授权判定必须失败即关闭，不能拿未解析链接的原始串当规范路径。
 std::wstring NormalizePath(const std::wstring& path);
 bool PathIsUnderRoot(const std::wstring& path, const std::wstring& root);
 

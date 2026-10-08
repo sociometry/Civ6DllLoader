@@ -3772,12 +3772,11 @@ static const char* CategoryNameForLog(LoaderCore::PluginCategory cat) {
 }
 
 void LoaderCore::LoadPluginsOf(PluginCategory cat) {
-    const HMODULE anchor = LoaderCore::RuntimeModuleHandle();
     // 扫描（文件系统/sqlite）在锁外做，避免长时间阻塞卸载/reconcile 路径；
     // 单个插件的加载由 LoadSinglePlugin 在锁内原子完成。
     const auto wpaths = (cat == PluginCategory::GameCore)
-        ? ModScan::FindGameCorePluginCandidates(anchor)
-        : ModScan::FindGlobalPluginCandidates(anchor);
+        ? ModScan::FindGameCorePluginCandidates()
+        : ModScan::FindGlobalPluginCandidates();
     Logger::Log("LoadPluginsOf(%s): %zu candidate(s)", CategoryNameForLog(cat), wpaths.size());
     for (const auto& wpath : wpaths) {
         LoadSinglePlugin(wpath);

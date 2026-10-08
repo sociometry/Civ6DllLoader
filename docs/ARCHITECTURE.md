@@ -332,23 +332,19 @@
 
 扫描（`common/ModScan.cpp`）：内容根 = 游戏目录 / `Documents\My Games\...\Mods` / Workshop，
 每个根下找 `<mod>\Binaries\Win64\Plugins\<Global|GameCore>\*.dll`（插件目录固定是 `Binaries\Win64`；
-`Win64Steam` 只影响"锚模块"所在目录的识别，插件扫描不认它），
+`Win64Steam` 只影响 exe 目录的形状，插件扫描不认它），
 按文件名去重，再用 `common/EnabledMods.*`（读 `Mods.sqlite` 的启用集）过滤：**路径必须落在某个启用 Mod
 的根下**，且**只认 SQL 返回的那个精确 mod root**（`AllowsPath` 不沿路径向上找 `.modinfo` 再放宽：
 外层 mod 目录即使包着某个启用 root，也不因此获得授权）。只比 GUID 不够：同一 GUID 可能有多份安装副本。
-例外是**锚本地**：位于锚模块自身 mod 根（`FindModRoot(锚目录)`）或锚目录之下的插件无条件放行
-（`FilterByEnabledMods` 的 `shellLocal`）——薄壳/开发期直接加载时仍要能加载自己那一份插件。
+**没有任何"锚本地豁免"**：授权判据只有 `AllowsPath` 一条。`Mods.sqlite` 读不到时**一个都不加载**
+（失败即关闭）。内容根一律由**进程 exe 目录**推导（`CollectScanRoots()` 不接受锚模块参数）：
+游戏只从 `<内容根>\<Mod>\Binaries\Win64\` 加载薄壳，而其余内容根的发现
+（`SHGetKnownFolderPath` 拿 Documents、注册表 + `libraryfolders.vdf` 拿 Steam/Workshop）都与调用方无关，
+所以"谁在调用"不改变结果 —— 传非 exe 模块只会少拿"游戏根"这一条。
 
-> ⚠️ **这个例外目前是"绕过白名单"而不是"白名单的兜底"。** 两点：
-> ① `shellLocal` 被 `||` 写在 `AllowsPath` **前面**，只要它为真就根本不会查启用集；
-> ② **锚模块是 runtime 自己（`LoaderCore::RuntimeModuleHandle()`），不是薄壳**。
->    装成 `version.dll` 之后 `shellDir` 就是**游戏 exe 目录**，
->    而 `shellModRoot = FindModRoot(shellDir)` 在那个目录上必然为空
->    （向上 8 层没有 `.modinfo`），于是生效的只剩 `PathIsUnderRoot(path, shellDir)` 一条 ——
->    **等于无条件把整个游戏 exe 目录加进白名单，与玩家启用了哪些 Mod 无关。**
->    参数名沿用了安装器路径的 `shellModule` / `shellDir`（`ShellBootstrap.cpp` 传的才是真薄壳），
->    名称本身有误导性。安装器那条路径不调 `FilterByEnabledMods`，所以不受影响。
-> 修法：把例外改成白名单的补充条件，且只在自身文件名不是 `version.dll`（开发期）时生效，或直接删除。
+> 历史坑：这两处参数曾叫 `shellModule` / `shellDir`，但实际有三个调用方分别传 runtime 自己、
+> exe 模块、薄壳，语义混在一个名字里，`FilterByEnabledMods` 因此被误当成"薄壳的目录"而写出
+> 一条绕过白名单的例外（装成 `version.dll` 后它就是游戏 exe 目录）。现在参数已删除。
 
 类别判定（`Civ6DLLHookLoaderAPI.cpp:CategoryForPath`）：把路径规范化（全小写、`/`→`\`）后含
 `\plugins\global\` → `Global`，**其余一律 `GameCore`**。注意默认方向：放到预期之外的位置会被当成

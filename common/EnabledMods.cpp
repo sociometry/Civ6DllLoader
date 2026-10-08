@@ -65,28 +65,6 @@ bool PathIsUnderRoot(const std::wstring& path, const std::wstring& root) {
     return p[r.size()] == L'\\';
 }
 
-std::wstring FindModRoot(const std::wstring& anyPathUnderMod) {
-    std::error_code ec;
-    fs::path cur = fs::path(anyPathUnderMod);
-    if (fs::is_regular_file(cur, ec)) cur = cur.parent_path();
-
-    for (int i = 0; i < 8 && !cur.empty(); ++i) {
-        if (fs::is_directory(cur, ec)) {
-            for (fs::directory_iterator it(cur, ec), end; !ec && it != end; it.increment(ec)) {
-                std::error_code fileEc;
-                if (!it->is_regular_file(fileEc)) continue;
-                const auto ext = it->path().extension().wstring();
-                if (_wcsicmp(ext.c_str(), L".modinfo") == 0) {
-                    return NormalizePath(cur.wstring());
-                }
-            }
-        }
-        fs::path parent = cur.parent_path();
-        if (parent == cur) break;
-        cur = parent;
-    }
-    return {};
-}
 
 Snapshot Load() {
     Snapshot snap;
