@@ -120,9 +120,9 @@
 **① 薄壳侧的"补装"（`DllLoader/ShellBootstrap.cpp`）**——只在 Loader 完全没装时用，进程内只跑一次：
 
 1. 算 exe 目录，看 `exe\version.dll` 在不在：**在 → 零动作**（不复制、不弹窗，正常路径就走这里）；
-2. 不在 → 收集 `Civ6DllLoader.runtime.dll` 候选（`ModScan::FindRuntimeCandidates`，锚点 = 薄壳自己所在
-   目录 = 该 Mod 的 `Binaries\Win64`）→ 逐个探测版本（读 RC 资源 105）→ 选版本最高的一份
-   （同版本比路径字典序）。候选**不按 Mod 启用集过滤**（见下面的说明）；
+2. 不在 → 收集 `Civ6DllLoader.runtime.dll` 候选（`ModScan::FindRuntimeCandidates()`，无参数）→
+   逐个探测版本（读 RC 资源 105）→ 选版本最高的一份（同版本比路径字典序）。
+   候选**不按 Mod 启用集过滤**（见下面的说明）；
 3. 复制到 `version.tmp` 再原子改名成 `version.dll`（顺带尽力清理 `version_Old.dll`）；
 4. 弹一次双语提示"已安装，点击确定立即重启游戏"并尝试重启；
 5. 任何一步失败都**只记日志、不弹窗、不阻塞**——本次会话就以官方 GameCore 透传跑完（Loader 缺席，
@@ -132,7 +132,7 @@
 
 - 前提：自己的文件名必须是 `version.dll`（否则视为开发中的直接加载，跳过自更新）；
 - 启动时若发现 `version_Old.dll` 存在，说明**上一会话刚做完一次自更新**，直接删掉它（自愈）；
-- 候选走同一个 `ModScan::FindRuntimeCandidates`，但锚点是 **exe 模块**；排除自己（规范化路径比较）后
+- 候选走同一个 `ModScan::FindRuntimeCandidates()`；排除自己（规范化路径比较）后
   选更新的版本 → **先备份成 `version_Old.dll` 再原子替换**（`ReplaceFileW`：被替换文件被重命名到备份名、
   替换文件顶替它的名字，磁盘上不会出现 "`version.dll` 不存在" 的中间态；`ReplaceFileW` 被拒时退回
   旧的两步改名 + 失败回滚）→ 失败则回滚，当前安装保持不变；
@@ -143,11 +143,13 @@
 
 候选**不按 Mod 启用集过滤**（`ModScan::FindRuntimeCandidates` 故意不调 `FilterByEnabledMods`）：
 安装/自更新 loader 只看版本（RC 资源 105），与"插件只从启用的 Mod 加载"是两条独立通路。
-代价与前提：候选来自三个内容根（游戏根 / `Documents\...\Mods` / Workshop）下的
-`<mod>\Binaries\Win64\` 以及锚模块同级目录。游戏根由锚目录上溯得到，Workshop 根另有"问 Steam 自己"的
-发现方式（注册表 `HKCU\Software\Valve\Steam\SteamPath`，退回 `HKLM\...\Valve\Steam\InstallPath`；
-再扫 `<steam>\steamapps\libraryfolders.vdf` 里的每个库根）——薄壳的锚在 `Documents\...\Mods` 时
-只有这条路能命中 Workshop。而 `RuntimePackage::ProbeVersion` 只验 PE + RC 105、
+代价与前提：候选来自两个内容根（`Documents\...\Mods` / Steam Workshop）下的
+`<mod>\Binaries\Win64\Civ6DllLoader.runtime.dll`。**游戏安装根不是内容根**（它不是模组容器，
+其直接子目录 `Base`/`CTP`/`DLC`/`Debug`/`LaunchPad` 都不含 `Binaries\Win64`；官方 DLC 的模组根是
+`<gameRoot>\DLC\<名>`，不是 loader 的分发位置），所以不扫它。Workshop 根有两条发现方式：从 exe 目录
+上溯（exe 在游戏安装树里时直接命中），以及"问 Steam 自己"（注册表
+`HKCU\Software\Valve\Steam\SteamPath`，退回 `HKLM\...\Valve\Steam\InstallPath`；
+再扫 `<steam>\steamapps\libraryfolders.vdf` 里的每个库根）。而 `RuntimePackage::ProbeVersion` 只验 PE + RC 105、
 **没有发行者签名**——能装成 `version.dll` 的候选就是这些目录里任意名字对得上的 runtime DLL。
 插件侧的启用集过滤（`FilterByEnabledMods` + `EnabledMods::AllowsPath`）见 §3.1。
 
@@ -330,21 +332,27 @@
 
 ### 3.1 目录与类别判定
 
-扫描（`common/ModScan.cpp`）：内容根 = 游戏目录 / `Documents\My Games\...\Mods` / Workshop，
+扫描（`common/ModScan.cpp`）：内容根 = `Documents\My Games\...\Mods` / Workshop，
 每个根下找 `<mod>\Binaries\Win64\Plugins\<Global|GameCore>\*.dll`（插件目录固定是 `Binaries\Win64`；
 `Win64Steam` 只影响 exe 目录的形状，插件扫描不认它），
 按文件名去重，再用 `common/EnabledMods.*`（读 `Mods.sqlite` 的启用集）过滤：**路径必须落在某个启用 Mod
 的根下**，且**只认 SQL 返回的那个精确 mod root**（`AllowsPath` 不沿路径向上找 `.modinfo` 再放宽：
 外层 mod 目录即使包着某个启用 root，也不因此获得授权）。只比 GUID 不够：同一 GUID 可能有多份安装副本。
 **没有任何"锚本地豁免"**：授权判据只有 `AllowsPath` 一条。`Mods.sqlite` 读不到时**一个都不加载**
-（失败即关闭）。内容根一律由**进程 exe 目录**推导（`CollectScanRoots()` 不接受锚模块参数）：
-游戏只从 `<内容根>\<Mod>\Binaries\Win64\` 加载薄壳，而其余内容根的发现
-（`SHGetKnownFolderPath` 拿 Documents、注册表 + `libraryfolders.vdf` 拿 Steam/Workshop）都与调用方无关，
-所以"谁在调用"不改变结果 —— 传非 exe 模块只会少拿"游戏根"这一条。
+（失败即关闭）。`CollectScanRoots()` 不接受锚模块参数：内容根的发现全部与调用方无关
+（`SHGetKnownFolderPath` 拿 Documents、注册表 + `libraryfolders.vdf` 拿 Steam/Workshop、
+exe 目录上溯拿 Workshop）。
+
+**游戏安装根不是内容根**：它不是模组容器（直接子目录 `Base`/`CTP`/`DLC`/`Debug`/`LaunchPad`
+都不含 `Binaries\Win64`，实测候选取集恒为空）。游戏自己 `Mods.sqlite` 的 `ScannedFiles` 记录的
+安装内模组根是 `<gameRoot>\DLC\<名>` 与 `<gameRoot>\Base\Assets\Scenarios\<名>`；官方 DLC 里只有
+`DLC\Expansion1` / `DLC\Expansion2` 带 `Binaries\Win64`，而那是官方内容、不是 loader/插件的分发位置。
 
 > 历史坑：这两处参数曾叫 `shellModule` / `shellDir`，但实际有三个调用方分别传 runtime 自己、
 > exe 模块、薄壳，语义混在一个名字里，`FilterByEnabledMods` 因此被误当成"薄壳的目录"而写出
 > 一条绕过白名单的例外（装成 `version.dll` 后它就是游戏 exe 目录）。现在参数已删除。
+> 扫描根去重也必须先归一化：注册表 `SteamPath` 返回 `d:/steam` 而 vdf 里是 `D:\Steam`，
+> 同一目录两种写法，只做大小写不敏感比较会把它当成两个根、扫两遍。
 
 类别判定（`Civ6DLLHookLoaderAPI.cpp:CategoryForPath`）：把路径规范化（全小写、`/`→`\`）后含
 `\plugins\global\` → `Global`，**其余一律 `GameCore`**。注意默认方向：放到预期之外的位置会被当成
@@ -922,7 +930,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | C | teardown 窗口在取不到映像信息时被清成空 | `ResetForReload`（`SetGameCoreTeardownWindow(0,0)` 分支） | 而 `base == 0` 时保护判定直接返回 false，等于在最不确定时把门关掉；同文件 `RemoveGameCoreDomainSiteRecords` 在同样情形下**刻意不清**，两者矛盾 |
 | D | `MakeHash` 是唯一既不做探针、也不做归属校验的指针入口 | `MakeHashImpl` | 先探长度、再重新读同一段内存（非原子），且返回值 0 有二义性 |
 | E | 状态码 `3`（预留 Frontend）与若干空槽 | `common/HookAPI.h` | 未实现的功能不应留在核心枚举里 |
-| F | `ModScan.cpp` 两处结构性问题 | `FindContentRoot`（接受任意 `Win64*` 前缀）、`ShouldSkipPluginFile`（文件名黑名单而非白名单） | 分别会引入非预期的扫描根、以及把未来官方 DLL 当插件加载 |
+| F | `ShouldSkipPluginFile` 用文件名黑名单而非白名单 | `common/ModScan.cpp` | 会把将来新增的官方 DLL 当插件加载（`FindContentRoot` 那条已于本次提交删除：它接受任意 `Win64*` 前缀，且唯一的调用点会引入"游戏安装根"这个恒空的内容根） |
 | G | 补丁自动回滚尚未按 §5.8 删除 | `UnloadPluginByOwnerId` / `QuarantinePluginByOwner` | 目标态是"补丁进程内不可撤销、由插件自己 `Unpatch`"，当前仍在自动回滚 |
 
 ---

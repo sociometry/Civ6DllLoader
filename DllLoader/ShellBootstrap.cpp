@@ -168,7 +168,7 @@ bool InstallLoaderIfMissing() {
             versionDll.c_str());
     }
 
-    // c. Collect candidates from the scan roots (game root / Documents Mods / Workshop).
+    // c. Collect candidates from the scan roots (Documents Mods / Steam Workshop).
     //    FindRuntimeCandidates deliberately does NOT filter by
     //    mod-enabled state - installation elects by version only (RCDATA 105), which is a
     //    separate path from "plugins load only from enabled mods". Probe versions, elect the

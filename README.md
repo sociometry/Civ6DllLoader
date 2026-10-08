@@ -34,8 +34,8 @@ updates read this resource without executing candidate DLL entry points or expor
 Rebuild both shell and runtime after this change: older runtimes without the
 resource are skipped. Version numbers remain defined in `common/LoaderVersion.h`.
 
-Candidates come from the scan roots (game root, Documents Mods, Workshop) and the
-loader's own directory. The installer/updater does **not** filter by mod-enabled state
+Candidates come from the scan roots (Documents Mods and the Steam Workshop content
+roots); the game install root is not a mod container and is not scanned. The installer/updater does **not** filter by mod-enabled state
 (plugin loading still does). The metadata identifies the package format; it is not a
 publisher signature, and `ProbeVersion` only checks PE + RC 105 - so only distribute
 runtime DLLs from sources you trust.

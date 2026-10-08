@@ -95,7 +95,7 @@ void CheckAndApplyUpdate() {
         }
     }
 
-    // b. 扫描各内容根（游戏根 / Documents Mods / Workshop）的候选，排除自身。
+    // b. 扫描各内容根（Documents Mods / Steam Workshop）的候选，排除自身。
     //    注意 FindRuntimeCandidates【故意】不按 Mod 启用集过滤（安装/自更新只比版本），
     //    与"插件只从启用的 Mod 加载"是两条独立通路。
     const std::vector<std::wstring> candidates = ModScan::FindRuntimeCandidates();
