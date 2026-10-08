@@ -1154,6 +1154,16 @@ static void* ResolveByPatternCore(HookImageId image, const char* pattern, HookIm
         return nullptr;
     }
 
+    // PE 头声明的 SizeOfImage 不保证整段都已提交：声明值大于实际提交页时，线性扫描会读到
+    // 未提交/守卫页，这里是裸指针访问且没有 SEH，一次访问违例就是整个游戏进程崩溃。
+    // 扫描前对范围走一次 VirtualQuery（对任意地址都安全），不可读就拒绝（失败即关闭）。
+    if (!Runtime::IsReadableSpan(reinterpret_cast<const void*>(searchBase), searchSize)) {
+        Logger::Log("ResolveByPattern: region unreadable image=%u section=%d base=%p size=%zu",
+            static_cast<unsigned>(image), static_cast<int>(section),
+            reinterpret_cast<const void*>(searchBase), searchSize);
+        return nullptr;
+    }
+
     // 线性首命中搜索（mask 0 位 = 通配）。
     const uint8_t* basePtr = reinterpret_cast<const uint8_t*>(searchBase);
     const size_t limit = searchSize - bytes.size() + 1;

@@ -56,7 +56,12 @@ bool GetSelfPath(std::wstring& outPath, std::wstring& outExeDir) {
 // 不要在这里再写一份"看起来一样"的实现：多一份就多一种"同一条路径被判成不同"的漂移
 //（典型的坑是符号链接 / 8.3 短名 / 大小写差异）。
 bool IsSamePath(const std::wstring& a, const std::wstring& b) {
-    return EnabledMods::NormalizePath(a) == EnabledMods::NormalizePath(b);
+    const std::wstring na = EnabledMods::NormalizePath(a);
+    const std::wstring nb = EnabledMods::NormalizePath(b);
+    // 规范化失败会返回空串，那是"不知道"而不是"同一条路径"：空 == 空 若当相等，
+    // 两条不同的候选会被误判成自身而剔出候选池，宁可都留下让调用方自己判断。
+    if (na.empty() || nb.empty()) return false;
+    return na == nb;
 }
 
 // 选举：版本大者优先；同版本路径字典序小者优先。

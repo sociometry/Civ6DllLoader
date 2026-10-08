@@ -41,7 +41,10 @@ std::wstring NormalizePath(const std::wstring& path) {
     std::error_code ec;
     fs::path p(path);
     fs::path canon = fs::weakly_canonical(p, ec);
-    if (!ec) p = canon;
+    // 失败就返回空：宁可判不出授权，也不能拿没解析过链接的原始串当规范路径
+    //（否则 junction/符号链接规范化失败时原始串仍带 Mod 根前缀，会被放行）。
+    if (ec) return {};
+    p = canon;
     std::wstring s = p.wstring();
     for (auto& c : s) {
         if (c == L'/') c = L'\\';
