@@ -786,7 +786,7 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
   畸形 sidecar 触发的分配/解析异常只让本次加载失败，绝不逃出工作线程；
 - `BuildNewTable(imageId, target)`：解析目标映像的 `.pdata`（PE 异常目录），对每条算签名
   （`(begin_rva, size, unwind_hash)`，`unwind_hash` 是 FNV-1a64），再按顺序判定：
-  ① `SizeOfImage` + `TimeDateStamp` 相同 = 同一构建 → 恒等映射；
+  ① **去 DRM `SizeOfImage`** + `TimeDateStamp` 相同 = 同一构建 → 恒等映射；
   ② 否则整表逐条 `(begin_rva, size, unwind_hash)` 相等（纯重建）→ 同样恒等映射；
   ③ 两者都不同 → 跨版本匹配：磁盘缓存（`LoadCache` / `SaveCache`，键 =
   新表指纹 + sidecar 指纹；两者都是各自 pdata 表 `(size, unwind_hash)` 序列的 FNV-1a64，**不含**
@@ -794,6 +794,14 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
   **头 hash 校验**（sidecar 里带 `normHeadHash` 的 old 条目，按新映像同一函数的序言字节重算，
   不等即剔除）→ 头 hash 局部恢复（`normHeadHash`，生成端「无 hash」一律写 0）→ 函数体 AOB 恢复 →
   叶子 AOB 匹配 + vtable 槽位反推（结果并入同一张 `leafMap`）；
+  ① 里的 `SizeOfImage` 是**去 DRM 视图**（`NormalizedSizeOfImage`：从末节往前剥掉连续的
+  `.bind` 段后重算，只认 `.bind` 这一个名字）。去 DRM 的 exe 删掉了末尾的 `.bind` 段，
+  `SizeOfImage` 因此比原版小 0x33000，而 `TimeDateStamp` 与 `.pdata` 表逐字节不变 ——
+  sidecar 的 `baseSizeOfImage` 与运行时两边用同一套规则（`symdb.py:normalized_size_of_image`
+  与 `PdataMatch.cpp:NormalizedSizeOfImage`），故去 DRM 版与原版都能命中快路径。
+  GameCore 没有 `.bind`（末节是 `.reloc`），原样返回。
+  **注意两种 `SizeOfImage` 用途不同**：身份判定用归一值，所有越界/边界检查一律用 PE 原始值
+  （`nt->OptionalHeader.SizeOfImage`），不能用 sidecar 里的历史值去约束当前映像；
 - 缓存命中后按头/尾 + 最多 64 个等距条目做一次抽样自校验（`ValidateCachedMap`）。它只保证「结构上像
   本次匹配的产出」（索引不越界、签名/头 hash/AOB 至少一条成立），**不是对缓存可信度的保证**：缓存文件
   与 sidecar 同在游戏目录、权限相同，能改写它的人也能直接换掉 runtime；

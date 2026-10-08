@@ -182,6 +182,11 @@ DEFAULT_PACK = os.path.join(HERE, "Civ6DllLoader.symdb.pack.bin")
 DEFAULT_AOB_HELPER = os.path.join(HERE, "aob_helper.exe")
 DEFAULT_NORMHASH_HELPER = os.path.join(HERE, "normhash_helper.exe")
 DEFAULT_DEMUMBLE = os.path.join(HERE, "demumble.exe")
+
+# 去 DRM 的 exe 会删掉末节的 .bind 段（SecVR 遗留段），SizeOfImage 随之变小而 TDS/pdata 不变。
+# sidecar 里的 baseSizeOfImage 统一记"剥掉它之后"的值，两端（此处与运行时的
+# NormalizedSizeOfImage）用同一套规则。只认 .bind，避免误伤 GameCore 末尾的 .reloc。
+DRM_SECTION = b".bind"
 # 运行时内嵌资源（Sidecar.rc 的 102 RCDATA）
 RUNTIME_XP = os.path.join(ROOT, "DllLoaderRuntime", "Civ6DllLoader.symdb.bin.xp")
 
@@ -517,10 +522,50 @@ def scan_candidate_vtables(asm_path, exe_path, base):
     return out
 
 
+def normalized_size_of_image(pe) -> int:
+    """SizeOfImage 的"去 DRM 视图"：剥掉末尾连续的 DRM 段后重算。
+
+    去 DRM 的 exe 删掉了末节的 .bind 段（SecVR 遗留段），SizeOfImage 因此比原版小
+    0x33000，而 TimeDateStamp 与 .pdata 表逐字节不变。若这里记原始 SizeOfImage，
+    运行时（PdataMatch.cpp 的 NormalizedSizeOfImage，已剥掉 .bind 再比）就对不上，
+    会退化成"逐条比 pdata 表"的慢路径。
+
+    两端必须同一套规则。GameCore 没有 .bind（末节是 .reloc），返回原值。
+
+    只认 .bind：不按"末节且非代码段"之类的启发式剥离，那会误伤 GameCore 的 .reloc。
+    """
+    original = pe.OPTIONAL_HEADER.SizeOfImage
+    alignment = pe.OPTIONAL_HEADER.SectionAlignment
+    if not alignment:
+        return original
+    secs = list(pe.sections)
+    if not secs:
+        return original
+
+    def is_drm(s) -> bool:
+        return bytes(s.Name).rstrip(b"\0") == DRM_SECTION
+
+    keep = len(secs) - 1
+    if keep < 0 or not is_drm(secs[keep]):
+        return original                      # 末节不是 DRM 段
+    while keep > 0 and is_drm(secs[keep]):
+        keep -= 1                            # 跳过末节连续的 DRM 段，停在最后一个非 DRM 段
+    if keep == 0:
+        return original                      # 全是 DRM 段：布局异常，不采用
+
+    last = secs[keep]
+    vs = last.Misc_VirtualSize
+    end = last.VirtualAddress + max(vs, last.SizeOfRawData)
+    aligned = (end + alignment - 1) // alignment * alignment
+    if aligned >= original:
+        return original                      # 剥离后不该变大；变大说明解析有问题
+    return aligned
+
+
 def cmd_json_exe(args) -> int:
     base = int(args.base, 16)
     pe = pefile.PE(args.exe)
-    sizeimg = pe.OPTIONAL_HEADER.SizeOfImage
+    sizeimg = normalized_size_of_image(pe)
     pdata_count = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3].Size // 12
 
     # ---- 函数 ----
