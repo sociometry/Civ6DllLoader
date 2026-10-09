@@ -28,4 +28,16 @@ namespace PdataMatch {
 
     // 按 vtable 符号名（demangled/mangled）查矫正后的 vtable RVA 与槽位数。
     bool CorrectVTableByName(uint32_t imageId, const char* name, uint32_t& outRva, uint32_t& outSlotCount);
+
+    // "去 DRM 视图"的 SizeOfImage：剥掉 PE 节表末尾连续的 .bind 段（SecVR 遗留 DRM 段）
+    // 后按 SectionAlignment 重算；无 DRM 段或算出的值不合理时原样返回 nt 的 SizeOfImage。
+    //
+    // 【只能用于构建身份判定】—— 同一份代码去不去 DRM，末节 .bind 的有无会让原始
+    // SizeOfImage 差 0x33000（DX11 0x3704000↔0x36D1000、DX12 0xFE55000↔0xFE22000），
+    // 而 TimeDateStamp 与 .pdata 表逐字节不变。sidecar 的 baseSizeOfImage 记的也是去 DRM
+    // 视图，所以任何"这个映像是不是我认识的那个构建"的比较，两边都必须用本函数。
+    //
+    // 【不能用于边界检查】—— 越界/区间检查必须用 nt->OptionalHeader.SizeOfImage 原始值，
+    // 那是镜像实际占据的大小；拿 sidecar 里的历史值去约束当前映像是错的。
+    uint32_t NormalizedSizeOfImage(const IMAGE_NT_HEADERS* nt);
 }

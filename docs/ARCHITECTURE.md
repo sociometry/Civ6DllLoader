@@ -156,7 +156,7 @@
 ### 1.4 一次性启动线程（阶段 A）
 
 `RuntimeEntry.cpp` 的 DllMain 通过休眠检测后建一个**一次性**线程（`WorkerMain`），步骤是固定的
-（下文编号与 `WorkerMain` 里的注释编号一一对应：1 / 1.5 / 2 / 2.5 / 3 / 4）：
+（下文编号与 `WorkerMain` 里的注释编号一一对应：1 / 1.2 / 1.5 / 2 / 2.5 / 3 / 4）：
 
 1. `LoaderCore::InitEarly()`：`Logger::Init` + `VerifyHookApiTableProtection`（HookAPI 表必须落在只读页）
    + `PdataMatch::Init`（加载 sidecar）+ **为当前 exe 变体建档** + `Runtime::InitMinHook`。
@@ -164,12 +164,14 @@
    只是让 sidecar 可用，还要为**当前进程实际是 DX11 还是 DX12** 建一份 exe 符号表，供插件按旧 exe
    RVA 作跨版本矫正。缺模块或建档失败一律 fail-closed：该映像的 `ResolveByRva`/`ResolveByName`
    返回 `nullptr`，**不回退原 RVA**（原 RVA 在更新后本就是错的），所以这两种情况都会留醒目日志；
-2. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
-3. `LoaderHooks::InstallAll()`：exe 域钩子。**`LoadDLL` 是必需项**（它失败会把本次已建的钩子全部回滚），
+2. `hks::InitHavokScript()` + `Localization::InitScript()`：两个**进程级静态导入**解析一次
+   （缺失只降级各自的 API，不影响插件加载；为什么放这一阶段见 §1.5）；
+3. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
+4. `LoaderHooks::InstallAll()`：exe 域钩子。**`LoadDLL` 是必需项**（它失败会把本次已建的钩子全部回滚），
    `UnloadDLL` 是**可选项**（失败只放弃它一个，`LoadDLL` 照常留着——丢一个可选功能不等于丢全部）；
-4. `UiInject::Install()`：主菜单 UI 注入钩，失败静默降级；
-5. `LoaderUpdate::CheckAndApplyUpdate()`：runtime 级自更新检查（薄壳之外的第二道）；
-6. `LoaderCore::LoadPluginsOf(PluginCategory::Global)`：扫描并加载 **Global 插件**。
+5. `UiInject::Install()`：主菜单 UI 注入钩，失败静默降级；
+6. `LoaderUpdate::CheckAndApplyUpdate()`：runtime 级自更新检查（薄壳之外的第二道）；
+7. `LoaderCore::LoadPluginsOf(PluginCategory::Global)`：扫描并加载 **Global 插件**。
 
 这条线程**不常驻**：没有事件循环、没有 reconcile（见 §3.3）。此后一切都在游戏线程上由 detour 驱动。
 
@@ -277,8 +279,10 @@
 - **第 5 步必须在第 7 步之前**：入口字节还原之后才谈得上"Free 插件不会留下入口跳向已释放代码的窗口"；
 - **第 9 步重扫而不是沿用第 5 步的地址列表**：第 5～9 步之间还跑过插件卸载，而 `PushLuaMethods` 这类
   注册入口按设计不过域门，理论上仍可能往正在拆除的映像上装钩——重扫能一并收掉；
-- **不再需要"补丁区间清账"**：唯一的补丁来源是插件的 `PatchImpl`，它已过正面域规则（§4.1），
-  拆映像时不可能存在落在旧映像区间里的记录。
+- **这里【不做】补丁区间清账，是设计决定**：Loader 已删除补丁自动回滚（§5.8），补丁记录只在插件
+  自己调 `Unpatch` 时才从 `PatchRegistry` 摘除。副作用是**未撤销的补丁记录会跨代存活** —— GameCore
+  插件若没调 `Unpatch`，它那条落在旧映像区间里的记录会留到进程退出；新一代 GameCore 映射到同一基址时，
+  这条陈旧记录仍会参与 `OverlapsRegistered` / `OverlapsHookPrologue` 的区间仲裁（见 §5.8）。
 
 ### 2.4 插件模块的释放时机
 
@@ -435,8 +439,9 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   `api` 是 Loader 通过 `OnLoad` 传进来的 `LoaderCore::RuntimeHookApi()`（= `&g_hookApi`，
   Loader 编译进去的那份表），`CIV6_HOOK_API_VERSION` 与 `sizeof(HookAPI)` 才是插件编译进去的值。
   因此它能同时检出两种失配：**破坏性改动**（Loader 侧 `apiVersion` 变了而插件头没跟上，或反之）
-  与 **append-only 场景**（Loader 表更大时 `structSize` 不等式成立，正是头文件 `:330-333` 承诺的语义；
-  Loader 侧 `structSize` 另有 static_assert 钉死）。它守不住的是"插件根本没调它"——
+  与 **append-only 场景**（Loader 表更大时 `structSize` 不等式成立，正是 `common/HookAPI.h` 里
+  `HookAPI_IsCompatible` 上方注释承诺的语义；Loader 侧 `structSize` 另有 static_assert 钉死）。
+  它守不住的是"插件根本没调它"——
   真正在 `OnLoad` 之前硬把关的仍然是上一条的 `Civ6PluginKind` 导出：
 - 两个门的分工：`Civ6PluginKind` 决定"要不要跑 `OnLoad`"（Loader 侧强制），
   `HookAPI_IsCompatible` 是插件进入主逻辑前的自检（插件侧自愿，但比较内容有效）。
@@ -481,18 +486,15 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 - `Global` 类别：目标必须落在**某个已加载的非 GameCore 模块**内 —— exe、常驻系统 dll（user32/dxgi…）、
   插件自己的模块都算；**堆、`VirtualAlloc` 的 JIT 页、空闲地址、将来会被 GameCore 占用的地址一律拒绝**。
 
-> ⚠️ **Global 这一条目前只实现了一半。** 代码用的是
-> `const bool disjoint = !hasGameCore || (…)`（`IsRangeOpenToCaller`，`IsTargetOpenToCaller` 同形），
-> 于是**GameCore 未加载时 `disjoint` 无条件为真**，判据退化成"落在某个已加载模块里即可"。
-> 而 GameCore 未加载正是阶段 A、以及每一局开始前的全部时间 —— 恰是本规则存在的意义所在。
-> 代码自己的注释（`Civ6DLLHookLoaderAPI.cpp` 域门段上方）明确写着这种写法已被否决，
-> 理由正是"GameCore 未加载时它对任何地址都放行"，但实现没有跟上。
-
 实现（`Civ6DLLHookLoaderAPI.cpp`）：`IsTargetOpenToCaller`（单点）/ `IsRangeOpenToCaller`（整段）/
 `IsImageOpenToCaller`（image 参数）；模块判定用 `RangeInsideOneLoadedModule`——两端各自的
 `GetModuleHandleExW(FROM_ADDRESS)` 返回同一模块句柄，即证明整段同属一个已加载模块（不解析 PE）。
-注意该判定**只比首尾两端的模块句柄**，并不证明整段落在 `[模块基址, 基址+SizeOfImage)` 之内：
-模块映像之后的保留/对齐区仍会通过。
+
+`GetModuleHandleExW(FROM_ADDRESS)` **严格按该模块的 `SizeOfImage` 判定归属**（本机实测：
+`kernel32` 基址 `+SizeOfImage-1` 命中，`+SizeOfImage` 即返回 FALSE / `ERROR_MOD_NOT_FOUND`=126）。
+所以"`!hasGameCore` 让第一个合取项恒真"并不构成放行——判据由第二个合取项
+`RangeInsideOneLoadedModule` 独立承担，堆页 / JIT 页 / 空闲地址 / 映像外的对齐余量都拿不到模块句柄。
+（曾有"模块映像之后的保留/对齐区仍会通过"的说法，已实测证伪并删除。）
 
 
 与域门**并列**的其它仲裁（顺序见 §5.5）：页属性预检（`PluginBoundary`）、补丁区间仲裁
@@ -524,8 +526,8 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   `LocPushArgument` / `LocToUtf8`——走独立模块 `Localization_FinalRelease.dll` 的导出；
 - `MakeHash`：**已内化**为 loader 自己的原生 CRC32（raw，无最终异或，与官方 `GameCore::Utilities::MakeHash`
   逐位一致，并有编译期自检向量）；不再解析任何 GameCore 符号，任何时刻可算；
-- `GetMainLuaState`：读 exe 全局 `LuaSystem::LuaScriptSystem::ms_apSingletonInstance`（RVA 0x2D08F88）
-  解引用后的 `+0x10` → **引擎主 Lua VM**（`m_pkMainLuaState`）。★ 这是**进程级** state：
+- `GetMainLuaState`：读 exe 全局 `LuaSystem::LuaScriptSystem::ms_apSingletonInstance`（DX11 实测 RVA
+  `0x2D08F88`）解引用后的 `+0x10` → **引擎主 Lua VM**（`m_pkMainLuaState`）。★ 这是**进程级** state：
   `lua_newstate()` 在 `Civ6App::GUIInit` 建一次，只在 `Civ6App::GUIShutdown` `lua_close`
   ——**换局不会失效、也不会被重写**（全 exe 仅一处写 `+0x10`）。未就绪返回 null。
   **Global 与 GameCore 两类插件都可调用，不限类别**——它是进程级 state，常驻插件持有它
@@ -788,7 +790,7 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
    `Civ6DllLoader_FrontEndUI.{lua,xml}` 释放到 `<exe 目录>\Civ6DllLoader\`；目标文件已存在就跳过
    （用户可以在磁盘上改），写入用 `CREATE_NEW`，"已被别人放好"按良性竞态处理；
 2. **钩子**：`UiInject::Install()` detour `MainMenuState::LoadUI`（exe 域独立钩，与站点表无关，
-   见 §5.4）。detour 先调原函数（FrontEnd 与 InvitePopup 由游戏自己建），再 `RunInjectionSafely`；
+   见 §5.5）。detour 先调原函数（FrontEnd 与 InvitePopup 由游戏自己建），再 `RunInjectionSafely`；
 3. **注入**（`InjectFrontEndUi`，只在游戏/UI 线程执行；重入时置 `g_refreshRequested` 留到下次
    `LoadUI`）：AOB 解出 `ForgeUI::UIManager` 全局槽 → 从 `MainMenuState + 0x230` 取 FrontEnd
    context → `AllocateControl<LuaContext>(mgr)` 造根 context → `ChangeParent` 挂到 FrontEnd 下 →
@@ -866,7 +868,11 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
   与 `PdataMatch.cpp:NormalizedSizeOfImage`），故去 DRM 版与原版都能命中快路径。
   GameCore 没有 `.bind`（末节是 `.reloc`），原样返回。
   **注意两种 `SizeOfImage` 用途不同**：身份判定用归一值，所有越界/边界检查一律用 PE 原始值
-  （`nt->OptionalHeader.SizeOfImage`），不能用 sidecar 里的历史值去约束当前映像；
+  （`nt->OptionalHeader.SizeOfImage`），不能用 sidecar 里的历史值去约束当前映像。
+  **凡是"这个映像是不是我认识的那个构建"的比较，两边都必须走归一口径** —— 目前共三处：
+  `BuildNewTable` 的 `headerIdentity`、exe 版本锚 `ExeMatchesAnchor`（`Civ6DLLHookLoaderAPI.cpp`，
+  无符号库时判断能否直接信任原始 RVA）、以及 `PdataMatch` 的那条"header 不同但 pdata 相同"日志
+  （早期只改了前两处，第三处会打出两种口径的假差异）；
 - 缓存命中后按头/尾 + 最多 64 个等距条目做一次抽样自校验（`ValidateCachedMap`）。它只保证「结构上像
   本次匹配的产出」（索引不越界、签名/头 hash/AOB 至少一条成立），**不是对缓存可信度的保证**：缓存文件
   与 sidecar 同在游戏目录、权限相同，能改写它的人也能直接换掉 runtime；

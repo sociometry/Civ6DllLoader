@@ -27,7 +27,9 @@ Outputs (typical):
 
 Copy both into a Workshop mod under `Binaries\Win64\`. On the first launch the shell elects the
 highest-version runtime, copies it to `<game exe dir>\version.dll` and asks to restart; after that
-restart the proxy DLL is what pulls the loader in (the shell then only serves vanilla sessions).
+restart the proxy DLL is what pulls the loader in. Once the loader is in place the shell is never
+loaded at all — the `LoadDLL` detour redirects the Expansion2 slot straight to the stock GameCore
+DLL, vanilla sessions included (see `docs/ARCHITECTURE.md` §1.1).
 
 Runtime candidates carry static version metadata (RCDATA 105). Installation and
 updates read this resource without executing candidate DLL entry points or exports.

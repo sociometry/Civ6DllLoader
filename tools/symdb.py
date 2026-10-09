@@ -44,8 +44,10 @@ symdb.py - Civ6 符号库（sidecar）流水线唯一入口
     +24  uint32 flags
     +28  uint32 reserved
   ModuleDesc (64B, DESC, 紧跟 header):
-    +0   uint32 imageId           (1=ExeDx11, 2=ExeDx12, 3=GameCoreBase, 4=GameCoreXP1,
-                                   5=GameCoreXP2)
+    +0   uint32 imageId           (1=ExeDx11, 2=ExeDx12, 5=GameCoreXP2)
+                                   ⚠️ 只支持这三个值。HookImageId 枚举里的 3=GameCoreBase /
+                                   4=GameCoreXP1 是保留值，运行时 PdataMatch 遇到它们会
+                                   直接判为 unsupported 并【拒载整个容器】，所以别打进去。
     +4   uint32 baseSizeOfImage
     +8   uint32 baseTimeDateStamp
     +12  uint32 pdataOffset       // 以下 offset 均为文件绝对偏移
@@ -70,8 +72,10 @@ symdb.py - Civ6 符号库（sidecar）流水线唯一入口
   heap       变长:  名字池，NUL 结尾，offset 0 保留
   aob        变长:  <I bodySize> + body[bodySize] + mask[bodySize]（bodySize <= MAX_AOB=64）
 
-  不变式（validate 会查）：符号表末尾 == vtableOffset、槽位末尾 == heapOffset、
-  堆末尾 == aobOffset、aobOffset + aobSize == 文件大小。
+  各段在模块内按 [pdata, symbol, vtable, heap, aob] 顺序 8 字节对齐依次排列（padding8 补齐），
+  所以"前一段末尾 == 后一段 offset"只在恰好对齐时成立，中间可能有填充字节。
+  validate 实际检查的是【各段是否都落在容器 blob 范围内】（_check_extents），外加模块内
+  符号/vtable/AOB 的游标消耗守恒；不检查上面的相邻等式。
 
 
 ================================================================================
@@ -87,8 +91,7 @@ symdb.py - Civ6 符号库（sidecar）流水线唯一入口
   （dict 16MB 是 44MB 容器的拐点；再大只省 0.5%。）
   实测 44.3 MB 容器（3 模块）→ 3,991,784 B（9.0%）。
 
-  历史上出现过的 lzms / xpress / --legacy 路径运行时早就不认，已删除；
-  compress 只保留 LZMA1 这一条默认路径。
+  compress 只保留 LZMA1 这一条路径（运行时也只认这一种信封，见上）。
 
 
 ================================================================================
@@ -205,10 +208,9 @@ IMAGE_NAMES = {1: "ExeDx11", 2: "ExeDx12", 3: "GameCoreBase",
                4: "GameCoreXP1", 5: "GameCoreXP2"}
 
 # build_module 实际消费的 JSON 结构（symbols/vtables）。version 只是生产者标签：
-# 仓库里的 GameCore.symdb.json = 2，两个 exe JSON = 4 —— 结构与 v1 完全一致。
-# 旧 build_sidecar.py 曾写死 "!= 1 就退出"，导致它无法重建仓库里已有的 .bin；
-# 这里保留校验，但接受这三种已知兼容的标签：version 只是标签，从未发布过，
-# 不做版本兼容分支；未知值仍然硬失败。
+# 仓库里的 GameCore.symdb.json = 2，两个 exe JSON = 4 —— 三者结构完全一致。
+# 保留校验是为了挡住手改坏的输入；version 始终只是标签（项目从未发布过，不做版本兼容分支），
+# 未知值硬失败。
 JSON_SCHEMA_VERSIONS = (1, 2, 4)
 
 # ---------------------------------------------------------------- 信封 ("C6XC")
@@ -550,7 +552,9 @@ def normalized_size_of_image(pe) -> int:
         return original                      # 末节不是 DRM 段
     while keep > 0 and is_drm(secs[keep]):
         keep -= 1                            # 跳过末节连续的 DRM 段，停在最后一个非 DRM 段
-    if keep == 0:
+    # 循环停在 keep == 0 时，"只剩首段"与"全是 DRM 段"两种情形都成立，必须看 secs[keep]
+    # 是不是 DRM 段才能区分（与 C++ 的 PdataMatch::NormalizedSizeOfImage 同规则）。
+    if is_drm(secs[keep]):
         return original                      # 全是 DRM 段：布局异常，不采用
 
     last = secs[keep]

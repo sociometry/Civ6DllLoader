@@ -143,7 +143,7 @@ bool ReadResourceData(HMODULE module, int id, std::vector<uint8_t>& out) {
     return true;
 }
 
-// 写文件（覆盖）。失败返回 false。
+// 新建文件并整段写入（文件已存在则失败，**不覆盖**）。失败返回 false。
 // CREATE_NEW：只在文件不存在时创建。调用方的语义本来就是"已存在则跳过"，
 // 这样同时消掉 GetFileAttributesW -> CreateFileW 之间的 TOCTOU，也不会跟到 junction/symlink 目标。
 bool WriteWholeFile(const std::wstring& path, const void* data, size_t len) {
@@ -378,7 +378,8 @@ bool IsSafeUiFilePath(const std::string& file, std::string& baseName) {
     }
     size_t slash = file.find_last_of("/\\");
     const std::string fname = slash == std::string::npos ? file : file.substr(slash + 1);
-    // 到这里 fname.size() >= 12（上面的 <= 11 已挡掉更短的），末尾 4 字节必在范围内。
+    // 下面的 size() <= 11 先挡掉短于 kModUiPrefix + ".xml" 的名字（|| 短路保证后面
+    // fname.size() - 4 不下溢），所以末尾 4 字节必在范围内。
     if (fname.size() <= 11 || _strnicmp(fname.c_str(), kModUiPrefix, 11) != 0 ||
         _stricmp(fname.c_str() + fname.size() - 4, ".xml") != 0) {
         return false;

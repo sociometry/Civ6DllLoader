@@ -286,7 +286,8 @@ typedef struct HookAPI {
     // 必须完全一致。name 指针必须来自调用插件模块。
     int (*RegisterPushMethodsTarget)(const char* name, int sigType, const char* pushMethodsSymbol);
 
-    // v2: 原始字节补丁（单层存档，见 patch registry）。由运行时在初始化时填表。
+    // 原始字节补丁（单层存档，见 patch registry）。两个槽在 Loader 的静态 HookAPI 表
+    // （g_hookApi，编译期常量初始化）里一次性填好，运行期不再改表。
     bool (*Patch)(void* target, const void* bytes, size_t len);
     bool (*Unpatch)(void* target);
 

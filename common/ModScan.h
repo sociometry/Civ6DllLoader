@@ -17,9 +17,9 @@ std::string WideToNarrow(const std::wstring& s);
 // 安装/自更新 loader 用：只看版本，【不】按 Mod 启用集过滤（插件扫描才过滤）。
 std::vector<std::wstring> FindRuntimeCandidates();
 
-// v2: 各启用 Mod 的 Binaries\Win64\Plugins\Global\*.dll 候选（稳定的顺序/大小写不敏感排序/按文件名去重语义）
+// 各启用 Mod 的 Binaries\Win64\Plugins\Global\*.dll 候选（稳定的顺序/大小写不敏感排序/按文件名去重语义）
 std::vector<std::wstring> FindGlobalPluginCandidates();
-// v2: 各启用 Mod 的 Binaries\Win64\Plugins\GameCore\*.dll 候选（同上）
+// 各启用 Mod 的 Binaries\Win64\Plugins\GameCore\*.dll 候选（同上）
 std::vector<std::wstring> FindGameCorePluginCandidates();
 
 }  // namespace ModScan

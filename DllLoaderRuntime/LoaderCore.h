@@ -64,7 +64,7 @@ bool LoadSinglePlugin(const std::wstring& path);   // 已加载返回 false
 
 // 阶段 B：官方 XP2 加载完成后（LoadDLL detour 内调用）。实现于 Civ6DLLHookLoaderAPI.cpp：
 // AttachGameCore(GetModuleHandleW(L"GameCore_XP2_FinalRelease.dll"))
-// → EnsureScriptHooksInstalled()。
+// → 重装共享脚本钩（EnsureScriptHooksInstalled，Loader 内部 static，不在本头文件暴露）。
 // （HKS / Localization 的导入不在这里——它们是进程级静态导入，已在阶段 A 的 WorkerMain 解析。）
 // 返回 false 表示初始化失败（detour 据此跳过 GameCore 插件加载）。
 bool InitializeGameCorePhase();
