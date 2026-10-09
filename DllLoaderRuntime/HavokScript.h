@@ -108,7 +108,9 @@ namespace hks {
 	extern void pushboolean(lua_State* L, bool value);
 	extern void pushlightuserdata(lua_State* L, void* ptr);
 
-	// 每次阶段 B 重新解析（模块常驻，重新解析的是导入地址），可重复调用。
-	// false = HavokScript 模块缺失或有导入未解析，调用方应停用依赖 Lua API 的插件加载。
+	// 阶段 A（WorkerMain）解析一次即可：HavokScript_FinalRelease.dll 是 **exe 的静态导入**，
+	// 随进程装载、进程内不会卸载，所以 GetProcAddress 的结果恒定，没有"需要重新解析"的理由。
+	// 返回 false = 模块缺失或任一导入未解析；调用方按**降级**处理（Lua API 逐入口
+	// 返回安全默认值），不要据此拒载插件。
 	extern bool InitHavokScript();
 }

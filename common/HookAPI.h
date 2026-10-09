@@ -330,8 +330,14 @@ typedef struct HookAPI {
     // IScriptSystem1::CreateLuaThread 建、结束时 FreeLuaThread 回收，**换局必失效**。
     // 本接口返回的不是它们。若插件持有的是某个 thread state，那才是会崩的场景。
     //
-    // 仅游戏线程调用（Lua 状态非线程安全；GameCore.dll 的 CCallWithErrorHandling 用的是
-    // 与 exe 侧不同的临界区实例）。未就绪（GUIShutdown 之后 / 尚未 GUIInit）返回 nullptr。
+    // **Global 与 GameCore 两类插件都可调用，不限类别。** 这个 state 是进程级的，常驻插件
+    // 持有它不会因换局而悬垂（这正是它与 §地址域门 所防的"GameCore 短命域地址"的根本区别）。
+    // 之所以早先一度给它加类别门，是因为把"GameCore.dll 用 Lua::ms_CriticalSection、
+    // exe 用 Lua::Details::LockAccess，是两个不同临界区实例"误当成了类别问题——那其实是
+    // **线程**问题：约束是"仅游戏线程调用"，与插件类别无关，类别门拦不住跨线程调用。
+    //
+    // 仅游戏线程调用（Lua 状态非线程安全）。未就绪（GUIShutdown 之后 / 尚未 GUIInit）
+    // 返回 nullptr。
     void* (*GetMainLuaState)(void);
 
     // Lua nil 入栈（hks ?hksi_lua_pushnil 导出）。参数打包回调里构造 nil 参数用。
@@ -689,7 +695,6 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
 /* GameCore 专属入口：对象式宏重命名 -> 调用或取地址都在编译期报"不是 HookAPI 的成员"。
    结构体字段一个没少、偏移一个没变，只是这些名字在本 TU 里指向了不存在的成员。 */
 #define GetEngineUtility           CIV6_ERROR_GetEngineUtility_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
-#define GetMainLuaState            CIV6_ERROR_GetMainLuaState_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define EditPlayer                 CIV6_ERROR_EditPlayer_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define RegisterGameEvent          CIV6_ERROR_RegisterGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define TriggerGameEvent           CIV6_ERROR_TriggerGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE

@@ -1637,10 +1637,10 @@ void* GetEngineUtilityImpl() {
 }
 
 // 引擎主 Lua VM（进程级，见 HookAPI.h 的 GetMainLuaState 说明）。
-// 无门版本：Loader 内部 GameEvent 路径（GameEventInvokeLuaImpl）也用它——
-// 那条路径的 _ReturnAddress() 落在 loader 模块内，不是插件，加门会误伤它。
-// 对外暴露给插件的入口是下面的 GetMainLuaStateImpl（带类别门）。
-void* GetMainLuaStateCore() {
+// **不限插件类别**：它是进程级 state，Global 插件持有它不会因换局悬垂，所以不需要
+// 地址域门（域门防的是 GameCore 那种"随对局重载的短命域地址"）。Loader 内部
+// GameEvent 路径（GameEventInvokeLuaImpl）也直接调它。
+void* GetMainLuaStateImpl() {
     // 定位 exe 的 ScriptSystem::CallHook 内的全局读取序列（IDA 实证）：
     //   48 8B 05 ?? ?? ?? ??   mov rax, cs:ms_apSingletonInstance
     //   48 8B 48 10            mov rcx, [rax+10h]      ← 主 lua_State
@@ -1693,16 +1693,6 @@ void* GetMainLuaStateCore() {
         if (L) return L;
     }
     return nullptr;
-}
-
-// 插件可见入口：只对 GameCore 类别插件开放（调用方由返回地址反查）。
-// 与 GetEngineUtilityImpl 同款拆法——Core 供 Loader 内部（GameEvent 路径）无门使用，
-// 这里加门后暴露给插件。理由见 HookAPI.h 的 GetMainLuaState 说明：虽然主 state 本身
-// 是进程级的、换局不会失效，但 GameCore DLL 的 CCallWithErrorHandling 用的是与 exe 侧
-// 不同的临界区实例，常驻 Global 插件跨线程在它上面 push/call 会缺锁。
-void* GetMainLuaStateImpl() {
-    if (!RequireGameCoreOwner(_ReturnAddress(), "GetMainLuaState")) return nullptr;
-    return GetMainLuaStateCore();
 }
 
 // 插件卸载/隔离时清理其注册的 GameEvent：清槽位（name[0]='\0' + 字段清空 + ownerId.clear）。
@@ -1794,7 +1784,7 @@ static void WarnEngineUtilityUnavailable(const char* name) {
 static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
                                    const void* payload) {
     if (!name || !*name) return false;
-    void* L = GetMainLuaStateCore();
+    void* L = GetMainLuaStateImpl();
     if (!L) {
         Logger::Log("GameEvent: InvokeLua no-main-state name=%s", name);
         return false;
@@ -2620,7 +2610,7 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
 }
 
 // hks 导入缺失时的统一降级：安全默认值 + 限次日志（脚本可能高频调用，不能每次刷日志）。
-// 导入缺失在 InitHavokScript 已整体告警并停用 GameCore 插件加载；此处是纵深防御
+// 导入在阶段 A（WorkerMain）已整体告警；此处是纵深防御（防"告警漏了/新加导入没跟上"）。
 // （阶段 A 已加载的 Global 插件仍可能在调用这些包装）。
 static void WarnHksImportMissing(const char* name) {
     static std::atomic<int> s_warned{ 0 };
@@ -3854,17 +3844,11 @@ bool LoaderCore::InitializeGameCorePhase() {
         Logger::Log("InitializeGameCorePhase: AttachGameCore failed");
         return false;
     }
-    // 阶段 B 固定顺序：AttachGameCore（映像登记 + pdata 表 + 作用域记账）→ HavokScript 导入 →
-    // 本地化导入 → 共享脚本钩重装（EnsureScriptHooksInstalled，见本函数末尾）→ 加载 GameCore 插件。
+    // 阶段 B 固定顺序：AttachGameCore（映像登记 + pdata 表 + 作用域记账）→ 共享脚本钩重装
+    // （EnsureScriptHooksInstalled，见本函数末尾）→ 加载 GameCore 插件。
     // （历史步骤 InitializeLoader 已删除，见文件上方说明。）
-    // HavokScript 导入缺失 = Lua API 半可用，对插件是崩溃源：停用 GameCore 插件
-    // 加载（本会话游戏本体照常运行）。
-    if (!hks::InitHavokScript()) {
-        Logger::Log("InitializeGameCorePhase: InitHavokScript incomplete; GameCore plugins disabled");
-        ImageAddress::DetachGameCore();
-        return false;
-    }
-    Localization::InitScript();
+    // HKS / Localization 的导入不在这里做：它们是进程级静态导入，已在阶段 A
+    // （WorkerMain）解析完成，缺失只降级各自的 API，不影响本阶段成败。
     g_gameCorePhaseReady = true;
     // 共享脚本钩的 MinHook 记录随旧映像在 ResetForReload 里被摘除，这里按【当次】仍存在的
     // 注册项重装。首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。

@@ -191,13 +191,14 @@
 
 - **阶段 A（进主菜单前）**：上面那条线程。此阶段 GameCore 还没加载，Global 插件的 `OnLoad` 在这里跑；
   它们能做的取址/挂钩只涉及 exe 与常驻模块。
-  ⚠️ **这条规则目前没有真正被执行**：Global 的地址域门按"与当前 GameCore 映像不相交"判定，
-  而阶段 A 没有 GameCore 映像，于是 `!hasGameCore` 使这条判据**无条件成立**，
-  规则退化成"只要落在某个已加载模块里就放行"。详见 §4.1 与 `Civ6DLLHookLoaderAPI.cpp`
-  的 `IsRangeOpenToCaller` / `IsTargetOpenToCaller`。
+  该阶段还解析两个**进程级静态导入**：`hks::InitHavokScript()`（Lua VM）与 `Localization::InitScript()`。
+  两者随 exe 装载、与对局周期无关，故放这里而不是阶段 B（放阶段 B 会把"进程级依赖"误表达成
+  "每局重建的能力"）。导入缺失只**降级**各自的 API（逐入口返回安全默认值 + 限次日志），
+  **不影响插件加载**——插件可能压根不用 Lua 或本地化。
 - **阶段 B（进对局时）**：引擎调用 `LoadDLL` → 我们的 detour（`LoaderHooks.cpp`）改写路径并调原函数，
-  成功后 `LoaderCore::InitializeGameCorePhase()`：`AttachGameCore` → `hks::InitHavokScript` →
-  `Localization::InitScript` → `EnsureScriptHooksInstalled` → 加载 **GameCore 插件**。
+  成功后 `LoaderCore::InitializeGameCorePhase()`：`AttachGameCore` →
+  `EnsureScriptHooksInstalled` → 加载 **GameCore 插件**。
+  （`hks::InitHavokScript` / `Localization::InitScript` **不在**这里——见阶段 A 的说明。）
 - **退对局**：引擎调用 `UnloadDLL` → 我们的 detour 先 `ResetForReload()`（见 §2.3）再调原函数。
 
 `LoaderHooks::InstallAll()` 与 `UiInject::Install()` 都在阶段 A（那条一次性线程里）装钩子；两者失败都只
@@ -512,8 +513,8 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 全部是 `HavokScript_FinalRelease.dll` 导出的薄封装（`HavokScript.cpp`：约 40 个 `GetProcAddress` +
 `checkplayerid` + 极端情况下的原始栈兜底）。入口本身**与 GameCore 无关**：作用对象是**调用方传进来的**
-`lua_State*`，所以两类插件都开放。导入在每次阶段 B 重新解析；缺失时 Lua API 降级，并停用 GameCore
-插件加载（半可用的 Lua 对插件是崩溃源）。
+`lua_State*`，所以两类插件都开放。导入在**阶段 A** 解析一次（该 DLL 是 exe 静态导入、常驻）；
+缺失时逐个入口降级为安全默认值 + 限次日志，**不影响插件加载**。
 
 ### 4.4 其它
 
@@ -527,15 +528,16 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   解引用后的 `+0x10` → **引擎主 Lua VM**（`m_pkMainLuaState`）。★ 这是**进程级** state：
   `lua_newstate()` 在 `Civ6App::GUIInit` 建一次，只在 `Civ6App::GUIShutdown` `lua_close`
   ——**换局不会失效、也不会被重写**（全 exe 仅一处写 `+0x10`）。未就绪返回 null。
-  已按 `GetEngineUtility` 同款拆 **Core / Impl** 并**两层设防**：在 `HookAPI.h` 底部的
-  "GameCore 专属成员重命名"名单里，实现侧 `RequireGameCoreOwner`。（拆分是必须的：
-  `GameMainLuaStateCore` 同时供 Loader 内部 GameEvent 路径无门使用，直接在首行加门会误伤它。）
+  **Global 与 GameCore 两类插件都可调用，不限类别**——它是进程级 state，常驻插件持有它
+  不会因换局悬垂，所以与 `GetEngineUtility` 那类"GameCore 短命域"入口不同类，不受地址域门限制。
 
   ⚠️ **别和"每局 thread state"混淆**：Civ6 确实是多 `lua_State` 引擎，但 GameCore 每局用
   `IScriptSystem1::CreateLuaThread` 建的是 `lua_newthread(main_state)` 派生的 coroutine，
-  换局必被 `FreeLuaThread` 回收。本接口返回的**不是**它们。给本接口加门的理由是**锁**：
-  GameCore.dll 的 `CCallWithErrorHandling` 用的是 `Lua::ms_CriticalSection`，与 exe 侧
-  `Lua::Details::LockAccess` 是**不同实例**，常驻 Global 插件跨线程在它上面 push/call 会缺锁。
+  换局必被 `FreeLuaThread` 回收。本接口返回的**不是**它们；若插件持有的是某个 thread state，
+  那才是会崩的场景。
+  ⚠️ **仅游戏线程调用**（Lua 状态非线程安全）。注意这是**线程**约束而非类别约束：
+  GameCore.dll 用 `Lua::ms_CriticalSection`、exe 侧用 `Lua::Details::LockAccess`，
+  是两个不同实例，所以从非游戏线程调用会缺锁——类别门拦不住这种情况。
 
 ---
 
@@ -890,8 +892,8 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 - `Localization_FinalRelease.dll`：按**导出名**解析 `Lookup` / `PushArgument` / `String` 析构 / `toUTF8` 等；
   缺任何一个只降级对应包装（返回空串/nullptr），不影响其它功能；
 - `HavokScript_FinalRelease.dll`：解析约 40 个 `hksi_lua*` / `hks*` 导出，作为绝大多数 `Lua*` 原语的实现；
-  **每次阶段 B 重新解析**（模块本身是 exe 静态导入、常驻，重新解析的是导入地址）；缺导入 → Lua API
-  降级 + 停用 GameCore 插件加载。唯一的例外是 `LuaPushBoolean`：该 DLL 不导出任何 `pushboolean`，
+  **在阶段 A 解析一次**（该模块是 exe 静态导入、常驻，导入地址恒定，没有"需要重新解析"的理由）；
+  缺导入 → Lua API 逐个入口降级为安全默认值 + 限次日志，**不影响插件加载**。唯一的例外是 `LuaPushBoolean`：该 DLL 不导出任何 `pushboolean`，
   实现是硬编码 `lua_State + 0x48` 的原始栈写入（`RawPushTValue`），换游戏版本必须重验该偏移。
 
 ### 7.6 工具链：`tools/symdb.py`（唯一入口）
@@ -994,7 +996,8 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 | # | 问题 | 位置 | 说明 |
 |---|---|---|---|
-| B | ~~`GetActiveLuaState` 没有类别限制~~ ✅ **已修复** | `HookAPI.h` 重命名名单 + `GetMainLuaStateCore/Impl`（§4.4） | 已按 `GetEngineUtility` 同款拆 Core/Impl 并两层设防。**注意理由与原判断不同**：主 state 是进程级的、换局<u>不会</u>失效（原以为"每局 state"是错的，见 §6.6）；设防的真实理由是**锁**——GameCore.dll 用 `Lua::ms_CriticalSection`，与 exe 侧是不同的临界区实例。接口已改名 `GetActiveLuaState` → `GetMainLuaState`（与引擎自己的 `m_pkMainLuaState` / Tuner 的 `"Main State"` 对齐） |
+| B | ~~`GetActiveLuaState` 没有类别限制~~ ❌ **已撤回：无需设防** | `HookAPI.h`（§4.4 / §6.6） | 主 state 是**进程级**的、换局<u>不会</u>失效（原以为"每局 state"是错的，见 §6.6），所以它**不该**受地址域门限制——与 `GetEngineUtility` 等 GameCore 专属入口不同类。一度据"GameCore.dll 用 `Lua::ms_CriticalSection`、与 exe 侧是不同临界区实例"加过门，但那**是线程问题不是类别问题**，类别门拦不住跨线程调用；约束是"**仅游戏线程调用**"。门已移除。保留的有效产出：接口改名 `GetMainLuaState`（对齐引擎的 `m_pkMainLuaState` / Tuner 的 `"Main State"`）+ 错误注释修正 |
+| H | ~~GameCore 已映射但未 attach 时 Global 能钩进去~~ ✅ **已解决** | `InitializeGameCorePhase` | 根因是**进程级依赖的导入（HKS / Localization）被错放在每局阶段**：`InitHavokScript` 失败会走一条"detach 了却不设 teardown 窗口、标志仍为 false"的路径，导致 Global 插件能钩进一个 Loader 不再跟踪的映像而无人清理。已把两个导入移到阶段 A（`WorkerMain`），该失败路径整体消失。见 `AUDIT_REPORT.md` §35 |
 | C | teardown 窗口在取不到映像信息时被清成空 | `ResetForReload`（`SetGameCoreTeardownWindow(0,0)` 分支） | 而 `base == 0` 时保护判定直接返回 false，等于在最不确定时把门关掉；同文件 `RemoveGameCoreDomainSiteRecords` 在同样情形下**刻意不清**，两者矛盾 |
 | E | 状态码 `3`（预留 Frontend）与若干空槽 | `common/HookAPI.h` | 未实现的功能不应留在核心枚举里 |
 | F | `ShouldSkipPluginFile` 用文件名黑名单而非白名单 | `common/ModScan.cpp` | 会把将来新增的官方 DLL 当插件加载（`FindContentRoot` 那条已于本次提交删除：它接受任意 `Win64*` 前缀，且唯一的调用点会引入"游戏安装根"这个恒空的内容根） |
