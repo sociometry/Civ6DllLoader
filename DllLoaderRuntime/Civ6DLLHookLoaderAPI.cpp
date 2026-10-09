@@ -1561,7 +1561,7 @@ namespace {
 // ——AOB 自锚定，避免硬编码 RVA 的版本脆性。
 constexpr const char* kLuaSingletonPattern =
     "48 8B 05 ?? ?? ?? ?? 48 8B 48 10 E9";
-void* g_activeLuaStateHit = nullptr;   // AOB 命中缓存（Contains 校验，跨代自动重扫）
+void* g_mainLuaStateHit = nullptr;   // AOB 命中缓存（Contains 校验，跨代自动重扫）
 constexpr size_t   kGameEventNameMax           = 96;    // 事件名副本容量（注册表）
 
 // ms_pkCurrentGame 定位 pattern（GameSignals::Subscribe 开头 mov rdi, cs:ms_pkCurrentGame
@@ -1636,33 +1636,37 @@ void* GetEngineUtilityImpl() {
     return GetEngineUtilityCore();
 }
 
-// 当前活跃游戏 Lua 状态——官方 GameCore::ScriptSystem::CallHook 同款（IDA 实证）：
-//   mov rax, cs:?ms_apSingletonInstance@LuaScriptSystem@LuaSystem@@2PEAV12@EA   ; exe RVA 0x2D08F88
-//   mov rcx, [rax+10h]                                                          ; 活跃 lua_State
-// 每次实时读（引擎在对局/脚本切换时更新 +0x10），不缓存。
-void* GetActiveLuaStateImpl() {
+// 引擎主 Lua VM（进程级，见 HookAPI.h 的 GetMainLuaState 说明）。
+// 无门版本：Loader 内部 GameEvent 路径（GameEventInvokeLuaImpl）也用它——
+// 那条路径的 _ReturnAddress() 落在 loader 模块内，不是插件，加门会误伤它。
+// 对外暴露给插件的入口是下面的 GetMainLuaStateImpl（带类别门）。
+void* GetMainLuaStateCore() {
     // 定位 exe 的 ScriptSystem::CallHook 内的全局读取序列（IDA 实证）：
     //   48 8B 05 ?? ?? ?? ??   mov rax, cs:ms_apSingletonInstance
-    //   48 8B 48 10            mov rcx, [rax+10h]      ← 活跃 lua_State
+    //   48 8B 48 10            mov rcx, [rax+10h]      ← 主 lua_State
     //   E9 ?? ?? ?? ??         jmp GameEventLibrary::CallHook
     // AOB 自锚定（不依赖硬编码 RVA，游戏版本更新时该序列由编译器稳定生成）；
     // 命中地址按镜像缓存（Contains 校验，跨代/重载自动重扫）。
+    //
+    // 注：该 pattern 在 PC exe 上命中 6 处（CallHook / CallAccumulator×2 / CallProcessor /
+    // CallTestAll / CallTestAny），但 6 处的 disp32 全部指向同一个单例槽、且都是 mov rcx,[rax+10h]，
+    // 所以取任一处结果等价，不需要唯一性。
     static const HookImageId kCandidates[] = { kHookImageExeDx11, kHookImageExeDx12 };
     for (HookImageId image : kCandidates) {
         if (!ImageAddress::IsLoaded(image)) continue;
         // 缓存命中（地址仍属该镜像）直接用
         void* slot = nullptr;
-        if (g_activeLuaStateHit && ImageAddress::Contains(image, g_activeLuaStateHit)) {
+        if (g_mainLuaStateHit && ImageAddress::Contains(image, g_mainLuaStateHit)) {
             const int32_t disp = GameEventReadInt32Safe(
-                static_cast<const char*>(g_activeLuaStateHit) + 3);
+                static_cast<const char*>(g_mainLuaStateHit) + 3);
             if (disp != 0) {
-                slot = static_cast<char*>(g_activeLuaStateHit) + 7 + disp;
+                slot = static_cast<char*>(g_mainLuaStateHit) + 7 + disp;
             }
         }
         if (!slot) {
             void* hit = ResolveByPatternCore(image, kLuaSingletonPattern, kSectionText);
             if (hit) {
-                g_activeLuaStateHit = hit;
+                g_mainLuaStateHit = hit;
                 const int32_t disp = GameEventReadInt32Safe(static_cast<const char*>(hit) + 3);
                 if (disp != 0) slot = static_cast<char*>(hit) + 7 + disp;
             }
@@ -1672,16 +1676,16 @@ void* GetActiveLuaStateImpl() {
         if (!singleton) continue;
         void* L = GameEventReadPtrSafe(static_cast<const char*>(singleton) + 0x10, 0);
         // 每个进程只打一次命中 RVA（预期 slot RVA=0x2D08F88）：确认 AOB 锚点落对位置，
-        // 是"活跃 state 取不到"这类现场问题的第一手证据。
+        // 是"主 state 取不到"这类现场问题的第一手证据。
         static bool s_logged = false;
         if (!s_logged && L) {
             s_logged = true;
             HookImageInfo info{ sizeof(HookImageInfo) };
             if (ImageAddress::GetInfo(image, &info) && info.base) {
-                Logger::Log("GetActiveLuaState: image=%u hitRva=0x%llX slotRva=0x%llX L=%p",
+                Logger::Log("GetMainLuaState: image=%u hitRva=0x%llX slotRva=0x%llX L=%p",
                     static_cast<unsigned>(image),
                     static_cast<unsigned long long>(
-                        reinterpret_cast<uintptr_t>(g_activeLuaStateHit) - info.base),
+                        reinterpret_cast<uintptr_t>(g_mainLuaStateHit) - info.base),
                     static_cast<unsigned long long>(
                         reinterpret_cast<uintptr_t>(slot) - info.base), L);
             }
@@ -1689,6 +1693,16 @@ void* GetActiveLuaStateImpl() {
         if (L) return L;
     }
     return nullptr;
+}
+
+// 插件可见入口：只对 GameCore 类别插件开放（调用方由返回地址反查）。
+// 与 GetEngineUtilityImpl 同款拆法——Core 供 Loader 内部（GameEvent 路径）无门使用，
+// 这里加门后暴露给插件。理由见 HookAPI.h 的 GetMainLuaState 说明：虽然主 state 本身
+// 是进程级的、换局不会失效，但 GameCore DLL 的 CCallWithErrorHandling 用的是与 exe 侧
+// 不同的临界区实例，常驻 Global 插件跨线程在它上面 push/call 会缺锁。
+void* GetMainLuaStateImpl() {
+    if (!RequireGameCoreOwner(_ReturnAddress(), "GetMainLuaState")) return nullptr;
+    return GetMainLuaStateCore();
 }
 
 // 插件卸载/隔离时清理其注册的 GameEvent：清槽位（name[0]='\0' + 字段清空 + ownerId.clear）。
@@ -1780,9 +1794,9 @@ static void WarnEngineUtilityUnavailable(const char* name) {
 static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
                                    const void* payload) {
     if (!name || !*name) return false;
-    void* L = GetActiveLuaStateImpl();
+    void* L = GetMainLuaStateCore();
     if (!L) {
-        Logger::Log("GameEvent: InvokeLua no-active-state name=%s", name);
+        Logger::Log("GameEvent: InvokeLua no-main-state name=%s", name);
         return false;
     }
     if (!hks::getfield || !hks::setfield || !hks::createtable || !hks::pcall ||
@@ -3245,7 +3259,7 @@ static const HookAPI g_hookApi = {
     &TriggerGameEventImpl,
 
     &GetEngineUtilityImpl,
-    &GetActiveLuaStateImpl,
+    &GetMainLuaStateImpl,
     &LuaPushNilImpl,
 };
 

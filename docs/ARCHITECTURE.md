@@ -523,11 +523,19 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   `LocPushArgument` / `LocToUtf8`——走独立模块 `Localization_FinalRelease.dll` 的导出；
 - `MakeHash`：**已内化**为 loader 自己的原生 CRC32（raw，无最终异或，与官方 `GameCore::Utilities::MakeHash`
   逐位一致，并有编译期自检向量）；不再解析任何 GameCore 符号，任何时刻可算；
-- `GetActiveLuaState`：读 exe 里脚本系统单例槽 → 活跃的 gamecore `lua_State`；对局前返回 null。
-  ⚠️ **它本该与 `GetEngineUtility` 同级受限，但目前两层都不设防**：既不在 `HookAPI.h` 底部那份
-  "GameCore 专属成员重命名"名单里，实现里也没有 `RequireGameCoreOwner` 探针。
-  它返回的是**每局对局**的活跃 state（`HookAPI.h` 自己的注释警告"旧 state 失效后 `GetField`
-  触发 hks 致命错误（80000003）"），而常驻的 Global 插件可以拿到它并跨局持有 —— 需要补上限制。
+- `GetMainLuaState`：读 exe 全局 `LuaSystem::LuaScriptSystem::ms_apSingletonInstance`（RVA 0x2D08F88）
+  解引用后的 `+0x10` → **引擎主 Lua VM**（`m_pkMainLuaState`）。★ 这是**进程级** state：
+  `lua_newstate()` 在 `Civ6App::GUIInit` 建一次，只在 `Civ6App::GUIShutdown` `lua_close`
+  ——**换局不会失效、也不会被重写**（全 exe 仅一处写 `+0x10`）。未就绪返回 null。
+  已按 `GetEngineUtility` 同款拆 **Core / Impl** 并**两层设防**：在 `HookAPI.h` 底部的
+  "GameCore 专属成员重命名"名单里，实现侧 `RequireGameCoreOwner`。（拆分是必须的：
+  `GameMainLuaStateCore` 同时供 Loader 内部 GameEvent 路径无门使用，直接在首行加门会误伤它。）
+
+  ⚠️ **别和"每局 thread state"混淆**：Civ6 确实是多 `lua_State` 引擎，但 GameCore 每局用
+  `IScriptSystem1::CreateLuaThread` 建的是 `lua_newthread(main_state)` 派生的 coroutine，
+  换局必被 `FreeLuaThread` 回收。本接口返回的**不是**它们。给本接口加门的理由是**锁**：
+  GameCore.dll 的 `CCallWithErrorHandling` 用的是 `Lua::ms_CriticalSection`，与 exe 侧
+  `Lua::Details::LockAccess` 是**不同实例**，常驻 Global 插件跨线程在它上面 push/call 会缺锁。
 
 ---
 
@@ -703,15 +711,70 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 ### 6.6 Lua 环境划分与 HavokScript
 
-- 游戏里**不是只有一个 Lua**：`frontend`（主菜单）与 `gamecore`（对局；内部再分 gameplay / ui）是不同
-  的 `lua_State`。Loader 只碰 gamecore 侧：`GetActiveLuaState` 读的是 exe 里脚本系统单例槽指向的活跃 state；
-- Lua VM 在 `HavokScript_FinalRelease.dll`（独立模块），loader 的所有 `Lua*` 原语都经它的导出；
+- 游戏里**不是只有一个 Lua**，但**层次要分清**（两类东西都叫 `lua_State*`，生命周期完全不同）：
+
+  | | 是什么 | 生命周期 |
+  |---|---|---|
+  | **主 VM** | exe 全局 `LuaScriptSystem` 单例的 `+0x10`（`m_pkMainLuaState`），`lua_newstate()` 建 | **进程级**，`GUIInit` → `GUIShutdown` |
+  | **thread / coroutine** | `IScriptSystem1::CreateLuaThread` → `lua_newthread(主VM)` 派生 | **每局**，`FreeLuaThread` 回收 |
+
+  `CallAccumulator<float>` / `CallProcessor` / `CallTestAll` / `CallTestAny` 都是 3 指令 thunk，
+  读的都是**主 VM**；GameCore 的 `ScriptSystem` 本身**不持有任何 `lua_State`**。
+  `GetMainLuaState` 读的是主 VM。**UI（ForgeUI）可能有自己独立的 VM**——未查证，别假设是同一个；
+- Lua VM 实现在 `HavokScript_FinalRelease.dll`（独立模块），loader 的所有 `Lua*` 原语都经它的导出。
+  **GameCore.dll 不含 VM**：它从同一个 DLL 导入 49 个 lua 符号，但**没有** `lua_newstate` /
+  `lua_close` / `lua_newthread`——它只能**消费** state，不能创建或销毁；
 - 谁把"插件的东西"放进 Lua：只有两条——`PushLuaMethods`（loader 把插件闭包塞进游戏的方法表）、插件自己
   在 `RegisterScriptGlobals` 回调里注册的全局/闭包。`GameEvent` 的 `pushFn` 不在 Lua 表里（loader 每次现调）；
 - 因此"插件地址留在 Lua 表里"这件事，在 GameCore 专属 + §2.4 的释放顺序下不成问题：插件模块被释放时，
   那些 state 已经随 GameCore 一起没了；
 - **未支持**：frontend 侧的 PushMethods（`kind=3` 现在被显式拒绝）。将来要做，需要"loader 派发器"式的 adapter，
   否则插件闭包可能活过 GameCore。
+
+#### 6.6.1 结构体参考（IDA 实证，改动本区代码前先读）
+
+> 来源：SO（ARM64，符号全，**结构体类型最可信**）+ PC exe + GameCore.dll 三方交叉验证。
+> ⚠️ **两个平台布局不同**，别互套。下面给出的都是**实测值**。
+
+**`LuaSystem::LuaScriptSystem`**（`ms_apSingletonInstance` 指向的对象；派生类
+`AppLuaScriptSystem` **不新增任何成员**）：
+
+| 偏移 | PC (x64) | SO (ARM64) | 成员 |
+|---|---|---|---|
+| 0x00 | 8 | 8 | `__vftable` |
+| 0x08 / 0x0C | 4 / 4 | 4 / 4 | `m_iLogLevel` / `m_uiLogTypes` |
+| **0x10** | 8 | 8 | **`m_pkMainLuaState`** ← 唯一的 `lua_State` |
+| 0x18 | 5×**0x10** | 5×**0x18** | 5 个 Tuner `FastDelegate`（Remove/Add/Update/Message/Close） |
+| 0x68 / 0x90 | 0x90 | 0x90 | `HksStateSettings` |
+| **总计** | **0xF8 (248)** | **0x120 (288)** | |
+
+**两平台大小不同，差异全部来自 `FastDelegate`**：SO 24 字节、PC 16 字节 × 5。
+（`AppLuaScriptSystem::Create` 里 `operator new(0x120)` / `aligned_malloc_wrp(248)` 可直接印证。）
+
+**`lua_State`**（`m_apistack` 在两个平台**都是 `+0x48`** —— 这是
+`HavokScript.cpp` 的 `kLuaStateTopSlotOffset` 的依据）：
+
+| 偏移 | 成员 | 备注 |
+|---|---|---|
+| 0x00 | `hks::ChunkHeader` (16B) | |
+| 0x10 | `m_global` (`hks::HksGlobal*`) | |
+| 0x18 | `m_callStack` (`hks::CallStack`, 48B) | |
+| **0x48** | **`m_apistack` (`hks::ApiStack`, 32B)** | `top` 在其 `+0x00` → `[L+0x48]` 即 API 栈顶 |
+| 0x68 | `pending` | |
+| 0x70 | `globals` (`HksObject`) | |
+| 0xB0 / 0xB8 (SO) · 0x98 / 0xA0 (PC) | `m_next` / `m_nextStateStack` | **thread 链**——"多 lua_State"的实体 |
+
+**`HksObject`（Lua 栈元素，16B）** —— `RawPushTValue` 的手写布局依据：
+
+| 偏移 | 大小 | 成员 |
+|---|---|---|
+| 0x00 | 4 | `t`（类型标签） |
+| 0x04 | 4 | 空洞 |
+| 0x08 | 8 | `v`（`HksValue` 联合：指针 / double / uint64） |
+
+`ApiStack` = `{ top, base, alloc_top, bottom }`（各 8B），`top` 在 `+0x00`。
+
+> 改动 `HavokScript.cpp` / `PdataMatch` 的 Lua 相关偏移前，先按上表核对。换游戏版本必须重验。
 
 ---
 
@@ -931,12 +994,15 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 | # | 问题 | 位置 | 说明 |
 |---|---|---|---|
-| A | Global 的地址域门在 GameCore 未加载时失效 | `IsRangeOpenToCaller` / `IsTargetOpenToCaller`（§4.1） | `!hasGameCore` 使判据无条件成立；而 GameCore 未加载正是阶段 A 与每局开始前 |
-| B | `GetActiveLuaState` 没有类别限制 | `HookAPI.h` 的重命名名单 + `GetActiveLuaStateImpl`（§4.4） | 返回每局对局的 `lua_State`，却被常驻 Global 插件可获取并跨局持有 |
+| B | ~~`GetActiveLuaState` 没有类别限制~~ ✅ **已修复** | `HookAPI.h` 重命名名单 + `GetMainLuaStateCore/Impl`（§4.4） | 已按 `GetEngineUtility` 同款拆 Core/Impl 并两层设防。**注意理由与原判断不同**：主 state 是进程级的、换局<u>不会</u>失效（原以为"每局 state"是错的，见 §6.6）；设防的真实理由是**锁**——GameCore.dll 用 `Lua::ms_CriticalSection`，与 exe 侧是不同的临界区实例。接口已改名 `GetActiveLuaState` → `GetMainLuaState`（与引擎自己的 `m_pkMainLuaState` / Tuner 的 `"Main State"` 对齐） |
 | C | teardown 窗口在取不到映像信息时被清成空 | `ResetForReload`（`SetGameCoreTeardownWindow(0,0)` 分支） | 而 `base == 0` 时保护判定直接返回 false，等于在最不确定时把门关掉；同文件 `RemoveGameCoreDomainSiteRecords` 在同样情形下**刻意不清**，两者矛盾 |
-| D | `MakeHash` 是唯一既不做探针、也不做归属校验的指针入口 | `MakeHashImpl` | 先探长度、再重新读同一段内存（非原子），且返回值 0 有二义性 |
 | E | 状态码 `3`（预留 Frontend）与若干空槽 | `common/HookAPI.h` | 未实现的功能不应留在核心枚举里 |
 | F | `ShouldSkipPluginFile` 用文件名黑名单而非白名单 | `common/ModScan.cpp` | 会把将来新增的官方 DLL 当插件加载（`FindContentRoot` 那条已于本次提交删除：它接受任意 `Win64*` 前缀，且唯一的调用点会引入"游戏安装根"这个恒空的内容根） |
+
+> **A、D 两行已撤回**（独立复核证伪，详见 `AUDIT_REPORT.md` §9 / §14）：
+> - A：`!hasGameCore` 只让第一个合取项恒真，判据由第二个合取项 `RangeInsideOneLoadedModule` 承担；
+>   且 `GetModuleHandleExW(FROM_ADDRESS)` 严格按 `SizeOfImage` 判定（实测证伪"对齐余量能过"）。
+> - D：`MakeHashImpl` **确有** SEH 探针（`TryStrLenRaw`），且 `LocLookupImpl` 等多处严格更弱。
 
 > 曾经的 G（"补丁自动回滚尚未按 §5.8 删除"）**已解决**：Loader 侧自动回滚已删除，
 > 见 §5.8 与 §9 表第 12 行。

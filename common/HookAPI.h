@@ -314,13 +314,25 @@ typedef struct HookAPI {
     // 与官方 Utility::CallHook 完全同款三步。GameCore 未就绪返回 nullptr。
     void* (*GetEngineUtility)(void);
 
-    // 当前活跃游戏 Lua 状态——**官方 GameCore::ScriptSystem::CallHook 同款**：
-    // 每次实时读 exe 全局 LuaSystem::LuaScriptSystem::ms_apSingletonInstance（RVA 0x2D08F88）
-    // 的 +0x10 字段（引擎在对局/脚本切换时更新它）。
-    // 【真机教训】不要缓存阶段 C 的 L：Civ6 多 lua_State 引擎，启动 state 与每局对局 state
-    // 分离（全局表共享、API 栈不共享），旧 state 失效后 GetField 触发 hks 致命错误（80000003）。
-    // 仅游戏线程调用；无对局/未就绪返回 nullptr。
-    void* (*GetActiveLuaState)(void);
+    // 引擎的**主 Lua VM**（exe 全局 LuaSystem::LuaScriptSystem 单例的 +0x10，RVA 0x2D08F88）。
+    // 这是**进程级** state：由 lua_newstate() 在 Civ6App::GUIInit 时创建一次，只在
+    // Civ6App::GUIShutdown 时 lua_close —— **换局不会让它失效，也不会被重写**
+    // （全 exe 只有一处写 +0x10，就是 Setup 里 lua_newstate 之后那一次）。
+    //
+    // 名字来源于引擎自己：结构体成员就叫 m_pkMainLuaState，Tuner 注册时给的字符串名是
+    // "Main State"。官方 GameCore::ScriptSystem::CallHook 也是读它：
+    //   mov rax, cs:ms_apSingletonInstance ; mov rcx, [rax+10h] ; jmp GameEventLibrary::CallHook
+    // 本接口按同款方式每次实时读单例槽再取 +0x10（槽会在 GUIShutdown 时被清零并 lua_close，
+    // 所以绝不能缓存返回的指针）。
+    //
+    // 【别和"每局 thread state"混淆】Civ6 确实是多 lua_State 引擎，但那些是
+    // lua_newthread(main_state) 派生出来的 coroutine：GameCore 每局用
+    // IScriptSystem1::CreateLuaThread 建、结束时 FreeLuaThread 回收，**换局必失效**。
+    // 本接口返回的不是它们。若插件持有的是某个 thread state，那才是会崩的场景。
+    //
+    // 仅游戏线程调用（Lua 状态非线程安全；GameCore.dll 的 CCallWithErrorHandling 用的是
+    // 与 exe 侧不同的临界区实例）。未就绪（GUIShutdown 之后 / 尚未 GUIInit）返回 nullptr。
+    void* (*GetMainLuaState)(void);
 
     // Lua nil 入栈（hks ?hksi_lua_pushnil 导出）。参数打包回调里构造 nil 参数用。
     void (*LuaPushNil)(void* L);
@@ -677,6 +689,7 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
 /* GameCore 专属入口：对象式宏重命名 -> 调用或取地址都在编译期报"不是 HookAPI 的成员"。
    结构体字段一个没少、偏移一个没变，只是这些名字在本 TU 里指向了不存在的成员。 */
 #define GetEngineUtility           CIV6_ERROR_GetEngineUtility_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define GetMainLuaState            CIV6_ERROR_GetMainLuaState_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define EditPlayer                 CIV6_ERROR_EditPlayer_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define RegisterGameEvent          CIV6_ERROR_RegisterGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define TriggerGameEvent           CIV6_ERROR_TriggerGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
