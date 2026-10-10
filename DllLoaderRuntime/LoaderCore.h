@@ -18,7 +18,9 @@ enum class PluginCategory {
 // 实现于 RuntimeEntry.cpp。
 void InitEarly();
 
-// Loader 自身模块句柄（version.dll）。实现于 RuntimeEntry.cpp；供插件扫描作锚。
+// Loader 自身模块句柄（version.dll）。实现于 RuntimeEntry.cpp。
+// 用途：读自身内嵌资源（`UiInject::ExtractResources`）。插件扫描已不再以它为锚
+//（内容根与调用方无关，见 ModScan::CollectScanRoots）。
 // 返回 0 表示尚未初始化（DllMain 休眠检测未通过，理论不会走到扫描）。
 HMODULE RuntimeModuleHandle();
 

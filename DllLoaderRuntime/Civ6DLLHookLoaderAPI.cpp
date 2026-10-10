@@ -743,9 +743,11 @@ static bool OverlapsHookPrologue(const void* target, size_t len) {
 // target 的统一站点（MinHook 只挂一次，挂到站点 stub）。同一 target 已有 Detour 时
 // 明确拒绝（Detour 槽独占）；Capture 槽可与之共存，挂载顺序无关。
 bool InstallHookImpl(void* target, void* detour, void** original) {
-    // target / original 都是插件内存：必须在取锁【之前】用页属性探测拦掉坏地址。
+    // target 是插件解析出来的【游戏代码地址】，original 是插件给自己的【输出槽】：
+    // 两者都是调用方传入的指针值，有效性无法假定，必须在取锁【之前】用页属性探测拦掉坏地址。
     // 否则 MinHook 读目标前导字节时出错，会把 g_pluginLifecycleMutex 与
     // Runtime::MinHookMutex() 一起泄漏（/EHsc 下 lock_guard 不析构 -> 永久死锁）。
+    // 注意：target 属于游戏模块，不是插件内存——判据是"这个指针值可不可信"，不是"它属于谁"。
     if (!PluginBoundary::IsReadable(target, PluginBoundary::kMinHookTargetSpan)) {
         Logger::Log("InstallHook rejected: target not readable %p (span=%zu)",
             target, PluginBoundary::kMinHookTargetSpan);

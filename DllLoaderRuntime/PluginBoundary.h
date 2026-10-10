@@ -1,21 +1,27 @@
 #pragma once
-// Civ6DllLoader - 插件内存安全边界。
+// Civ6DllLoader - 外部指针安全边界。
 //
 // ============================ 不变量（Invariant） ============================
-// 任何持有 Loader 内部锁的代码，只允许访问 Loader 自有内存：
+// 边界划在【Loader 自有存储】与【调用方传入的指针值】之间，不是"插件 vs Loader"：
+// 前者含插件模块的内存，也含游戏模块的内存（ResolveBy* 解出来的 target / providerAddress
+// 就是游戏 .text 里的地址，同样不可假定有效）。
+// 任何持有 Loader 内部锁的代码，只允许访问 Loader 自有存储：
 //     g_pluginLifecycleMutex / g_pushStateMutex / g_scriptStateMutex /
 //     g_captureMutex / PatchRegistry 的 CRITICAL_SECTION
-// 插件提供的指针，必须在本线程【未持锁】时先经本文件的 Copy*/TryRead* 抄进
-// Loader 自有存储，再进锁使用。
+// 调用方传入的指针，必须在本线程【未持锁】时先经本文件的 Copy*/TryRead* 抄进
+// Loader 自有存储，或先经页属性探测证明可读/可写，再进锁使用。
 //
 // 为什么：MSVC 默认 /EHsc 下，硬件异常（访问违例）穿过 C++ 帧时不会执行析构，
 // lock_guard 不释放 -> 该锁被永久持有 -> 其它线程永久阻塞（游戏卡死，无报错）。
 // 把“可能出错的访存”放到取锁之前，出错路径上就没有任何锁被持有。
 //
-// 其它两类同族入口（不读内存，但要探页属性）：
-//   1) 宿主往插件给的【输出参数】写：InstallHook(original)、GetImageInfo(outInfo)、
+// 其它三类同族入口（不读内存，但要探页属性）：
+//   1) 宿主往调用方给的【输出参数】写：InstallHook(original)、GetImageInfo(outInfo)、
 //      RegisterGlobalCapture(out 槽) -> 用 IsWritable 先探；
-//   2) 宿主读插件给的【函数地址】再去调：用 IsReadable 先探。
+//   2) 宿主读调用方给的【函数地址】再去调：用 IsReadable 先探；
+//   3) 调用方解析出的【游戏代码地址】当 hook 目标用（InstallHook(target)、
+//      RegisterGlobalCapture 的 providerAddress）-> 用 IsReadable（capture 还要 IsExecutable
+//      落在可执行页），因为 MinHook 建记录时要读它的前导字节。
 // 页属性探测基于 VirtualQuery，对任意地址都安全，不需要 SEH。
 // ===========================================================================
 
