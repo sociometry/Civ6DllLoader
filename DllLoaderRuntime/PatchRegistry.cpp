@@ -1,4 +1,4 @@
-// PatchRegistry.cpp — 单层补丁注册表（HookAPI Patch/Unpatch 后端）。
+// PatchRegistry.cpp — 分层补丁注册表（HookAPI Patch/Unpatch 后端）。
 // 域规则/补丁仲裁见 docs/ARCHITECTURE.md §4.1 与 §5.5。
 #include "pch.h"
 #include "PatchRegistry.h"
@@ -17,9 +17,24 @@ namespace PatchRegistry {
 
 namespace {
 
+// 一个 owner 在某个 target 上打的一层补丁。
+struct Level {
+    // 本层写入【之前】该区间的字节。后打补丁者存到的是"含下层补丁"的字节，
+    // 因此它 Unpatch 时还原的是下层补丁而不是原始字节——这正是分层要的效果。
+    std::vector<uint8_t> original;
+    std::wstring owner;
+};
+
 struct Entry {
-    std::vector<uint8_t> original;  // 首次 Patch 时的原始字节（单层存档）
-    std::wstring owner;             // 所属插件 ownerId（规范化全路径，见 PluginEntry::ownerId）
+    // 按应用顺序排列，back() = 栈顶（最后一个打上去的补丁）。
+    std::vector<Level> levels;
+
+    // 本 target 上所有层覆盖的最大长度，用于与【其它 target】做区间仲裁。
+    size_t Extent() const {
+        size_t n = 0;
+        for (const auto& lv : levels) n = (std::max)(n, lv.original.size());
+        return n;
+    }
 };
 
 std::map<void*, Entry>& Registry() {
@@ -155,6 +170,22 @@ void RestoreProtections(const std::vector<SavedProtection>& saved) {
     }
 }
 
+// 把 [target, target+len) 改写成 src（自动处理页保护与指令缓存）。
+// src 必须已由调用方复制到自有缓冲（原字节存档目标、或插件字节的副本）。
+bool WriteBytes(void* target, const void* src, size_t len) {
+    std::vector<SavedProtection> saved;
+    if (!MakeWritableRecording(target, len, saved)) {
+        RestoreProtections(saved);         // 部分成功也要恢复，别留下可写/可执行的页
+        Logger::Log("PatchRegistry: protect failed target=%p len=%zu err=%lu",
+            target, len, GetLastError());
+        return false;
+    }
+    memcpy(target, src, len);
+    RestoreProtections(saved);             // 逐区域恢复各自的原保护属性
+    FlushInstructionCache(GetCurrentProcess(), target, len);
+    return true;
+}
+
 }  // namespace
 
 bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
@@ -182,59 +213,47 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     }
 
     CsGuard csGuard;
-    const auto existing = Registry().find(target);
-    const bool isFirst = existing == Registry().end();
-    if (isFirst) {
-        for (const auto& kv : Registry()) {
-            const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(kv.first);
-            uintptr_t otherEnd = 0;
-            if (RangeEnd(otherBegin, kv.second.original.size(), otherEnd) &&
-                    RangesOverlap(targetBegin, targetEnd, otherBegin, otherEnd)) {
-                Logger::Log("PatchRegistry::Apply: range overlap target=%p len=%zu existing=%p len=%zu",
-                    target, len, kv.first, kv.second.original.size());
+    auto it = Registry().find(target);
+    if (it != Registry().end()) {
+        // 同一 owner 重复 Apply 同一 target：拒绝。补丁已生效，再打一层只会让"哪层是谁的"
+        // 彻底不可追踪；要改字节请先 Unpatch 再 Patch。
+        for (const auto& lv : it->second.levels) {
+            if (lv.owner == owner) {
+                Logger::Log("PatchRegistry::Apply: owner already patched this target "
+                            "target=%p len=%zu owner=%ls (unpatch first)",
+                            target, len, owner);
                 return false;
             }
         }
-        Logger::Log("PatchRegistry::Apply: first patch target=%p len=%zu owner=%ls", target, len, owner);
     } else {
-        if (existing->second.owner != owner) {
-            const std::wstring currentOwner = existing->second.owner;
-            Logger::Log("PatchRegistry::Apply: owner conflict target=%p current=%ls requested=%ls",
-                        target, currentOwner.c_str(), owner);
-            return false;
+        // 只有【新 target】需要与其它 target 做区间仲裁：已存在的 target 允许不同 owner 叠加，
+        // 它们的区间本来就重合。
+        for (const auto& kv : Registry()) {
+            const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(kv.first);
+            uintptr_t otherEnd = 0;
+            if (RangeEnd(otherBegin, kv.second.Extent(), otherEnd) &&
+                    RangesOverlap(targetBegin, targetEnd, otherBegin, otherEnd)) {
+                Logger::Log("PatchRegistry::Apply: range overlap target=%p len=%zu existing=%p extent=%zu",
+                    target, len, kv.first, kv.second.Extent());
+                return false;
+            }
         }
-        if (existing->second.original.size() != len) {
-            const size_t currentLen = existing->second.original.size();
-            Logger::Log("PatchRegistry::Apply: repeat length mismatch target=%p current=%zu requested=%zu owner=%ls",
-                target, currentLen, len, owner);
-            return false;
-        }
-        // 重复 Apply 同一地址：更新当前字节但保留最初存档（日志告警）。
-        Logger::Log("PatchRegistry::Apply: repeat patch target=%p len=%zu owner=%ls (original archive kept)",
-            target, len, owner);
     }
 
+    // 存档必须在写入之前读取：存到的就是"本层写之前"的字节（含下层补丁的效果）。
     std::vector<uint8_t> original(len);
-    const auto* src = reinterpret_cast<const uint8_t*>(bytes);
-
-    std::vector<SavedProtection> saved;
-    if (!MakeWritableRecording(target, len, saved)) {
-        RestoreProtections(saved);         // 部分成功也要恢复，别留下可写/可执行的页
-        Logger::Log("PatchRegistry::Apply: protect failed target=%p len=%zu err=%lu",
-            target, len, GetLastError());
+    memcpy(original.data(), target, len);
+    if (!WriteBytes(target, bytes, len)) {
         return false;
     }
-    memcpy(original.data(), target, len);  // 存档原始字节（写入前读取）
-    memcpy(target, src, len);              // 写入新字节
-    RestoreProtections(saved);             // 逐区域恢复各自的原保护属性
-    FlushInstructionCache(GetCurrentProcess(), target, len);
 
-    if (isFirst) {
-        Entry e;
-        e.original = std::move(original);
-        e.owner = owner;
-        Registry().emplace(target, std::move(e));
-    }
+    Level level;
+    level.original = std::move(original);
+    level.owner = owner;
+    Entry& entry = Registry()[target];
+    entry.levels.push_back(std::move(level));
+    Logger::Log("PatchRegistry::Apply: patched target=%p len=%zu owner=%ls depth=%zu",
+        target, len, owner, entry.levels.size());
     return true;
 }
 
@@ -248,7 +267,7 @@ bool OverlapsRegistered(const void* target, size_t len) {
     for (const auto& kv : Registry()) {
         const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(kv.first);
         uintptr_t otherEnd = 0;
-        if (RangeEnd(otherBegin, kv.second.original.size(), otherEnd) &&
+        if (RangeEnd(otherBegin, kv.second.Extent(), otherEnd) &&
                 RangesOverlap(begin, end, otherBegin, otherEnd)) {
             return true;
         }
@@ -259,25 +278,39 @@ bool OverlapsRegistered(const void* target, size_t len) {
 bool RevertOwned(void* target, const wchar_t* owner) {
     if (!target || !owner || !*owner) return false;
     CsGuard csGuard;
-    const auto it = Registry().find(target);
-    if (it == Registry().end() || it->second.owner != owner) {
-        Logger::Log("PatchRegistry::RevertOwned: owner mismatch target=%p owner=%ls",
+    auto it = Registry().find(target);
+    if (it == Registry().end()) {
+        Logger::Log("PatchRegistry::RevertOwned: no patch record target=%p owner=%ls",
                     target, owner);
         return false;
     }
+    if (it->second.levels.empty()) {
+        Registry().erase(it);
+        Logger::Log("PatchRegistry::RevertOwned: empty record dropped target=%p", target);
+        return false;
+    }
+    // 只允许还原栈顶：下层存档记的是"上层写入之前"的字节，越过上层写回去会静默覆盖
+    // 上层 owner 的补丁（而它自己仍以为补丁在生效）。上层先 Unpatch，下层才轮得到。
+    if (it->second.levels.back().owner != owner) {
+        Logger::Log("PatchRegistry::RevertOwned: not on top of stack target=%p owner=%ls top=%ls",
+                    target, owner, it->second.levels.back().owner.c_str());
+        return false;
+    }
 
-    const size_t origSize = it->second.original.size();
-    std::vector<SavedProtection> saved;
-    if (!MakeWritableRecording(target, origSize, saved)) {
-        RestoreProtections(saved);
+    // 先复制再写：下面 pop_back 会让 src 指向已释放的缓冲。
+    std::vector<uint8_t> original = it->second.levels.back().original;
+    if (!WriteBytes(target, original.data(), original.size())) {
         Logger::Log("PatchRegistry::RevertOwned: protect failed target=%p err=%lu",
                     target, GetLastError());
         return false;
     }
-    memcpy(target, it->second.original.data(), origSize);
-    RestoreProtections(saved);
-    FlushInstructionCache(GetCurrentProcess(), target, origSize);
-    Registry().erase(it);
+    const size_t restored = it->second.levels.back().original.size();
+    it->second.levels.pop_back();
+    if (it->second.levels.empty()) {
+        Registry().erase(it);
+    }
+    Logger::Log("PatchRegistry::RevertOwned: restored target=%p len=%zu owner=%ls",
+                target, restored, owner);
     return true;
 }
 

@@ -429,13 +429,16 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 ### 3.4 插件 ABI：HookAPI 表与版本规则
 
 - 表是 `const HookAPI g_hookApi`（`.rdata`，只读——插件写它会当场 AV，被 `CallOnLoadSafe` 接住）；
-- **表的形状由两条 `static_assert` + 一个计数常量钉死**：`CIV6_HOOK_API_ENTRY_COUNT`（当前 76）
+- **表的形状由两条 `static_assert` + 一个计数常量钉死**：`CIV6_HOOK_API_ENTRY_COUNT`（当前 78）
   必须与 `sizeof(HookAPI)` 和末尾成员偏移同时吻合，否则编译失败；启动时 `VerifyHookApiTableProtection`
-  再扫一遍空项；
+  再扫一遍空项（聚合初始化漏写一项只会静默零填，编译期抓不到）；
 - **当前 `CIV6_HOOK_API_VERSION = 1`，且预发布阶段删改前缀不升版本号** —— 从未对外发布过插件，
-  `1` 是它唯一出现过的值。已发生过两次破坏前缀都没 bump（① 删掉
+  `1` 是它唯一出现过的值。已发生过的破坏前缀都没 bump（① 删掉
   `GetCivilizationDescription` / `RegisterGameCoreReady` / `RegisterGameCoreTeardown`；
-  ② 类别声明从表尾字段 `DeclarePluginKind` 改成插件自带导出 `Civ6PluginKind`，79 字段变 78）。
+  ② 类别声明从表尾字段 `DeclarePluginKind` 改成插件自带导出 `Civ6PluginKind`，入口 79 变 78）。
+  此后只在**尾部追加**过入口（本次追加 `GetSymbolDbState` / `GetSymbolDbMatchRatio`）——
+  追加不破坏旧偏移，旧插件不读新字段即可继续工作，`HookAPI_IsCompatible` 的 `structSize` 比较会
+  放过这种情形。
   **在预发布阶段，插件必须用当前头文件重新编译**；首次对外发布之后才需要递增版本号；
 - **类别走一条独立于表的通路**：`common/HookAPI.h` 为插件自动发出 `Civ6PluginKind` 导出
   （`extern "C" __declspec(dllexport) inline`，低 32 = kind、高 32 = `CIV6_HOOK_API_VERSION`），
@@ -471,7 +474,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 ## 4. 插件接口（HookAPI 全表）
 
-表共 78 个字段 = 2 个头（`apiVersion` / `structSize`）+ 76 个入口。按"谁能用、受什么限制"分四类。
+表共 80 个字段 = 2 个头（`apiVersion` / `structSize`）+ 78 个入口。按"谁能用、受什么限制"分四类。
 
 ### 4.1 双域通用，但按"目标地址域"设门（9 个）
 
@@ -519,10 +522,12 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 `lua_State*`，所以两类插件都开放。导入在**阶段 A** 解析一次（该 DLL 是 exe 静态导入、常驻）；
 缺失时逐个入口降级为安全默认值 + 限次日志，**不影响插件加载**。
 
-### 4.4 其它
+### 4.4 其它（17 个）
 
 - 消息：`BroadcastMessage` / `RegisterMessageHandler` / `SendMessageTo`（§6.2）；
 - `Log`、映像元数据 `IsImageLoaded` / `GetImageInfo`；
+- 符号库状态：`GetSymbolDbState` / `GetSymbolDbMatchRatio`——参数是 `image` 标量，没有跨模块
+  指针可解引用，因此**不过域门、不取插件锁**，只读 `PdataMatch` 自己的快照（§7.3）。
 - 本地化：`LocalizationLookup` / `LocStringBytes` / `LocCreate` / `LocDestroy` / `LocLookup` /
   `LocPushArgument` / `LocToUtf8`——走独立模块 `Localization_FinalRelease.dll` 的导出；
 - `MakeHash`：**已内化**为 loader 自己的原生 CRC32（raw，无最终异或，与官方 `GameCore::Utilities::MakeHash`
@@ -641,7 +646,8 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 ### 5.8 补丁的撤销（`PatchRegistry`）—— **Loader 不自动回滚**
 
-`Patch` / `Unpatch` 是插件对游戏内存的**原始字节修改**，账本按地址存"第一次 Apply 之前的字节"。
+`Patch` / `Unpatch` 是插件对游戏内存的**原始字节修改**。账本是**按 target 分层的 owner 栈**：
+每个 target 维护一串 `Level`（按应用顺序），每层记「该层写入**之前**该区间的字节」+ owner。
 
 **已实施：删除 Loader 侧的自动回滚**（`RevertAllFor` 及其两个调用点
 `UnloadPluginByOwnerId` / `QuarantinePluginByOwner` 里的还原步骤），理由：
@@ -651,22 +657,36 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
   真正会用到它的是**崩溃隔离**（§3.3），而隔离的语义是"模块驻留不卸、代码仍在内存里"——
   此时往**可能正被执行**的代码里写还原字节、又不做任何 quiesce（项目自己有 MinHook 的线程冻结机制，
   但这条路径没用），风险高于收益；
-- **存档未必是"真原始"。** 它存的是"调用 `Apply` 那一刻"的字节；若那一刻该函数已被 MinHook 挂钩，
-  存下来的就是跳板字节，日后写回等于把别的机制的跳板又塞回去；
 - **还原本身也在改页保护**，而恢复保护属性的返回值被忽略，一次失败就会把页永久留在可写状态（破坏 W^X）。
+
+**分层语义**（这一版的设计）：
+
+- **同 owner 重复 `Apply` 同一 target → 拒绝。** 补丁已生效，再叠一层只会让"哪层是谁的"不可追踪；
+  要改字节就 `Unpatch` 再 `Patch`。这同时消除了旧实现"重复 Apply 时保留最初存档"造成的
+  「存档与实际写入不符」的歧义；
+- **不同 owner 可以叠加补丁**（旧实现直接按 owner 冲突拒绝）。每层存的是**本层写入前**的字节，
+  所以后打补丁者 `Unpatch` 时还原的是**下层补丁**而非原始字节——各层各归其位；
+- **`RevertOwned` 只允许还原栈顶。** 下层存档记的是"上层写入之前"的字节，越过上层写回去会静默
+  覆盖上层的补丁（而那个 owner 仍以为自己在生效）。要撤下层就先撤上层；
+- **区间仲裁按 target 的最大层长**（`Entry::Extent()`）。同一 target 上的叠加层区间本就重合，
+  无需仲裁；仲裁只针对**不同 target**，防止两个插件往交错区间打补丁互相踩。
+
+**与 MinHook 的双向互斥**（同一段前导字节被两套机制各存一份"原始字节"会互相覆盖）：
+
+- 装钩前：`InstallHookImpl` 查 `PatchRegistry::OverlapsRegistered(target, kHookPrologueWindow)`；
+- 打补丁前：`HookPatch` 查 `OverlapsHookPrologue(target, len)`——**只看 `hookInstalled == true`
+  的站点**（未 Enable 的站点尚未改写前导字节）。因此**已被挂钩的点位不可能再打上补丁**，
+  反之亦然。窗口取 `PluginBoundary::kMinHookTargetSpan`（32 字节，与可读探测同口径）。
 
 **约定**：
 
-- `Unpatch(target)` **保留**（底层 `PatchRegistry::RevertOwned`），供插件在**自己还活着的时候**
-  主动撤销（典型位置是 `OnUnload`）。这时插件知道自己的状态，也知道自己的补丁是否还被调用；
-- **Loader 不再替插件自动撤销补丁**。隔离/卸载后的补丁留在游戏里，直到进程退出——
-  插件作者应把 `Patch` 视为"进程生命周期内不可撤销"的默认语义，需要可撤销就自己管好 `Unpatch` 时机；
-- `PatchRegistry::OverlapsRegistered` **保留**：即使补丁不可撤销，也必须禁止两个插件往**重叠**区间
-  打补丁（否则一方的补丁会不可逆地踩坏另一方）。`InstallHook` 的前导窗口仲裁 `OverlapsHookPrologue`
-  同理保留。
+- `Unpatch(target)` 保留（底层 `PatchRegistry::RevertOwned`），供插件在**自己还活着的时候**
+  主动撤销。这时插件知道自己的状态，也知道自己的补丁是否还被调用；
+- **Loader 不替插件自动撤销补丁**。隔离/卸载后的补丁留在游戏里，直到进程退出。
 
-> 副作用（已知且接受）：`PatchRegistry` 的记录只增不减（`Apply` 加、`RevertOwned` 减），
-> 隔离或未调 `Unpatch` 的插件会让记录在其后驻留到进程退出。
+> 副作用（已知且接受）：未 `Unpatch` 的层会留到进程退出；GameCore 插件若未撤销，其落在旧映像
+> 区间里的记录会跨代存活，并继续参与 `OverlapsRegistered` / `OverlapsHookPrologue` 的区间仲裁
+> （见 §2.3 第 9 步）。
 
 ---
 
@@ -868,12 +888,24 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 - `CorrectRva` / `CorrectByName` / `CorrectVTableByName` 只查表；构建期（vtable 反推）与运行期查询共用
   同一份 `CorrectRvaInTables` 口径（二分 + 封顶 64 条回扫；只有 `size` 不变时才允许函数内偏移；
   gap / 回扫耗尽退回 `leafMap`）；
-- 返回 0 / nullptr = 矫正失败（调用方按各自失败路径处理）。
+- 返回 0 / nullptr = 矫正失败（调用方按各自失败路径处理）；
+- **状态查询**（`GetMatchState` / `GetMatchRatio`，`HookAPI::GetSymbolDbState` /
+  `GetSymbolDbMatchRatio` 的后端）：把上面的判据结果暴露给插件，让它能在依赖硬编码旧 RVA
+  之前先判断矫正是否可用。`GetMatchState` 区分五态——`NoContext`（sidecar 无该映像模块）/
+  `NotBuilt`（有模块但未建表）/ `BuildFailed`（建表失败，本次会话不可矫正）/ `Identical`
+  （同一构建，RVA 恒等）/ `CrossVersion`（跨版本对齐成功）。`buildAttempted` 与 `tableReady`
+  两个标志一起把"还没轮到"和"试过但失败"分开——单看 `tableReady=false` 无法区分这两者。
+  `GetMatchRatio` 仅对 `CrossVersion` 返回真实匹配率（`map` 中非 `kUnmatched` 的比例），
+  `Identical` 返回 1.0，其余返回 0.0。两者都是纯读快照，只作诊断/降级依据——**单点能否解析
+  始终以 `CorrectRva` / `CorrectByName` 的返回值为准**。
 
 ### 7.4 取址入口与回退顺序
 
 - **插件可见**（`HookAPI`，全部要过 `image` 域门）：`ResolveByRva` / `ResolveByRvaEx`（指定段）/
-  `ResolveByName` / `ResolveByPattern`（AOB 文本）/ `ResolveByVTable`；
+  `ResolveByName` / `ResolveByPattern`（AOB 文本，带 `index` 取段内升序第 N 个命中）/ `ResolveByVTable`；
+- **符号库状态查询**（不过域门、不取插件锁）：`GetSymbolDbState(image)` /
+  `GetSymbolDbMatchRatio(image)`——参数是 `image` 标量，没有跨模块指针，因此只需读
+  `PdataMatch` 自己的快照；
 - **Loader 内部**（不经过插件 ABI，也不拿插件锁）：`LoaderCore::ResolveExeTarget(HookInfoExe)` 与
   `ResolveDataByAobCore(image, aob, index)`；
 - **exe 域双版本**：`HookInfoExe` = 每个变体（DX11/DX12）各一组「RVA + 唯一 AOB」，运行时按当前 exe

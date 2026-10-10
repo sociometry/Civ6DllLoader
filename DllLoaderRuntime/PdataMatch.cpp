@@ -287,6 +287,9 @@ struct ContextState {
     std::vector<PdataSig> newPdata;
     std::vector<uint32_t> map;
     bool tableReady = false;
+    // 是否已经为这个映像执行过建表（无论成败）。用它与 tableReady 一起区分
+    // "还没轮到"（NotBuilt）与"试过但失败"（BuildFailed）—— GetMatchState 需要这个区别。
+    bool buildAttempted = false;
 };
 static std::unordered_map<uint32_t, ContextState> g_contexts;  // imageId -> 上下文
 
@@ -1773,6 +1776,7 @@ bool BuildNewTable(uint32_t imageId, HMODULE target) {
         // imageId 上读到过期的恒等映射（铁律：拿不准就返回 0，不猜）。
         ctx.tableReady = false;
         ctx.identical = false;
+        ctx.buildAttempted = true;   // 本次会话已尝试建表（成败由后续 tableReady 体现）
         // 上下文 -> 构建用 globals（move，构建完再搬回）
         g_oldPdata = std::move(ctx.oldPdata);
         g_symbols = std::move(ctx.symbols);
@@ -1866,5 +1870,30 @@ bool CorrectVTableByName(uint32_t imageId, const char* name, uint32_t& outRva, u
     outRva = static_cast<uint32_t>(corrected);
     outSlotCount = static_cast<uint32_t>(sym.slots.size());
     return true;
+}
+
+MatchState GetMatchState(uint32_t imageId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const auto it = g_contexts.find(imageId);
+    if (it == g_contexts.end() || !it->second.loaded) return MatchState::NoContext;
+    const ContextState& ctx = it->second;
+    if (ctx.tableReady) return ctx.identical ? MatchState::Identical : MatchState::CrossVersion;
+    // 没建表：区分"还没轮到"与"试过但失败"。
+    return ctx.buildAttempted ? MatchState::BuildFailed : MatchState::NotBuilt;
+}
+
+double GetMatchRatio(uint32_t imageId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const auto it = g_contexts.find(imageId);
+    if (it == g_contexts.end() || !it->second.loaded) return 0.0;
+    const ContextState& ctx = it->second;
+    // 只有跨版本对齐才谈"匹配率"：恒等映射是 1，未建表/失败没有可比基数。
+    if (!ctx.tableReady || ctx.identical) return ctx.tableReady ? 1.0 : 0.0;
+    if (ctx.map.empty()) return 0.0;
+    size_t matched = 0;
+    for (uint32_t v : ctx.map) {
+        if (v != kUnmatched) ++matched;
+    }
+    return static_cast<double>(matched) / static_cast<double>(ctx.map.size());
 }
 }  // namespace PdataMatch

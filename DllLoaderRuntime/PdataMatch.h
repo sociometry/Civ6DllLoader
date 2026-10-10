@@ -29,6 +29,23 @@ namespace PdataMatch {
     // 按 vtable 符号名（demangled/mangled）查矫正后的 vtable RVA 与槽位数。
     bool CorrectVTableByName(uint32_t imageId, const char* name, uint32_t& outRva, uint32_t& outSlotCount);
 
+    // 内置符号库与该映像的匹配状态（供插件判断"我的硬编码 RVA/符号名还能不能用"）。
+    enum class MatchState {
+        NoContext,     // sidecar 里没有该映像的模块：完全没有符号库，无法矫正
+        NotBuilt,      // 有上下文但尚未建表（映像还没加载 / 建表未执行）
+        BuildFailed,   // 建表失败：本次会话该映像不做矫正
+        Identical,     // 符号库与该映像同一构建：RVA 恒等，最可靠
+        CrossVersion   // 跨版本对齐成功：RVA 已矫正，但存在个别未匹配项
+    };
+
+    // 查询状态。不持锁地读快照，仅用于诊断/日志/降级决策，不要拿它当"能解析"的保证——
+    // 真正的判据始终是 CorrectRva/CorrectByName 的返回值。
+    MatchState GetMatchState(uint32_t imageId);
+
+    // 该映像跨版本对齐的匹配率（已匹配 pdata 条目 / 总条目）。仅 CrossVersion 状态有意义；
+    // 其它状态返回 1.0（恒等或不可用，没有"部分匹配"的概念）。
+    double GetMatchRatio(uint32_t imageId);
+
     // "去 DRM 视图"的 SizeOfImage：剥掉 PE 节表末尾连续的 .bind 段（SecVR 遗留 DRM 段）
     // 后按 SectionAlignment 重算；无 DRM 段或算出的值不合理时原样返回 nt 的 SizeOfImage。
     //
