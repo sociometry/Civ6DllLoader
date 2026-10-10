@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::path::Path;
 use std::process;
 
 #[derive(Debug, serde::Deserialize)]
@@ -12,15 +10,74 @@ struct Entry {
     vtable_xrefs: Vec<String>,
 }
 
-const USAGE: &str = r#"rva_to_symbol - query RVA symbol info from rva_map.json
+/// 编译期嵌入的符号表（zlib 压缩）。
+///
+/// 三个映像的 JSON 原始体积合计约 30 MB，压缩后约 2.7 MB，因此直接用
+/// include_bytes! 打进 .rdata：交付物保持单个 exe，不需要任何 sidecar 文件。
+/// 查询时**只解压并解析选中的那一份**，另外两份始终是字节数组，不产生
+/// 任何解码/分配开销。
+///
+/// 用 zlib 而非 lzma：lzma 能再小 1 MB，但纯 Rust 解码慢 4-5 倍（~120 ms vs
+/// ~25 ms），对每次查表都要走一遍启动路径的 cli 来说不划算。
+///
+/// 数据由 tools/gen_rva_map.py 生成（改了 symdb JSON 之后要重新生成并重编译）。
+const GAMECORE_Z: &[u8] = include_bytes!("../data/rva_map.gamecore.z");
+const DX11_Z: &[u8] = include_bytes!("../data/rva_map.dx11.z");
+const DX12_Z: &[u8] = include_bytes!("../data/rva_map.dx12.z");
+
+/// 一个可查询的映像。
+struct Image {
+    /// 命令行选择符（不含前导横线），大小写不敏感。
+    selector: &'static str,
+    /// 与 loader 的 HookImageId 对应的数值，仅用于输出。
+    image_id: u32,
+    /// 展示名。
+    label: &'static str,
+    /// 对应的符号表 JSON 文件名，仅用于输出。
+    source: &'static str,
+    data: &'static [u8],
+}
+
+const IMAGES: &[Image] = &[
+    Image {
+        selector: "gamecore",
+        image_id: 5,
+        label: "GameCoreXP2",
+        source: "GameCore.symdb.json",
+        data: GAMECORE_Z,
+    },
+    Image {
+        selector: "dx11",
+        image_id: 1,
+        label: "ExeDx11",
+        source: "CivilizationVI.symdb.json",
+        data: DX11_Z,
+    },
+    Image {
+        selector: "dx12",
+        image_id: 2,
+        label: "ExeDx12",
+        source: "CivilizationVI_DX12.symdb.json",
+        data: DX12_Z,
+    },
+];
+
+const USAGE: &str = r#"rva_to_symbol - query symbol info for an RVA of a Civ6 image
 
 USAGE:
-    rva_to_symbol [FLAGS] <RVA>...
-    rva_to_symbol [FLAGS] {<RVA>,<RVA>...}...
-    rva_to_symbol [FLAGS] rva <RVA>...
-    rva_to_symbol rva [FLAGS] <RVA>...
+    rva_to_symbol <IMAGE> [FLAGS] <RVA>...
+    rva_to_symbol <IMAGE> [FLAGS] {<RVA>,<RVA>...}...
+    rva_to_symbol <IMAGE> [FLAGS] rva <RVA>...
     rva_to_symbol -h | --help
     rva_to_symbol --version
+    rva_to_symbol --list
+
+IMAGE (exactly one is required; the three images have unrelated RVAs, so a
+default would silently give wrong answers):
+    -gamecore        GameCore_XP2_FinalRelease.dll (image 5)
+    -dx11            CivilizationVI.exe           (image 1)
+    -dx12            CivilizationVI_DX12.exe      (image 2)
+                     Also accepted as --gamecore etc.
 
 POSITIONAL ARGUMENTS:
     <RVA>            Hex RVA, optional 0x/0X prefix (e.g. 0xA130, a130,
@@ -39,6 +96,7 @@ FLAGS (field selectors; any combination, any position):
     --vtable_xrefs   Output only the vtable_xrefs field.
     -h, --help       Print this help to stdout and exit 0.
     --version        Print "rva_to_symbol <version>" to stdout and exit 0.
+    --list           List the embeddable images and exit 0.
 
 OUTPUT:
     One section per query target, in input order, with no blank lines between
@@ -47,22 +105,20 @@ OUTPUT:
     vtable_xrefs, each formatted as "  <label>:" left-aligned to width 15
     followed by the value (so values start at column 17). With no field
     selector, all four fields are printed. vtable_xrefs is printed as
-    "[elem1, elem2]" (an empty list as "[]"). An RVA not present in
-    rva_map.json prints a single line "<rva>: not found".
+    "[elem1, elem2]" (an empty list as "[]"). An RVA not present in the
+    selected image prints a single line "<rva>: not found".
 
 EXIT CODES:
     0    every target was found
     1    at least one target was not found (found targets still print)
-    2    usage/argument error, or rva_map.json could not be read/parsed
+    2    usage/argument error, or the embedded symbol table could not be
+         decoded
 
-rva_map.json is looked up next to the executable (std::env::current_exe()),
-not in the current working directory.
+The symbol tables are embedded in the executable (zlib-compressed), so this
+tool is a single self-contained file; only the selected image is decoded.
 "#;
 
 fn main() {
-    // Data loading happens at startup: rva_map.json lives next to the exe.
-    let map: HashMap<String, Entry> = load_map();
-
     let args: Vec<String> = env::args().skip(1).collect();
 
     let mut positionals: Vec<String> = Vec::new();
@@ -70,14 +126,28 @@ fn main() {
     let mut f_demangled = false;
     let mut f_mangled = false;
     let mut f_xrefs = false;
+    let mut images: Vec<&'static Image> = Vec::new();
 
     for a in &args {
         if a.starts_with('-') {
+            // 长短横线都接受；先按原样匹配已知的短横线 flag。
             match a.as_str() {
-                "--kind" => f_kind = true,
-                "--demangled" => f_demangled = true,
-                "--mangled" => f_mangled = true,
-                "--vtable_xrefs" => f_xrefs = true,
+                "--kind" => {
+                    f_kind = true;
+                    continue;
+                }
+                "--demangled" => {
+                    f_demangled = true;
+                    continue;
+                }
+                "--mangled" => {
+                    f_mangled = true;
+                    continue;
+                }
+                "--vtable_xrefs" => {
+                    f_xrefs = true;
+                    continue;
+                }
                 "-h" | "--help" => {
                     print!("{}", USAGE);
                     process::exit(0);
@@ -86,8 +156,24 @@ fn main() {
                     println!("rva_to_symbol {}", env!("CARGO_PKG_VERSION"));
                     process::exit(0);
                 }
-                _ => {
+                "--list" => {
+                    for img in IMAGES {
+                        println!(
+                            "-{:<9} image={}  {:<14} {}",
+                            img.selector, img.image_id, img.label, img.source
+                        );
+                    }
+                    process::exit(0);
+                }
+                _ => {}
+            }
+            // 映像选择符：-gamecore / --gamecore / -GameCore 都收。
+            let bare = a.trim_start_matches('-').to_ascii_lowercase();
+            match IMAGES.iter().find(|i| i.selector == bare) {
+                Some(img) => images.push(img),
+                None => {
                     eprintln!("error: unknown flag: {}", a);
+                    eprintln!("hint: image must be one of -gamecore, -dx11, -dx12");
                     process::exit(2);
                 }
             }
@@ -95,6 +181,19 @@ fn main() {
             positionals.push(a.clone());
         }
     }
+
+    // 必须且只能指定一个映像：三份符号表的 RVA 互不相关，猜一个必然给出错误答案。
+    if images.is_empty() {
+        eprintln!("error: no image specified");
+        eprintln!("hint: pass exactly one of -gamecore, -dx11, -dx12");
+        process::exit(2);
+    }
+    if images.len() > 1 {
+        eprintln!("error: more than one image specified");
+        eprintln!("hint: pass exactly one of -gamecore, -dx11, -dx12");
+        process::exit(2);
+    }
+    let image = images[0];
 
     // Optional literal "rva" prefix on the first positional argument.
     if positionals.first().map(String::as_str) == Some("rva") {
@@ -142,6 +241,9 @@ fn main() {
             }
         }
     }
+
+    // 只解码选中的映像。
+    let map = load_image(image);
 
     let any_selector = f_kind || f_demangled || f_mangled || f_xrefs;
     let mut miss = false;
@@ -191,25 +293,32 @@ fn fmt_xrefs(xs: &[String]) -> String {
     format!("[{}]", xs.join(", "))
 }
 
-fn load_map() -> HashMap<String, Entry> {
-    let exe = env::current_exe().unwrap_or_else(|_| {
-        eprintln!("error: cannot read rva_map.json");
+/// 解压并解析选中的映像符号表。
+fn load_image(image: &Image) -> HashMap<String, Entry> {
+    let mut json = Vec::new();
+    if zlib_decode(&mut &image.data[..], &mut json).is_err() {
+        eprintln!(
+            "error: cannot decode embedded symbol table for {} ({})",
+            image.selector, image.source
+        );
+        process::exit(2);
+    }
+    let raw: HashMap<String, Entry> = serde_json::from_slice(&json).unwrap_or_else(|_| {
+        eprintln!(
+            "error: cannot parse embedded symbol table for {} ({})",
+            image.selector, image.source
+        );
         process::exit(2);
     });
-    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    let path = dir.join("rva_map.json");
-    let text = fs::read_to_string(&path).unwrap_or_else(|_| {
-        eprintln!("error: cannot read rva_map.json");
-        process::exit(2);
-    });
-    let raw: HashMap<String, Entry> = serde_json::from_str(&text).unwrap_or_else(|_| {
-        eprintln!("error: cannot read rva_map.json");
-        process::exit(2);
-    });
-    // Keys in the real rva_map.json keep their original hex casing (e.g.
-    // "0xA130", "0x9BADE0"); lowercase them so the spec-mandated lowercase
-    // normalization + exact key lookup matches (bijective: no collisions).
+    // 键在生成端是 "0x<大写>"；统一小写以配合 normalize_rva 的小写归一化做精确查表。
     raw.into_iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v))
         .collect()
+}
+
+/// zlib 解压（flate2 默认走纯 Rust 的 miniz_oxide，无 C 依赖）。
+fn zlib_decode(r: &mut dyn std::io::Read, w: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut d = flate2::read::ZlibDecoder::new(r);
+    std::io::copy(&mut d, w)?;
+    Ok(())
 }

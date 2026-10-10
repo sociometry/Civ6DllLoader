@@ -1,8 +1,15 @@
 [package]
 name = "rva_to_symbol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 纯 Rust 后端（miniz_oxide），不需要 C 工具链；解压速度是选它而非 lzma 的原因。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[profile.release]
+# 符号表内嵌使产物约 2 MB，体积与速度都值得优化（默认 release 已够用，
+# 这里只关掉增量以便可复现产物）。
+incremental = false

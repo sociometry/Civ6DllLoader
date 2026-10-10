@@ -936,8 +936,13 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 | `compress` | `pack.bin` → `C6XC` + LZMA1 信封 `.xp`（带 SHA256 roundtrip 校验） |
 | `validate` | 按运行时同款解析独立校验 `.bin` / `.xp` |
 | `aob` | 从容器里的 mask 指纹生成/核对 loader 的 AOB 常量（`--emit-cpp` 直接出可粘贴的常量块） |
-| `rva-map` | `GameCore.symdb.json` → `rva_map.json`（喂 `rva_to_symbol.exe` 做地址→符号） |
 | `all` | 一条命令跑完产线：`module` ×3 → `pack` → `compress` → 部署到 `DllLoaderRuntime/` → `validate` → 清理中间产物 |
+
+`rva-map` 已迁到 `tools/gen_rva_map.py`。`rva_to_symbol`（RVA → 符号）现在覆盖
+**gamecore / dx11 / dx12 三个映像**：每个映像的符号表各压成一份 zlib 数据，由 Rust 侧
+`include_bytes!` 在**编译期嵌入** exe —— 交付物仍是单个文件，查询时只解压选中的那一份。
+生成端因此是"三份 + 压缩"，与原先的单份未压缩实现不同源，故此只保留一处实现。
+重建：`python tools/gen_rva_map.py` 然后 `tools/rva_to_symbol/build.bat`（一键，含编译与安装）。
 
 **可复现边界**（工具文档里的定论）：`JSON → .bin → pack.bin → .xp → 部署/validate` 保证**逐字节复现**；
 `IDA → JSON` **不保证**（JSON 是某一份 IDB 的快照，函数集合取决于 IDA 的分析状态；名字全部来自 IDB）。
