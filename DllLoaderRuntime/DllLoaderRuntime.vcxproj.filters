@@ -72,6 +72,9 @@
     <ClCompile Include="SymbolResolve.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="PluginDomain.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="Civ6MessageBus.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -132,6 +135,12 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="TeardownWindow.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="PluginDomain.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="PluginTableAccess.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="HavokScript.h">

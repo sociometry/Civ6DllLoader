@@ -68,13 +68,19 @@ def _verify_extra(lines, start, end, expect_substrings):
             f"（文件已改动？请重新核对区间后再跑）\n实际内容前 200 字符：\n{seg[:200]}")
 
 
+# 已就地改造成门面实现、不再随模块搬走的函数
+ALREADY_REFACTORED = {
+    "ResolvePluginOwnerForAddress",   # -> PluginRegistry::ResolveOwnerByModule（阶段 2）
+}
+
+
 def functions_of(module):
     src = open(SRC, encoding="utf-8", errors="replace").read()
     clean = facts.strip_comments_and_strings(src)
     funcs = facts.find_functions(clean)
     out = []
     for name, s, e, cnt, q in funcs:
-        if facts.module_of(name) == module:
+        if facts.module_of(name) == module and name not in ALREADY_REFACTORED:
             out.append((name, s, e, cnt))
     return out
 
