@@ -3673,8 +3673,11 @@ static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
 }
 
 // 崩溃隔离（与 OnLoad 崩溃同构）：标记隔离 + 回滚该 owner 的全部注册
-// （补丁/MinHook 钩/Lua 方法/脚本全局/GameEvent/OnMessage）。模块驻留不卸；
+// （MinHook 钩/Lua 方法/脚本全局/GameEvent/OnMessage）。模块驻留不卸；
 // 隔离后 reconcile 与阶段 B 全量扫描都不再重试。
+// 【不回滚补丁】：隔离的语义是"模块驻留、代码仍在内存里"，此刻往可能正被执行的代码里
+// 写还原字节、又没有 quiesce，风险高于收益；补丁按"进程生命周期内不可撤销"处理，
+// 要撤销由插件在 OnUnload 里自己调 Unpatch。见 ARCHITECTURE §5.8。
 static void QuarantinePluginByOwner(const std::wstring& ownerId) {
     if (ownerId.empty()) return;
     {
@@ -3689,7 +3692,6 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
     // 先禁用并排空所有外部入口；等待期间不得持 lifecycle 锁。
     g_bus.UnregisterOwner(ownerId);
     PluginInFlight::WaitAll(PluginInFlight::Resolve(ownerId), ownerId.c_str());
-    PatchRegistry::RevertAllFor(ownerId.c_str());
     RemovePluginHooks(ownerId.c_str());
     // 隔离路径也必须撤销参数捕获站点；否则站点仍会向插件的 out 槽写入数据。
     CleanupCaptureSitesForOwner(ownerId);
@@ -3698,12 +3700,15 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
 }
 
 // 按跟踪项卸载单个插件（调用方保证 index 有效）：
-// OnUnload → PatchRegistry::RevertAllFor(name) → RemovePluginHooks(name) → 撤销 capture /
+// OnUnload → RemovePluginHooks（拔槽，绝不在插件卸载时物理摘 MinHook 记录）→ 撤销 capture /
 // 回调类注册 → 从 g_plugins 摘除 →（freeModule 时）句柄入队，等引擎卸完 GameCore 才 Free。
 // freeModule 只由 GameCore 类别传 true：GameCore 插件随对局重载必须真正卸载，插件静态
 // 状态才不会跨局残留；调用前 ResetForReload 已批量还原入口字节，不会再有人进入该插件的
 // detour。Global 插件一律 false（只在启动时加载，禁用需要重启）；崩溃隔离路径根本不走
 // 本函数，模块继续驻留。
+//
+// 【不回滚补丁】：需要撤销的插件应在 OnUnload 里自己调 Unpatch（那时它知道自己状态）。
+// Loader 侧不再自动还原，见 ARCHITECTURE §5.8。
 static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) {
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     const auto initial = std::find_if(g_plugins.begin(), g_plugins.end(),
@@ -3731,9 +3736,6 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) 
     auto onUnload = (OnUnloadFunc)GetProcAddress(entry.handle, "OnUnload");
     SetActivePluginContext(entry.ownerId, entry.handle);
     if (onUnload) CallOnUnloadSafe(onUnload, nullptr);
-    // 先 OnUnload 后回滚补丁：插件 OnUnload 可能仍依赖自己的补丁。
-    // 必须在 FreeLibrary 之前回滚——补丁目标可能位于该插件自身映像内。
-    PatchRegistry::RevertAllFor(entry.ownerId.c_str());
     // 撤销该插件的 MinHook 钩子：否则 GameCore 重载后重新 OnLoad 会撞 MH_ERROR_ALREADY_CREATED。
     RemovePluginHooks(entry.ownerId.c_str());
     // 撤销该插件的参数捕获订阅；其它 owner 仍在使用的共享站点继续工作。

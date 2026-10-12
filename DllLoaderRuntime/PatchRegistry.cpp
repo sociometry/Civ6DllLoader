@@ -281,49 +281,4 @@ bool RevertOwned(void* target, const wchar_t* owner) {
     return true;
 }
 
-size_t RevertAllFor(const wchar_t* owner) {
-    if (!owner || !*owner) {
-        return 0;
-    }
-    CsGuard csGuard;
-
-    // 先收集目标再逐个回滚（回滚会擦除条目，避免迭代器失效）。
-    std::vector<void*> targets;
-    targets.reserve(Registry().size());
-    for (const auto& kv : Registry()) {
-        if (kv.second.owner == owner) {
-            targets.push_back(kv.first);
-        }
-    }
-
-    size_t reverted = 0;
-    for (void* t : targets) {
-        const auto it = Registry().find(t);
-        if (it == Registry().end()) {
-            continue;
-        }
-        const size_t origSize = it->second.original.size();
-        std::vector<SavedProtection> saved;
-        if (!MakeWritableRecording(t, origSize, saved)) {
-            RestoreProtections(saved);
-            // 目标已不可写/不可读（映像已卸载）：原始字节随映射一起消失，恢复无意义，
-            // 保留记录只会把已死的地址长期留在表里（并挡住同地址区间的后续 Apply）。
-            // 丢弃记录——original 缓冲随 Entry 一起析构，不泄漏、不悬垂。
-            Logger::Log("PatchRegistry::RevertAllFor: protect failed target=%p err=%lu (dropping record)",
-                t, GetLastError());
-            Registry().erase(it);
-            continue;
-        }
-        memcpy(t, it->second.original.data(), origSize);
-        RestoreProtections(saved);
-        FlushInstructionCache(GetCurrentProcess(), t, origSize);
-        Registry().erase(it);
-        ++reverted;
-    }
-    if (reverted > 0) {
-        Logger::Log("PatchRegistry::RevertAllFor: rolled back %zu patch(es) for owner=%ls", reverted, owner);
-    }
-    return reverted;
-}
-
 }  // namespace PatchRegistry

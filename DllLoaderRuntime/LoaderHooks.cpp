@@ -312,7 +312,8 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
 // ---- UnloadDLL detour（阶段 B 收尾：原函数卸掉 GameCore 前先做清理）----
 // UnloadDLL 的调用方：LoadDLL 失败路径、退游戏、LoadGameCore 重载、RollbackContent、
 // UpdateContent。在调原函数【之前】清理：此时 GameCore 映像仍活着，插件 OnUnload 能
-// 干净回滚补丁（PatchRegistry::RevertAllFor）/摘 MinHook 钩子（RemovePluginHooks）。
+// 摘 MinHook 钩子（RemovePluginHooks）、撤销捕获与回调类注册（补丁由插件自己在
+// OnUnload 里 Unpatch，Loader 不再自动回滚，见 ARCHITECTURE §5.8）。
 // 但插件模块的 FreeLibrary 【不】在这里做：gamecore 的 gameplay/ui Lua 环境是这次调用
 // 里才拆掉的，而 Lua 表里可能还留着指向插件映像的闭包 -> 排到原函数返回之后再 Free
 // （见 LoaderCore::FreePendingPluginModules）。
