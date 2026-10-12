@@ -16,11 +16,12 @@ public:
     using MessageHandler = std::function<void(const char* topic, const void* data, size_t len)>;
 
     // 生命周期边界（谁负责什么）：
-    //   - 本类只管"消息分发 + 摘表项"，两条路径都【不阻塞等待】；
-    //   - 排空在途回调是插件生命周期管理的职责（UnloadPluginEntryAt / Quarantine
-    //     在调 OnUnload 与 FreeLibrary 之前统一 WaitAll），不在这里重复做。
-    // 覆盖同名 handler 时把旧 entry 标记为失效（active=false），派发路径据此跳过它；
-    // 旧 entry 的内存由调用快照的 shared_ptr 保活到最后一个使用者退出，无需等待。
+    //   - 覆盖同名 handler【不阻塞】：旧 entry 标记为失效（active=false），派发路径据此
+    //     跳过它；旧 entry 的内存由调用快照的 shared_ptr 保活到最后一个使用者退出。
+    //   - 注销（UnregisterOwner）【会排空】：摘掉该 owner 的登记后等待其在途回调退出，
+    //     返回时保证该 owner 不再有回调在执行。这是本类自身的承诺，不依赖调用方补等。
+    //     插件生命周期管理（UnloadPluginByOwnerId / QuarantinePluginByOwner）在调
+    //     OnUnload 与 FreeLibrary 之前也会 WaitAll，等的是同一个 Owner、计数已归零。
     // 本线程回调栈上的调用（含嵌套祖先与递归）继续到自然返回。
     // 回调内清理返回不代表自身调用链已经退出，不能立即释放该调用链仍依赖的外部状态。
 

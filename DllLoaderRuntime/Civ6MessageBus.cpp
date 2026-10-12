@@ -77,10 +77,13 @@ void Civ6MessageBus::UnregisterOwner(const std::wstring& owner) {
             }
         }
     }
-    // 此处【不】排空在途回调。排空是插件生命周期管理的职责：UnloadPluginEntryAt /
-    // QuarantinePluginByOwner 都会在调 OnUnload 与 FreeLibrary 之前统一 WaitAll，
-    // 那才是必须守住 UAF 红线的地方。总线若也等一次，只会让"谁负责排空"变得含糊
-    // （两次等待的是同一个 Owner，第二次纯属重复）。
+    // 先摘表项（在总线锁外排空），再等该 owner 的在途回调退出。
+    // 这是本类对外承诺的一部分：UnregisterOwner 返回后，该 owner 不会再有回调在执行。
+    // 调用方（UnloadPluginByOwnerId / QuarantinePluginByOwner）在调 OnUnload 与
+    // FreeLibrary 之前也会各自 WaitAll，但那时等的是同一个 Owner 对象、计数已归零，
+    // 所以这里是零成本的；保留它换来的是"总线自身闭环"，不依赖调用方是否记得补一次。
+    // 等待期间绝不能持 mtx_：回调线程的 Enter / 注册路径都要进总线锁，持锁等待会成环。
+    PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
 }
 
 void Civ6MessageBus::Broadcast(const char* topic, const void* data, size_t len) {
