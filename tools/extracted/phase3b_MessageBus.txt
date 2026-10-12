@@ -1,0 +1,21 @@
+// ==== g_bus ====
+static Civ6MessageBus g_bus;
+
+// ==== BroadcastMessageImpl ====
+void BroadcastMessageImpl(const char* topic, const void* data, size_t len) {
+    g_bus.Broadcast(topic, data, len);
+}
+
+// ==== SendMessageToImpl ====
+void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len) {
+    // pluginName 是插件内存，而 SendTo 收 const std::string&：直接传进去会按 NUL 边界读它。
+    // MSVC 的 basic_string(const char*) 不检查空指针（直接 traits::length），空指针/野指针
+    // 都是一次裸 strlen。与其它字符串入口同一口径：锁外先抄进 Loader 自有存储。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(pluginName, nameCopy) || nameCopy.empty()) {
+        Logger::Log("SendMessageTo rejected: pluginName pointer unreadable or empty");
+        return;
+    }
+    g_bus.SendTo(nameCopy, topic, data, len);
+}
+

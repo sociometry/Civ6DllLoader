@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Civ6MessageBus.h"
+#include "PluginBoundary.h"   // SendMessageToImpl 用 CopyCString 抄插件内存
 #include "PluginInFlight.h"
 #include "../common/Logger.h"
 #include <unordered_map>
@@ -123,4 +124,33 @@ void Civ6MessageBus::InvokeEntry(const HandlerPtr& entry, const char* topic,
     auto guard = PluginInFlight::Enter(entry->inFlight, PluginInFlight::Kind::Message);
     if (entry->inFlight && !guard) return;
     InvokeHandler(entry->handler, topic, data, len, name);
+}
+
+
+// ================= 消息总线实例与插件 ABI 转发层（阶段 3b 从母体迁入） =================
+//
+// g_bus 原来是 Civ6DLLHookLoaderAPI.cpp 的文件级 static；转发层（把 HookAPI 的函数指针
+// 转成类方法调用）与类定义同文件最自然，故一起搬进来。其它模块要拿它经 GlobalBus()
+// 访问器，而不是 extern 变量。
+
+static Civ6MessageBus g_bus;
+
+Civ6MessageBus& GlobalBus() {
+    return g_bus;
+}
+
+void BroadcastMessageImpl(const char* topic, const void* data, size_t len) {
+    g_bus.Broadcast(topic, data, len);
+}
+
+void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len) {
+    // pluginName 是插件内存，而 SendTo 收 const std::string&：直接传进去会按 NUL 边界读它。
+    // MSVC 的 basic_string(const char*) 不检查空指针（直接 traits::length），空指针/野指针
+    // 都是一次裸 strlen。与其它字符串入口同一口径：锁外先抄进 Loader 自有存储。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(pluginName, nameCopy) || nameCopy.empty()) {
+        Logger::Log("SendMessageTo rejected: pluginName pointer unreadable or empty");
+        return;
+    }
+    g_bus.SendTo(nameCopy, topic, data, len);
 }

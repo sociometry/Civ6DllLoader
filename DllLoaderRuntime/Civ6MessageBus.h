@@ -65,3 +65,14 @@ private:
 
 // 插件侧消息收发统一走 common/HookAPI.h（BroadcastMessage/SendMessageTo 函数指针），
 // 由运行时的 g_bus 实现；不再提供平行的 C 导出接口。
+//
+// g_bus 本身定义在 Civ6MessageBus.cpp 内（文件级 static，不导出变量）。
+// 需要它的其它模块（PluginRegistry 的加载/卸载/隔离路径要调 UnregisterOwner）
+// 经这个访问器拿引用 —— 而不是把 g_bus 做成 extern 全局（见 REFACTOR_PLAN.md §5）。
+Civ6MessageBus& GlobalBus();
+
+// 插件 ABI 转发层（实现在 Civ6MessageBus.cpp）：把 HookAPI 里的函数指针
+// （BroadcastMessage / SendMessageTo）转成类方法调用。
+// 声明在这里是因为母体的 g_hookApi 初始化表要取它们的地址。
+void BroadcastMessageImpl(const char* topic, const void* data, size_t len);
+void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len);

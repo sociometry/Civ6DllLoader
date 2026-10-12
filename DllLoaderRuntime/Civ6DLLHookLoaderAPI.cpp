@@ -42,7 +42,6 @@
 
 using namespace std;
 
-static Civ6MessageBus g_bus;
 
 // 插件跟踪项：路径 + 句柄 + 名字(stem，仅作 OnMessage 寻址名) + ownerId(规范化完整小写路径，
 // 作 Patch / hook / capture 的 owner) + 类别(Global/GameCore)。
@@ -713,9 +712,6 @@ static bool RemoveHookSiteRecordLocked(void* target, HookSite& site) {
     return true;
 }
 
-void BroadcastMessageImpl(const char* topic, const void* data, size_t len) {
-    g_bus.Broadcast(topic, data, len);
-}
 
 // 显式注册与 OnMessage 自动注册共用：消息地址只能来自 Loader 跟踪的插件名。
 // 调用时不得持 lifecycle 锁；替换旧回调可能等待正在使用 HookAPI 的其它线程。
@@ -744,7 +740,7 @@ static bool RegisterPluginMessageHandler(const std::wstring& owner, MessageHandl
     }
     // 总线锁 -> lifecycle 锁。若停用先发生则拒绝；若发布先发生，随后的
     // UnregisterOwner 必然能清除此登记，避免校验后停用又把 handler 注册回来。
-    return g_bus.RegisterHandler(handlerName, handler, owner, [&owner] {
+    return GlobalBus().RegisterHandler(handlerName, handler, owner, [&owner] {
         lock_guard<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
         const bool active = std::any_of(g_plugins.begin(), g_plugins.end(),
             [&owner](const PluginEntry& entry) {
@@ -765,17 +761,6 @@ bool RegisterMessageHandlerImpl(MessageHandlerFn handler) {
     return owner && RegisterPluginMessageHandler(owner->ownerId, handler);
 }
 
-void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len) {
-    // pluginName 是插件内存，而 SendTo 收 const std::string&：直接传进去会按 NUL 边界读它。
-    // MSVC 的 basic_string(const char*) 不检查空指针（直接 traits::length），空指针/野指针
-    // 都是一次裸 strlen。与其它字符串入口同一口径：锁外先抄进 Loader 自有存储。
-    std::string nameCopy;
-    if (!PluginBoundary::CopyCString(pluginName, nameCopy) || nameCopy.empty()) {
-        Logger::Log("SendMessageTo rejected: pluginName pointer unreadable or empty");
-        return;
-    }
-    g_bus.SendTo(nameCopy, topic, data, len);
-}
 
 bool IsImageLoadedImpl(HookImageId image) {
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
@@ -3167,7 +3152,7 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         });
     if (activate == g_plugins.end() || activate->state != PluginState::Loading) {
         lifecycleLock.unlock();
-        g_bus.UnregisterOwner(ownerId);
+        GlobalBus().UnregisterOwner(ownerId);
         return false;
     }
     SetPluginState(*activate, PluginState::Active);
@@ -3265,7 +3250,7 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
         }
     }
     // 先禁用并排空所有外部入口；等待期间不得持 lifecycle 锁。
-    g_bus.UnregisterOwner(ownerId);
+    GlobalBus().UnregisterOwner(ownerId);
     PluginInFlight::WaitAll(PluginInFlight::Resolve(ownerId), ownerId.c_str());
     RemovePluginHooks(ownerId.c_str());
     // 隔离路径也必须撤销参数捕获站点；否则站点仍会向插件的 out 槽写入数据。
@@ -3304,7 +3289,7 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) 
     // 先阻止并排空消息回调，避免 OnUnload 释放插件状态时旧快照仍在执行。
     // 等待时必须释放 lifecycle 锁，否则 handler 若正在调用 HookAPI 会锁反转。
     lifecycleLock.unlock();
-    g_bus.UnregisterOwner(entry.ownerId);
+    GlobalBus().UnregisterOwner(entry.ownerId);
     // 脚本全局/GameEvent 入口使用快照并在锁外执行；先排空 owner 的在途调用，
     // 再进入 OnUnload，避免插件状态被释放后旧回调继续访问。
     PluginInFlight::WaitAll(PluginInFlight::Resolve(entry.ownerId), entry.ownerId.c_str());
