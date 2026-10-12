@@ -56,7 +56,12 @@ bool GetSelfPath(std::wstring& outPath, std::wstring& outExeDir) {
 // 不要在这里再写一份"看起来一样"的实现：多一份就多一种"同一条路径被判成不同"的漂移
 //（典型的坑是符号链接 / 8.3 短名 / 大小写差异）。
 bool IsSamePath(const std::wstring& a, const std::wstring& b) {
-    return EnabledMods::NormalizePath(a) == EnabledMods::NormalizePath(b);
+    const std::wstring na = EnabledMods::NormalizePath(a);
+    const std::wstring nb = EnabledMods::NormalizePath(b);
+    // 规范化失败会返回空串，那是"不知道"而不是"同一条路径"：空 == 空 若当相等，
+    // 两条不同的候选会被误判成自身而剔出候选池，宁可都留下让调用方自己判断。
+    if (na.empty() || nb.empty()) return false;
+    return na == nb;
 }
 
 // 选举：版本大者优先；同版本路径字典序小者优先。
@@ -90,10 +95,10 @@ void CheckAndApplyUpdate() {
         }
     }
 
-    // b. 扫描各内容根（游戏根 / Documents Mods / Workshop）与 loader 自身目录的候选，排除自身。
+    // b. 扫描各内容根（Documents Mods / Steam Workshop）的候选，排除自身。
     //    注意 FindRuntimeCandidates【故意】不按 Mod 启用集过滤（安装/自更新只比版本），
     //    与"插件只从启用的 Mod 加载"是两条独立通路。
-    const std::vector<std::wstring> candidates = ModScan::FindRuntimeCandidates(GetModuleHandleW(nullptr));
+    const std::vector<std::wstring> candidates = ModScan::FindRuntimeCandidates();
     std::vector<std::wstring> pool;
     pool.reserve(candidates.size());
     for (const auto& c : candidates) {

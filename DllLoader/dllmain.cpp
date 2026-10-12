@@ -9,7 +9,6 @@
 #include "../DllLoaderRuntime/ProxyTypes.h"
 #include "ShellBootstrap.h"
 
-HMODULE g_hModule = nullptr;
 HMODULE g_realGameCore = nullptr;
 ProxyTypes::DllCreateGameContext base_DllCreateGameContext = nullptr;
 ProxyTypes::DllDestroyGameContext base_DllDestroyGameContext = nullptr;
@@ -44,14 +43,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
-        g_hModule = hModule;
         break;
 
     case DLL_PROCESS_DETACH:
         // DllMain runs under the loader lock. Never call runtime/plugin code,
         // FreeLibrary, or perform file I/O here. Normal teardown happens in
         // DllDestroyGameContext; the OS reclaims remaining handles at exit.
-        g_hModule = nullptr;
         break;
     }
     return TRUE;
@@ -75,7 +72,7 @@ extern "C" {
         // missing, install it once from the highest-version runtime found under the ModScan
         // scan roots (no mod-enabled filter here: installation elects by version only);
         // either way this session passes through to the stock GameCore.
-        if (ShellBootstrap::InstallLoaderIfMissing(g_hModule)) {
+        if (ShellBootstrap::InstallLoaderIfMissing()) {
             Logger::Log("Loader present after installer (installed or already installed)");
         } else {
             Logger::Log("Loader missing; install skipped or failed; continuing with stock GameCore only");

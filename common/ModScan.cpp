@@ -15,6 +15,11 @@
 
 namespace ModScan {
 
+// 定义在文件末尾（需要本文件的各种路径辅助）。static = 本文件内部链接；
+// 声明与定义都在 ModScan 作用域，避免与匿名命名空间里的同名实体混淆。
+static bool ShouldSkipPluginFile(const fs::path& path);
+static std::vector<std::wstring> CollectScanRoots();
+
 namespace {
 
 constexpr const wchar_t* kCiv6SteamAppId = L"289070";
@@ -41,6 +46,16 @@ void AddUniqueNormalized(std::vector<std::wstring>& out, const fs::path& path) {
     AddUnique(out, path.wstring());
 }
 
+// 扫描根去重前必须先归一化：注册表 SteamPath 可能返回正斜杠（"d:/steam"），
+// 而 libraryfolders.vdf 里写的是 "D:\\Steam" —— 同一目录两种写法，AddUnique 只做
+// 大小写不敏感比较，会把它当成两个根、把同一棵树扫两遍。走项目统一的 NormalizePath
+// （小写 + / -> \ + 去尾分隔符），不再另写一份"看起来一样"的实现。
+void AddRootUnique(std::vector<std::wstring>& roots, const std::wstring& path) {
+    const std::wstring norm = EnabledMods::NormalizePath(path);
+    if (norm.empty()) return;
+    AddUnique(roots, norm);
+}
+
 std::wstring GetDocumentsModsRoot() {
     wchar_t* docs = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs)) || !docs) {
@@ -51,10 +66,10 @@ std::wstring GetDocumentsModsRoot() {
     return root.wstring();
 }
 
-// Walk up from shell Win64 dir looking for steamapps/workshop/content/289070.
-std::wstring FindWorkshopContentRoot(const std::wstring& binariesWin64Dir) {
+// Walk up from the exe dir looking for steamapps/workshop/content/289070.
+std::wstring FindWorkshopContentRoot(const std::wstring& exeDir) {
     std::error_code ec;
-    fs::path cur(binariesWin64Dir);
+    fs::path cur(exeDir);
     for (int i = 0; i < 12 && !cur.empty(); ++i) {
         fs::path candidate = cur / L"steamapps" / L"workshop" / L"content" / kCiv6SteamAppId;
         if (fs::is_directory(candidate, ec)) {
@@ -75,9 +90,8 @@ std::wstring FindWorkshopContentRoot(const std::wstring& binariesWin64Dir) {
 }
 
 // ---- Steam 库发现（注册表 + libraryfolders.vdf）----
-// 为什么需要它：FindWorkshopContentRoot 是从锚目录向上找 steamapps，只有锚在游戏安装目录
-// 附近时才命中。薄壳的锚是 Mod 自己的 Binaries\Win64（Mod 常在 Documents\...\Mods），
-// 从那里上溯永远碰不到 steamapps —— 于是"三个内容根"在首次补装时只剩两个。
+// 为什么需要它：FindWorkshopContentRoot 是从 exe 目录向上找 steamapps，只有游戏装在
+// 该库下时才命中。若游戏装在别的库、或上溯 12 层内碰不到 steamapps，就只剩这条路。
 // 这里改成问 Steam 自己：先读安装路径（HKCU\Software\Valve\Steam\SteamPath，退回
 // HKLM WOW6432Node\...\InstallPath），再扫 <steam>\steamapps\libraryfolders.vdf 里的
 // 每个库根，逐个拼 <lib>\steamapps\workshop\content\289070。
@@ -170,29 +184,20 @@ void DedupPluginsByFilename(std::vector<std::wstring>& paths) {
     paths.swap(filtered);
 }
 
-// Keep shell-local + Additional-Content-enabled mods only.
-void FilterByEnabledMods(std::vector<std::wstring>& paths, HMODULE shellModule, const char* what) {
+// Keep only mods recorded as enabled in Mods.sqlite.
+// 授权判据只有一条：路径落在 Mods.sqlite 返回的某个精确 mod root 之下（AllowsPath）。
+// 【没有】任何"锚本地豁免"：早先的 shellLocal 把"文件在不在锚模块目录下"当成了授权条件，
+// 而插件的锚是 runtime 自己（装好即 version.dll，在游戏 exe 目录），等于无条件把整个
+// 游戏 exe 目录加进白名单、与玩家启用了哪些 Mod 无关。见 ARCHITECTURE §3.1。
+void FilterByEnabledMods(std::vector<std::wstring>& paths, const char* what) {
     if (paths.empty()) return;
-
-    const std::wstring shellDir = GetModuleDirectory(shellModule);
-    const std::wstring shellModRoot = EnabledMods::FindModRoot(shellDir);
 
     const EnabledMods::Snapshot snap = EnabledMods::Load();
     if (!snap.ok) {
-        Logger::Log("WARN EnabledMods unavailable (%s); keeping only shell-local %s",
+        // 拿不到启用集 = 没有任何 Mod 被确认启用。失败即关闭：一个都不加载。
+        Logger::Log("WARN EnabledMods unavailable (%s); loading no %s",
             snap.error.empty() ? "unknown" : snap.error.c_str(), what);
-        std::vector<std::wstring> localOnly;
-        localOnly.reserve(paths.size());
-        for (const auto& path : paths) {
-            const bool keep = (!shellModRoot.empty() && EnabledMods::PathIsUnderRoot(path, shellModRoot))
-                || EnabledMods::PathIsUnderRoot(path, shellDir);
-            if (keep) {
-                localOnly.push_back(path);
-            } else {
-                Logger::Log("Skipping %s (no EnabledMods DB): %s", what, WideToNarrow(path).c_str());
-            }
-        }
-        paths.swap(localOnly);
+        paths.clear();
         return;
     }
 
@@ -202,9 +207,7 @@ void FilterByEnabledMods(std::vector<std::wstring>& paths, HMODULE shellModule, 
     std::vector<std::wstring> filtered;
     filtered.reserve(paths.size());
     for (const auto& path : paths) {
-        const bool shellLocal = (!shellModRoot.empty() && EnabledMods::PathIsUnderRoot(path, shellModRoot))
-            || EnabledMods::PathIsUnderRoot(path, shellDir);
-        if (shellLocal || EnabledMods::AllowsPath(snap, path)) {
+        if (EnabledMods::AllowsPath(snap, path)) {
             filtered.push_back(path);
             continue;
         }
@@ -246,13 +249,12 @@ void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::pa
 
 // v2 shared pipeline: scan roots -> EnabledMods filter -> case-insensitive lexicographic sort ->
 // basename dedup (stable order, case-insensitive sort, dedup by filename).
-std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir, HMODULE anchor) {
-    // 锚 = Loader 自身模块（version.dll）；由其目录收集扫描根，避免 exe 目录(Win64Steam)导致的根上溯偏差。
+std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir) {
     std::vector<std::wstring> out;
-    for (const auto& root : CollectScanRoots(anchor)) {
+    for (const auto& root : CollectScanRoots()) {
         CollectPluginsUnderContentRootDir(root, pluginSubdir, out);
     }
-    FilterByEnabledMods(out, anchor, "plugin");
+    FilterByEnabledMods(out, "plugin");
 
     std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
         // Case-insensitive lexicographic order for stable load order.
@@ -299,54 +301,46 @@ std::string WideToNarrow(const std::wstring& s) {
     return out;
 }
 
-std::wstring FindContentRoot(const std::wstring& binariesWin64Dir) {
-    fs::path win64(binariesWin64Dir);
-    // 兼容 Win64 / Win64Steam 两种目录名（Steam 版 exe 与 Loader 在 Binaries\Win64Steam）。
-    const std::wstring win64Name = win64.filename().wstring();
-    if (win64Name.size() < 5 || !EqualsIgnoreCase(win64Name.substr(0, 5), L"Win64")) {
-        return {};
-    }
-    fs::path binaries = win64.parent_path();
-    if (!EqualsIgnoreCase(binaries.filename().wstring(), L"Binaries")) return {};
-    fs::path modRoot = binaries.parent_path();
-    if (modRoot.empty()) return {};
-    return modRoot.parent_path().wstring();
-}
-
-std::vector<std::wstring> CollectScanRoots(HMODULE shellModule) {
+// 仅本文件使用（FindRuntimeCandidates / FindSubdirPluginCandidates 调用）。
+static std::vector<std::wstring> CollectScanRoots() {
     std::vector<std::wstring> roots;
-    const std::wstring shellDir = GetModuleDirectory(shellModule);
-    AddUnique(roots, FindContentRoot(shellDir));
 
+    // Documents\My Games\...\Mods：玩家自装 Mod 的主位置。
     const std::wstring docsMods = GetDocumentsModsRoot();
     std::error_code ec;
     if (!docsMods.empty() && fs::is_directory(docsMods, ec)) {
-        AddUnique(roots, docsMods);
+        AddRootUnique(roots, docsMods);
     }
 
-    // Workshop 内容根：① 从锚目录上溯（锚就在游戏安装树里时最快命中）；② 注册表拿 Steam
-    // 安装路径 + libraryfolders.vdf 里的每个库根（锚在 Documents\Mods 时只有这条能命中，
-    // 见 FindSteamInstallPath 的说明）。
-    AddUnique(roots, FindWorkshopContentRoot(shellDir));
+    // Workshop 内容根：① 从 exe 目录上溯（exe 在游戏安装树里，游戏装在哪个库就直接命中）；
+    // ② 注册表拿 Steam 安装路径 + libraryfolders.vdf 里的每个库根（上溯碰不到 steamapps 时靠这条）。
+    const std::wstring exeDir = GetModuleDirectory(nullptr);
+    AddRootUnique(roots, FindWorkshopContentRoot(exeDir));
     const std::wstring steamPath = FindSteamInstallPath();
     if (!steamPath.empty()) {
-        AddUnique(roots, WorkshopRootUnder(steamPath));
+        AddRootUnique(roots, WorkshopRootUnder(steamPath));
         std::vector<std::wstring> libraries;
         CollectLibraryRootsFromVdf(steamPath, libraries);
         for (const auto& library : libraries) {
-            AddUnique(roots, WorkshopRootUnder(library));
+            AddRootUnique(roots, WorkshopRootUnder(library));
         }
     }
 
+    // 【不】加"游戏安装根"（FindContentRoot(exeDir)）：那不是模组容器。游戏自己
+    // （Mods.sqlite 的 ScannedFiles）记录的安装内模组根是 <gameRoot>\DLC\<名> 与
+    // <gameRoot>\Base\Assets\Scenarios\<名>，而 <gameRoot> 的直接子目录
+    // （Base / CTP / DLC / Debug / LaunchPad）没有一个含 Binaries\Win64 —— 实测该根
+    // 的候选取集恒为空。要覆盖官方 DLC 得用 <gameRoot>\DLC 当根；但那里是官方内容，
+    // 不是 loader/插件的分发位置，故不扫。详见 ARCHITECTURE §3.1。
     return roots;
 }
 
-std::vector<std::wstring> FindRuntimeCandidates(HMODULE shellModule) {
+std::vector<std::wstring> FindRuntimeCandidates() {
     std::vector<std::wstring> out;
-    const std::wstring shellDir = GetModuleDirectory(shellModule);
-    AddUniqueNormalized(out, fs::path(shellDir) / CIV6_DLL_LOADER_RUNTIME_FILENAMEW);
-
-    for (const auto& root : CollectScanRoots(shellModule)) {
+    // 不额外探测"自己旁边那一份"：薄壳只能在 <内容根>\<Mod>\Binaries\Win64\ 里被引擎加载，
+    // 而那正是下面根扫描枚举的形状，所以自身探测恒为重复项（实测游戏 Mods.sqlite 记录的
+    // 133 个 .modinfo 无一嵌套，全部是内容根的直接子目录）。
+    for (const auto& root : CollectScanRoots()) {
         CollectRuntimesUnderContentRoot(root, out);
     }
     // 故意【不】过 FilterByEnabledMods：安装/自更新 loader 只看版本（RC 资源 105），
@@ -354,15 +348,15 @@ std::vector<std::wstring> FindRuntimeCandidates(HMODULE shellModule) {
     return out;
 }
 
-std::vector<std::wstring> FindGlobalPluginCandidates(HMODULE anchor) {
-    return FindSubdirPluginCandidates(L"Global", anchor);
+std::vector<std::wstring> FindGlobalPluginCandidates() {
+    return FindSubdirPluginCandidates(L"Global");
 }
 
-std::vector<std::wstring> FindGameCorePluginCandidates(HMODULE anchor) {
-    return FindSubdirPluginCandidates(L"GameCore", anchor);
+std::vector<std::wstring> FindGameCorePluginCandidates() {
+    return FindSubdirPluginCandidates(L"GameCore");
 }
 
-bool ShouldSkipPluginFile(const fs::path& path) {
+static bool ShouldSkipPluginFile(const fs::path& path) {
     const std::wstring name = path.filename().wstring();
     if (!EqualsIgnoreCase(path.extension().wstring(), L".dll")) return true;
     if (EqualsIgnoreCase(name, CIV6_DLL_LOADER_RUNTIME_FILENAMEW)) return true;

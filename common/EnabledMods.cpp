@@ -41,7 +41,10 @@ std::wstring NormalizePath(const std::wstring& path) {
     std::error_code ec;
     fs::path p(path);
     fs::path canon = fs::weakly_canonical(p, ec);
-    if (!ec) p = canon;
+    // 失败就返回空：宁可判不出授权，也不能拿没解析过链接的原始串当规范路径
+    //（否则 junction/符号链接规范化失败时原始串仍带 Mod 根前缀，会被放行）。
+    if (ec) return {};
+    p = canon;
     std::wstring s = p.wstring();
     for (auto& c : s) {
         if (c == L'/') c = L'\\';
@@ -62,28 +65,6 @@ bool PathIsUnderRoot(const std::wstring& path, const std::wstring& root) {
     return p[r.size()] == L'\\';
 }
 
-std::wstring FindModRoot(const std::wstring& anyPathUnderMod) {
-    std::error_code ec;
-    fs::path cur = fs::path(anyPathUnderMod);
-    if (fs::is_regular_file(cur, ec)) cur = cur.parent_path();
-
-    for (int i = 0; i < 8 && !cur.empty(); ++i) {
-        if (fs::is_directory(cur, ec)) {
-            for (fs::directory_iterator it(cur, ec), end; !ec && it != end; it.increment(ec)) {
-                std::error_code fileEc;
-                if (!it->is_regular_file(fileEc)) continue;
-                const auto ext = it->path().extension().wstring();
-                if (_wcsicmp(ext.c_str(), L".modinfo") == 0) {
-                    return NormalizePath(cur.wstring());
-                }
-            }
-        }
-        fs::path parent = cur.parent_path();
-        if (parent == cur) break;
-        cur = parent;
-    }
-    return {};
-}
 
 Snapshot Load() {
     Snapshot snap;

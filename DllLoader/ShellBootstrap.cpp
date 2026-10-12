@@ -110,7 +110,7 @@ HMODULE LoadRealGameCore() {
     return nullptr;
 }
 
-bool InstallLoaderIfMissing(HMODULE shellModule) {
+bool InstallLoaderIfMissing() {
     // 只在【成功装好、或已确认我们的 loader 在位】时才记住结果并短路后续调用；
     // 任何失败都不置位，下次调用（同一会话内游戏可能重建 game context）还会重试。
     //
@@ -168,12 +168,12 @@ bool InstallLoaderIfMissing(HMODULE shellModule) {
             versionDll.c_str());
     }
 
-    // c. Collect candidates from the scan roots (game root / Documents Mods / Workshop) plus the
-    //    loader's own directory. FindRuntimeCandidates deliberately does NOT filter by
+    // c. Collect candidates from the scan roots (Documents Mods / Steam Workshop).
+    //    FindRuntimeCandidates deliberately does NOT filter by
     //    mod-enabled state - installation elects by version only (RCDATA 105), which is a
     //    separate path from "plugins load only from enabled mods". Probe versions, elect the
     //    highest (tie -> lexicographically smaller path).
-    const auto paths = ModScan::FindRuntimeCandidates(shellModule);
+    const auto paths = ModScan::FindRuntimeCandidates();
     Logger::Log("InstallLoaderIfMissing: found %zu runtime candidate(s)", paths.size());
 
     std::vector<RuntimeCandidate> ranked;
