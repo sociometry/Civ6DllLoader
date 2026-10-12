@@ -319,7 +319,7 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 - **第 5 步必须在第 7 步之前**：入口字节还原之后才谈得上"Free 插件不会留下入口跳向已释放代码的窗口"；
 - **第 9 步重扫而不是沿用第 5 步的地址列表**：第 5～9 步之间还跑过插件卸载，而 `PushLuaMethods` 这类
   注册入口按设计不过域门，理论上仍可能往正在拆除的映像上装钩——重扫能一并收掉；
-- **这里【不做】补丁区间清账，是设计决定**：Loader 已删除补丁自动回滚（§5.8），补丁记录只在插件
+- **这里【不做】补丁区间清账，是设计决定**：Loader 不替插件回滚补丁（§5.8），补丁记录只在插件
   自己调 `Unpatch` 时才从 `PatchRegistry` 摘除。副作用是**未撤销的补丁记录会跨代存活** —— GameCore
   插件若没调 `Unpatch`，它那条落在旧映像区间里的记录会留到进程退出；新一代 GameCore 映射到同一基址时，
   这条陈旧记录仍会参与 `OverlapsRegistered` / `OverlapsHookPrologue` 的区间仲裁（见 §5.8）。
@@ -473,14 +473,12 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 ### 3.4 插件 ABI：HookAPI 表与版本规则
 
 - 表是 `const HookAPI g_hookApi`（`.rdata`，只读——插件写它会当场 AV，被 `CallOnLoadSafe` 接住）；
-- **表的形状由两条 `static_assert` + 一个计数常量钉死**：`CIV6_HOOK_API_ENTRY_COUNT`（当前 78）
+- **表的形状由两条 `static_assert` + 一个计数常量钉死**：`CIV6_HOOK_API_ENTRY_COUNT`（当前 77）
   必须与 `sizeof(HookAPI)` 和末尾成员偏移同时吻合，否则编译失败；启动时 `VerifyHookApiTableProtection`
   再扫一遍空项（聚合初始化漏写一项只会静默零填，编译期抓不到）；
 - **当前 `CIV6_HOOK_API_VERSION = 1`，且预发布阶段删改前缀不升版本号** —— 从未对外发布过插件，
-  `1` 是它唯一出现过的值。已发生过的破坏前缀都没 bump（① 删掉
-  `GetCivilizationDescription` / `RegisterGameCoreReady` / `RegisterGameCoreTeardown`；
-  ② 类别声明从表尾字段 `DeclarePluginKind` 改成插件自带导出 `Civ6PluginKind`，入口 79 变 78）。
-  此后只在**尾部追加**过入口（本次追加 `GetSymbolDbState` / `GetSymbolDbMatchRatio`）——
+  `1` 是它唯一出现过的值。
+  此后只在**尾部追加**过入口（`GetSymbolDbState` / `GetSymbolDbMatchRatio`）——
   追加不破坏旧偏移，旧插件不读新字段即可继续工作，`HookAPI_IsCompatible` 的 `structSize` 比较会
   放过这种情形。
   **在预发布阶段，插件必须用当前头文件重新编译**；首次对外发布之后才需要递增版本号；
@@ -518,7 +516,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 ## 4. 插件接口（HookAPI 全表）
 
-表共 80 个字段 = 2 个头（`apiVersion` / `structSize`）+ 78 个入口。按"谁能用、受什么限制"分四类。
+表共 79 个字段 = 2 个头（`apiVersion` / `structSize`）+ 77 个入口。按"谁能用、受什么限制"分四类。
 
 ### 4.1 双域通用，但按"目标地址域"设门（9 个）
 
@@ -549,15 +547,14 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 （`PatchRegistry::OverlapsRegistered`）、装钩前导窗口仲裁（`OverlapsHookPrologue`）、teardown 窗口
 （`TargetInTearingDownGameCore`）。
 
-### 4.2 GameCore 专属（8 个，编译期 + 加载期 + 运行期三层限制）
+### 4.2 GameCore 专属（7 个，编译期 + 加载期 + 运行期三层限制）
 
-`GetEngineUtility`、`EditPlayer`、`RegisterGameEvent`、`TriggerGameEvent`、`RegisterScriptGlobals`、
+`EditPlayer`、`RegisterGameEvent`、`TriggerGameEvent`、`RegisterScriptGlobals`、
 `RegisterScriptGlobalsForUI`、`PushLuaMethods`、`RegisterPushMethodsTarget`。
 
-为什么专属：`GetEngineUtility` 的定位 pattern 直接扫 **GameCore XP2**（读 `ms_pkCurrentGame + 0x18`），
-`EditPlayer` 解析 `GameCore::Context::Globals::EditPlayer` 符号；其余六个操作 **gamecore 的脚本环境**
-（往 Lua 表里放闭包、注册脚本全局、事件）。Global 插件用它们没有意义：对局前拿不到对象，对局中也不该
-持有 GameCore 域的引用。
+为什么专属：`EditPlayer` 解析 `GameCore::Context::Globals::EditPlayer` 符号；其余六个操作
+**gamecore 的脚本环境**（往 Lua 表里放闭包、注册脚本全局、事件）。Global 插件用它们没有意义：
+对局前拿不到对象，对局中也不该持有 GameCore 域的引用。
 
 ### 4.3 Lua 原语（44 个）——不是 GameCore 专属
 
@@ -581,7 +578,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   `lua_newstate()` 在 `Civ6App::GUIInit` 建一次，只在 `Civ6App::GUIShutdown` `lua_close`
   ——**换局不会失效、也不会被重写**（全 exe 仅一处写 `+0x10`）。未就绪返回 null。
   **Global 与 GameCore 两类插件都可调用，不限类别**——它是进程级 state，常驻插件持有它
-  不会因换局悬垂，所以与 `GetEngineUtility` 那类"GameCore 短命域"入口不同类，不受地址域门限制。
+  不会因换局悬垂，所以与 `EditPlayer` 那类"GameCore 短命域"入口不同类，不受地址域门限制。
 
   ⚠️ **别和"每局 thread state"混淆**：Civ6 确实是多 `lua_State` 引擎，但 GameCore 每局用
   `IScriptSystem1::CreateLuaThread` 建的是 `lua_newthread(main_state)` 派生的 coroutine，
@@ -713,22 +710,20 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 `Patch` / `Unpatch` 是插件对游戏内存的**原始字节修改**。账本是**按 target 分层的 owner 栈**：
 每个 target 维护一串 `Level`（按应用顺序），每层记「该层写入**之前**该区间的字节」+ owner。
 
-**已实施：删除 Loader 侧的自动回滚**（`RevertAllFor` 及其两个调用点
-`UnloadPluginByOwnerId` / `QuarantinePluginByOwner` 里的还原步骤），理由：
+**Loader 不替插件自动回滚**。理由：
 
-- **两个调用点里只有一个有意义，而那个恰好最危险。** `UnloadPluginByOwnerId` 那条针对 GameCore 插件，
-  其补丁本来就只能落在当前 GameCore 映像内（§4.1），拆映像时随映射一起消失，回滚纯属多余；
-  真正会用到它的是**崩溃隔离**（§3.3），而隔离的语义是"模块驻留不卸、代码仍在内存里"——
+- **能自动回滚的场合回滚本就多余**：GameCore 插件的补丁只允许落在当前 GameCore 映像内（§4.1），
+  拆映像时随映射一起消失；
+- **真正需要回滚的场合恰恰最危险**：崩溃隔离（§3.3）的语义是"模块驻留不卸、代码仍在内存里"——
   此时往**可能正被执行**的代码里写还原字节、又不做任何 quiesce（项目自己有 MinHook 的线程冻结机制，
   但这条路径没用），风险高于收益；
 - **还原本身也在改页保护**，而恢复保护属性的返回值被忽略，一次失败就会把页永久留在可写状态（破坏 W^X）。
 
-**分层语义**（这一版的设计）：
+**分层语义**：
 
 - **同 owner 重复 `Apply` 同一 target → 拒绝。** 补丁已生效，再叠一层只会让"哪层是谁的"不可追踪；
-  要改字节就 `Unpatch` 再 `Patch`。这同时消除了旧实现"重复 Apply 时保留最初存档"造成的
-  「存档与实际写入不符」的歧义；
-- **不同 owner 可以叠加补丁**（旧实现直接按 owner 冲突拒绝）。每层存的是**本层写入前**的字节，
+  要改字节就 `Unpatch` 再 `Patch`；
+- **不同 owner 可以叠加补丁。** 每层存的是**本层写入前**的字节，
   所以后打补丁者 `Unpatch` 时还原的是**下层补丁**而非原始字节——各层各归其位；
 - **`RevertOwned` 只允许还原栈顶。** 下层存档记的是"上层写入之前"的字节，越过上层写回去会静默
   覆盖上层的补丁（而那个 owner 仍以为自己在生效）。要撤下层就先撤上层；
@@ -828,8 +823,7 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 
 `RegisterGameEvent(name, pushFn)` / `TriggerGameEvent(name, payload)`（GameCore 专属）：注册只写 loader
 自己的表（owner + name + pushFn）；触发走"内化"路径——取活跃 Lua state → `GameEvents[name].Call(...)`，
-参数由插件的 `pushFn` **现压**（是 loader 在调它，所以能被 `PluginInFlight` 守卫）。引擎信号环桥接的旧
-路径已删除。
+参数由插件的 `pushFn` **现压**（是 loader 在调它，所以能被 `PluginInFlight` 守卫）。
 
 ### 6.6 Lua 环境划分与 HavokScript
 
@@ -1023,7 +1017,7 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 
 ### 7.6 工具链：`tools/symdb.py`（唯一入口）
 
-原先 7 个脚本已合并为一个带子命令的入口，每条老命令行只需把脚本名换成 `python tools/symdb.py <子命令>`：
+符号库产线收在一个带子命令的入口里：
 
 | 子命令 | 作用 |
 |---|---|
@@ -1035,10 +1029,9 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 | `aob` | 从容器里的 mask 指纹生成/核对 loader 的 AOB 常量（`--emit-cpp` 直接出可粘贴的常量块） |
 | `all` | 一条命令跑完产线：`module` ×3 → `pack` → `compress` → 部署到 `DllLoaderRuntime/` → `validate` → 清理中间产物 |
 
-`rva-map` 已迁到 `tools/gen_rva_map.py`。`rva_to_symbol`（RVA → 符号）现在覆盖
-**gamecore / dx11 / dx12 三个映像**：每个映像的符号表各压成一份 zlib 数据，由 Rust 侧
-`include_bytes!` 在**编译期嵌入** exe —— 交付物仍是单个文件，查询时只解压选中的那一份。
-生成端因此是"三份 + 压缩"，与原先的单份未压缩实现不同源，故此只保留一处实现。
+`rva_to_symbol`（RVA → 符号）覆盖 **gamecore / dx11 / dx12 三个映像**：每个映像的符号表各压成一份
+zlib 数据，由 Rust 侧 `include_bytes!` 在**编译期嵌入** exe —— 交付物仍是单个文件，查询时只解压选中的
+那一份。
 重建：`python tools/gen_rva_map.py` 然后 `tools/rva_to_symbol/build.bat`（一键，含编译与安装）。
 
 **可复现边界**（工具文档里的定论）：`JSON → .bin → pack.bin → .xp → 部署/validate` 保证**逐字节复现**；
@@ -1118,7 +1111,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | 9 | UI 注入依赖特征码，匹配失败静默降级 | 游戏更新改了目标代码 | 面板不出现（日志有记录），其余功能正常 | 接受 |
 | 10 | 数据槽定位依赖 AOB 兜底指令序列 | 编译器 / 游戏更新 | 定位失败返回 0，对应功能降级 | 接受（有日志） |
 | 11 | 休眠检测要求宿主 exe 名形如 `CivilizationVI*.exe` | 防止"别的进程从 exe 目录加载这份 version.dll"时把 Loader + Global 插件拉进去 | 用改名 exe / 第三方启动器的会话里 Loader 静默休眠（不装钩）；`OutputDebugString` 有留痕 | 有意（严格优先） |
-| 12 | 插件打的补丁**不再自动回滚** | 自动回滚要在"插件已崩"的时刻往可能正执行的代码里写还原字节，且无 quiesce；存档还可能是别人的跳板字节 | 隔离/卸载后补丁留在游戏里直到进程退出；插件需自己管 `Unpatch` 时机 | 有意（§5.8，已实施） |
+| 12 | 插件打的补丁**不由 Loader 自动回滚** | 自动回滚要在"插件已崩"的时刻往可能正执行的代码里写还原字节，且无 quiesce；存档还可能是别人的跳板字节 | 隔离/卸载后补丁留在游戏里直到进程退出；插件需自己管 `Unpatch` 时机 | 有意（§5.8） |
 
 ### 9.1 已知未处理的问题（实现缺陷，待修复）
 
@@ -1158,7 +1151,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 #### 加一个 HookAPI 入口
 
 1. 在 `common/HookAPI.h` 的 `HookAPI` 结构**尾部**追加函数指针；
-2. 若它只对 GameCore 有意义：加进文件底部"类别门禁"块的对象式重命名列表（8 个之一的位置），
+2. 若它只对 GameCore 有意义：加进文件底部"类别门禁"块的对象式重命名列表（7 个之一的位置），
    并在实现里调用 `RequireGameCoreOwner`；
 3. 若它是"换地址 / 给地址"类：实现必须过 `IsTargetOpenToCaller` / `IsRangeOpenToCaller`；
 4. 在**归属模块**里实现对应的 `*Impl`（取址类 → `AddressResolve.cpp`；脚本/Lua/GameEvent/PushMethods 类 →
@@ -1190,8 +1183,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 ### 10.3 改 ABI 的规则
 
 - **预发布阶段（当前）不升版本号**：从未对外发布过插件，删字段 / 改顺序 / 改语义直接做，
-  `CIV6_HOOK_API_VERSION` 停在 `1`（唯一出现过的值）；插件必须用当前头文件重新编译。
-  已发生的两次破坏前缀见 §3.4；
+  `CIV6_HOOK_API_VERSION` 停在 `1`（唯一出现过的值）；插件必须用当前头文件重新编译；
 - **对外发布之后**：只追加（新增函数追加到尾部，`apiVersion` 不动）；破坏前缀才提升版本号，
   旧插件会被拒而不是崩；
 - **类别门在表外**：`Civ6PluginKind` 导出负责"OnLoad 之前"按类别快速拒绝（旧头文件编出来的插件没有这个
