@@ -618,6 +618,17 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 两个设计点：`nextTarget` **运行时**从站点字段读，所以跳板可以在 stub 生成之后由 `MH_CreateHook` 回填、
 拔槽也不需要改写任何可执行字节；stub 一经生成**永不释放**。
 
+**字段偏移是编译期钉死的**：stub 访问 `HookSite` 靠写进指令里的字节偏移（`hasCapture` /
+`nextTarget` / `captureParamIndex` 三处 `offsetof`），而 stub 永不重建——改 `HookSite` 布局后，
+同进程里可能同时存在按旧布局生成的旧 stub 与按新布局生成的新 stub。偏移错了不编译失败、
+不运行时报错，只表现为 capture 静默失效或跳到垃圾地址。`HookEngine.cpp` 在
+`BuildHookHubStub` 之前有四条 `static_assert` 钉住这三个偏移与 `sizeof(HookSite)`
+（实测 x64 Release：`hasCapture` 0x40 / `nextTarget` 0x18 / `captureParamIndex` 0x44 /
+`sizeof` 0x78），改布局会在编译期失败并提示同步 `BuildHookHubStub`。
+
+这四条只挡**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它们保证——但该前提在本项目成立：
+stub 里嵌的是本进程的 `&HookSite`，而 `version.dll` 自更新会重启进程，新进程里不存在旧 stub。
+
 **Stub 与 HookSite 节点的常驻原则（永不释放）**：
 1. **立即数指针内嵌**：Stub 机器码使用立即数 `mov r10, imm64(&HookSite)` 硬编码了站点节点地址；若释放节点，执行流将直接访问悬垂指针；
 2. **缺乏无锁静默判定机制**：系统无法证明“当前已无任何线程正停留在 Stub 执行流或跳板内”（缺少可靠的原子引用计数），释放内存会产生释放后使用（UAF）隐患；

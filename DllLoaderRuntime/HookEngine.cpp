@@ -99,6 +99,35 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);
 // ---------------- 函数实现 ----------------
 
 
+// ---- stub 依赖的字段偏移（编译期钉死） ----
+//
+// BuildHookHubStub 生成的 stub 是裸机器码，访问 HookSite 靠的是写进指令里的字节偏移
+// （下面三个 offsetof）。而 stub 一经生成**永不重建**（见 HookEngine.h 的硬约束），
+// 所以同一进程里可能同时存在"按旧布局生成的旧 stub"和"按新布局生成的新 stub"。
+//
+// 若有人调整 HookSite 的成员顺序 / 类型 / 容器（std::wstring 是 32 字节、std::vector
+// 是 24 字节，插入它们会让后面所有偏移整体移动），stub 会读到错字段：
+// hasCapture 读到 nextTarget 的低字节 → 永远走慢路径；captureParamIndex 读到别处
+// → 按错误的参数序号派发。这类错误不编译失败、不运行时报错，只表现为功能静默失效。
+//
+// 因此把这三个偏移 + 结构体大小钉死。实测值（x64 Release，/std:c++20，/MT）：
+//   detourOwner 0x20（std::wstring，32 字节）→ hasCapture 0x40（跨过一整个 wstring）
+//   captureOuts 0x48（std::vector，24 字节）→ recordStale 0x60 → sizeof 120 = 0x78
+// 改动 HookSite 布局时，这几条会编译失败 —— 那正是要的效果：提示同步更新
+// BuildHookHubStub 里的三个 offsetof（以及慢路径 movaps 的栈槽假设）。
+//
+// 注意这只挡住**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它保证：stub 里嵌的
+// 是本进程的 &HookSite 与本 DLL 编译期的偏移，而 version.dll 自更新会重启进程，
+// 新进程里不存在旧 stub，所以该前提在本项目成立。
+static_assert(offsetof(HookSite, hasCapture)      == 0x40,
+              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
+static_assert(offsetof(HookSite, nextTarget)      == 0x18,
+              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
+static_assert(offsetof(HookSite, captureParamIndex) == 0x44,
+              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
+static_assert(sizeof(HookSite)                     == 0x78,
+              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
+
 // ==== BuildHookHubStub ====
 // 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
 // 快路径（hasCapture == 0，Detour-only 站点的常态）：
