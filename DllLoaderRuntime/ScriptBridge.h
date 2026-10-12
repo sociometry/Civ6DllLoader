@@ -73,7 +73,6 @@ void SetGameCorePhaseReady(bool ready);
 // 故不能是 static。签名与实现逐字一致（从源码自动提取，未手工改写）。
 
 void* EditPlayerImpl(int playerId);
-void* GetEngineUtilityImpl();
 void* GetMainLuaStateImpl();
 void* LocCreateImpl(void);
 void LocDestroyImpl(void* loc);

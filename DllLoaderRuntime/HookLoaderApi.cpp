@@ -117,7 +117,6 @@ static const HookAPI g_hookApi = {
     &ScriptBridge::RegisterGameEventImpl,
     &ScriptBridge::TriggerGameEventImpl,
 
-    &ScriptBridge::GetEngineUtilityImpl,
     &ScriptBridge::GetMainLuaStateImpl,
     &ScriptBridge::LuaPushNilImpl,
     &AddressResolve::GetSymbolDbStateImpl,

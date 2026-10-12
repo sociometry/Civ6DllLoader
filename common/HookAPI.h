@@ -334,15 +334,6 @@ typedef struct HookAPI {
     //   必须在游戏线程调用——Lua 状态非线程安全。
     bool (*TriggerGameEvent)(const char* name, const void* payload);
 
-    // GameCore::EngineUtility 全局对象指针（ms_pkCurrentGame 槽 +0x18，与 scriptSystem +0x20
-    // 同族；IDA 实证 www.ms_pkEngineUtility）——锁协议用：
-    //   had = eu->vtable[6](eu)  HasGameCoreLock（+0x30）
-    //   if (had) eu->vtable[7](eu)  ReleaseGameCoreLock（+0x38）
-    //   ... Lua 工作 ...
-    //   if (had) eu->vtable[8](eu)  GetGameCoreLock（+0x40）
-    // 与官方 Utility::CallHook 完全同款三步。GameCore 未就绪返回 nullptr。
-    void* (*GetEngineUtility)(void);
-
     // 引擎的**主 Lua VM**（exe 全局 LuaSystem::LuaScriptSystem 单例的 +0x10，RVA 0x2D08F88）。
     // 这是**进程级** state：由 lua_newstate() 在 Civ6App::GUIInit 时创建一次，只在
     // Civ6App::GUIShutdown 时 lua_close —— **换局不会让它失效，也不会被重写**
@@ -405,7 +396,7 @@ static inline int HookAPI_IsCompatible(const HookAPI* api) {
 // HookAPI 里"入口"（函数指针）字段的数量。它是追加字段时唯一需要同步的计数：
 // 追加字段 -> 改这个常量 -> Civ6DLLHookLoaderAPI.cpp 的 static_assert 会逼着你把
 // g_hookApi 的位置初始化补齐（聚合初始化少写几项只会静默零填，运行时就是空指针调用）。
-constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT = 78;
+constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT = 77;
 
 template <typename T>
 T ResolveByName(HookAPI* api, HookImageId image, const char* name) {
@@ -641,7 +632,6 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
 #endif
 /* GameCore 专属入口：对象式宏重命名 -> 调用或取地址都在编译期报"不是 HookAPI 的成员"。
    结构体字段一个没少、偏移一个没变，只是这些名字在本 TU 里指向了不存在的成员。 */
-#define GetEngineUtility           CIV6_ERROR_GetEngineUtility_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define EditPlayer                 CIV6_ERROR_EditPlayer_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define RegisterGameEvent          CIV6_ERROR_RegisterGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define TriggerGameEvent           CIV6_ERROR_TriggerGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE

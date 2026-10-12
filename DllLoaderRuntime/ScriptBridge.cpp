@@ -95,7 +95,7 @@ constexpr size_t   kGameEventNameMax           = 96;    // 事件名副本容量
 
 // ms_pkCurrentGame 定位 pattern（GameSignals::Subscribe 开头 mov rdi, cs:ms_pkCurrentGame
 // 序列；读命中+3 的 disp32，目标槽 = 命中+7+disp32）。GetCurrentGameSlot 用它解析
-// ms_pkCurrentGame 槽（GetEngineUtilityImpl 读 +0x18 取 EngineUtility）。
+// ms_pkCurrentGame 槽（GetEngineUtilityCore 读 +0x18 取 EngineUtility）。
 constexpr char kGameEventCurrentGamePattern[] =
     "48 8B 3D ?? ?? ?? ?? 48 85 FF 0F 84 ?? ?? ?? ?? 48 8B BF 80 02 00 00";
 // GameSignals::Subscribe 内 "mov rdi, cs:ms_pkCurrentGame" 指令地址（按代缓存，重扫兜底）。
@@ -270,19 +270,13 @@ static void* GetCurrentGameSlot() {
 
 // ==== GetEngineUtilityCore ====
 // GameCore::EngineUtility 全局（ms_pkCurrentGame 槽 +0x18，与 scriptSystem +0x20 同族）。
-// 锁协议（官方 Utility::CallHook 同款）。内部无门版本：Loader 自己的 Lua 锁协议路径
-// （GameEventInvokeLuaImpl）必须能取到它 —— 那里 _ReturnAddress() 会落在 Loader 模块，
-// 若走带门的 GetEngineUtilityImpl 会被 GameCore 门拒绝而误伤 TriggerGameEvent。
+// 锁协议（官方 Utility::CallHook 同款）。**Loader 私有**，不导出为插件 ABI 入口：
+// Loader 自己的 Lua 锁协议路径（GameEventInvokeLuaImpl）必须能取到它 —— 那里
+// _ReturnAddress() 会落在 Loader 模块，任何按调用者身份设门的入口都会拒绝它。
 static void* GetEngineUtilityCore() {
     void* currentGameSlot = GetCurrentGameSlot();
     if (!currentGameSlot) return nullptr;
     return GameEventReadPtrSafe(static_cast<const char*>(currentGameSlot) + 0x18, 0);
-}
-
-// ==== GetEngineUtilityImpl ====
-void* GetEngineUtilityImpl() {
-    if (!PluginDomain::RequireGameCoreOwner(_ReturnAddress(), "GetEngineUtility")) return nullptr;
-    return GetEngineUtilityCore();
 }
 
 // ==== GetMainLuaStateImpl ====
