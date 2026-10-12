@@ -56,6 +56,11 @@ struct PluginEntry {
     std::wstring ownerId;
     LoaderCore::PluginCategory category = LoaderCore::PluginCategory::Global;
     PluginState state = PluginState::Active;
+    // 本代（本次加载）的在途登记对象，由 PluginInFlight::BeginLifetime 在加载时新建。
+    // 必须按代持有而不是每次 Resolve(ownerId)：同一个插件重载后是同一个 ownerId，
+    // 若沿用旧对象，上一代未退出的回调会计进新一代的计数（WaitAll 等错对象）。
+    // 旧对象由 BeginLifetime 停用但【不删除】——锁外快照可能还握着它。
+    PluginInFlight::Owner* inFlight = nullptr;
     // 类别 / ABI 版本在 OnLoad 之前就由插件的 Civ6PluginKind 导出判完（见 LoadPluginDllInternal），
     // 这里不再保存任何"插件自述"字段。
 };
@@ -63,9 +68,11 @@ static vector<PluginEntry> g_plugins;
 
 // 插件状态的唯一写入口：state 与 PluginInFlight 的放行镜像必须一起更新，
 // 否则会出现"状态已停用、回调仍被放行"（或反之）的错位。
+// 用 entry.inFlight（本代对象）而不是 Resolve(ownerId)：后者会在加载路径抢先建出
+// 一个非本代的对象，使代际隔离失效。调用方必须保证 inFlight 已赋值。
 static void SetPluginState(PluginEntry& entry, PluginState state) {
     entry.state = state;
-    PluginInFlight::SetAllowed(PluginInFlight::Resolve(entry.ownerId),
+    PluginInFlight::SetAllowed(entry.inFlight,
         state == PluginState::Loading || state == PluginState::Active);
 }
 
@@ -3580,6 +3587,9 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     entry.name = pluginStem;
     entry.ownerId = NormalizePluginPath(wpath);
     entry.category = category;
+    // 先建本代登记对象，再置状态：SetPluginState 要写 entry.inFlight 的放行镜像，
+    // 顺序反了会作用在 nullptr 上（静默失效）。
+    entry.inFlight = PluginInFlight::BeginLifetime(entry.ownerId);
     SetPluginState(entry, PluginState::Loading);
     const std::wstring ownerId = entry.ownerId;
     g_plugins.push_back(std::move(entry));

@@ -15,15 +15,18 @@ class Civ6MessageBus {
 public:
     using MessageHandler = std::function<void(const char* topic, const void* data, size_t len)>;
 
-    // 注销（UnregisterOwner）会摘掉旧 entry 的登记并等待其它线程的在途调用退出；同 owner
-    // 的覆盖不单独排空（在途按 owner 记账，由 owner 级 WaitAll 统一等，见 .cpp）。
-    // 本线程回调栈上的调用（含嵌套祖先与递归）继续到自然返回，调用快照保活 entry。
+    // 生命周期边界（谁负责什么）：
+    //   - 本类只管"消息分发 + 摘表项"，两条路径都【不阻塞等待】；
+    //   - 排空在途回调是插件生命周期管理的职责（UnloadPluginEntryAt / Quarantine
+    //     在调 OnUnload 与 FreeLibrary 之前统一 WaitAll），不在这里重复做。
+    // 覆盖同名 handler 时把旧 entry 标记为失效（active=false），派发路径据此跳过它；
+    // 旧 entry 的内存由调用快照的 shared_ptr 保活到最后一个使用者退出，无需等待。
+    // 本线程回调栈上的调用（含嵌套祖先与递归）继续到自然返回。
     // 回调内清理返回不代表自身调用链已经退出，不能立即释放该调用链仍依赖的外部状态。
 
     // 注册消息处理器（同 owner 同名覆盖；不同 owner 的同名注册返回 false）。
     // canRegister 在总线锁内、发布前执行，使生命周期校验与 UnregisterOwner 串行化；
-    // 不得重入总线。覆盖旧 entry 时【不】排空（在途由 owner 级 WaitAll 统一等，见 .cpp）；
-    // 调用者也不得持有回调需要的锁。
+    // 不得重入总线。调用者不得持有回调需要的锁。
     bool RegisterHandler(const std::string& name, MessageHandler handler,
                          const std::wstring& owner = {},
                          const std::function<bool()>& canRegister = {});
@@ -42,6 +45,13 @@ private:
         MessageHandler handler;
         // 在途记账 / 门禁统一走 PluginInFlight（注册时解析一次，见 .cpp）。
         PluginInFlight::Owner* inFlight = nullptr;
+        // 本 entry 自身的有效性。覆盖同名 handler 时置 false，派发路径据此丢弃旧 handler。
+        // 与 inFlight 的分工：inFlight 管"插件是否还允许被回调"（跨卸载/跨代），
+        // active 只管"这一个 handler 是否已被替换掉"（同 owner 内的换实现）。
+        // 用独立标记而不是复用 inFlight：覆盖时插件仍然活着，不能把 owner 级门禁关掉
+        // （那会连带拒绝该 owner 的其它回调）。旧 entry 不删也不等——调用快照持有的
+        // shared_ptr 会保活它到最后一个使用者退出。
+        std::atomic<bool> active{ true };
     };
 
     using HandlerPtr = std::shared_ptr<HandlerEntry>;

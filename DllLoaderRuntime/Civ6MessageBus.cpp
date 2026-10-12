@@ -51,10 +51,15 @@ bool Civ6MessageBus::RegisterHandler(const std::string& name, MessageHandler han
             Logger::Log("Message handler name conflict rejected: %s", name.c_str());
             return false;
         }
+        if (existing != handlers_.end()) {
+            // 覆盖：给旧 handler 立一个"已失效"标记就走，不排空、不等待。
+            // 旧 entry 的内存由调用快照的 shared_ptr 保活（见头文件生命周期说明）。
+            existing->second->active.store(false, std::memory_order_release);
+        }
         handlers_[name] = std::move(replacement);
     }
-    // 覆盖旧 entry 不单独排空：异 owner 的覆盖已被拒绝，新旧 entry 同 owner，
-    // 在途调用按 owner 记账，由 owner 级 WaitAll 统一等。
+    // 覆盖旧 entry 不排空：异 owner 的覆盖已被拒绝，新旧 entry 同 owner、插件仍活着。
+    // 旧 handler 至多被"已取出快照、尚未读 active"的那一次调用多跑一遍，随后被拦下。
     return true;
 }
 
@@ -64,16 +69,18 @@ void Civ6MessageBus::UnregisterOwner(const std::wstring& owner) {
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto it = handlers_.begin(); it != handlers_.end(); ) {
             if (it->second->owner == owner) {
+                // 标记失效后再摘表项：并发派发可能已从表里取到快照，靠 active 拦下它。
+                it->second->active.store(false, std::memory_order_release);
                 it = handlers_.erase(it);
             } else {
                 ++it;
             }
         }
     }
-    // 先摘表项，再在总线锁外排空该 owner 的在途回调：等待期间绝不能持 mtx_
-    // （回调线程的 Enter / 注册路径都要进总线锁，持锁等待会成环）。
-    // 调用方通常已经 SetAllowed(false)；此处只负责等干净。
-    PluginInFlight::WaitAll(PluginInFlight::Resolve(owner), owner.c_str());
+    // 此处【不】排空在途回调。排空是插件生命周期管理的职责：UnloadPluginEntryAt /
+    // QuarantinePluginByOwner 都会在调 OnUnload 与 FreeLibrary 之前统一 WaitAll，
+    // 那才是必须守住 UAF 红线的地方。总线若也等一次，只会让"谁负责排空"变得含糊
+    // （两次等待的是同一个 Owner，第二次纯属重复）。
 }
 
 void Civ6MessageBus::Broadcast(const char* topic, const void* data, size_t len) {
@@ -104,9 +111,13 @@ void Civ6MessageBus::SendTo(const std::string& targetName, const char* topic, co
 void Civ6MessageBus::InvokeEntry(const HandlerPtr& entry, const char* topic,
                                  const void* data, size_t len, const char* name) {
     if (!entry) return;
+    // 1) 本 entry 是否已被覆盖掉。快照可能在覆盖之前取出，靠这个标记把它拦下。
+    //    只读一次原子量，不阻塞、不取锁。
+    if (!entry->active.load(std::memory_order_acquire)) return;
+    // 2) 插件级门禁：owner 已停用（卸载/隔离）时拒绝进入。
+    //    inFlight 只为"有 owner 的 handler"解析出来（注册路径只接受被跟踪的插件），
+    //    判空是防御；门禁由 owner 的 allowed 镜像决定。
     auto guard = PluginInFlight::Enter(entry->inFlight, PluginInFlight::Kind::Message);
-    // inFlight 只为"有 owner 的 handler"解析出来（注册路径只接受被跟踪的插件），
-    // 判空是防御；门禁由 owner 的 allowed 镜像决定。
     if (entry->inFlight && !guard) return;
     InvokeHandler(entry->handler, topic, data, len, name);
 }

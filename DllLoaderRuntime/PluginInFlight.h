@@ -8,17 +8,15 @@
 // 覆盖范围：只覆盖“加载器主动去调插件”的回调类入口——
 //     Message / GameEvent / ScriptGlobals / ScriptGlobalsUI / PushMethods（见 Kind）。
 // 这些入口由加载器自己发起，可以在进出时记账。
-// 不覆盖：钩子(detour) 与“交给 Lua 引擎的函数指针”——这两类不走这里，它们靠
-//     加载顺序（先装钩子、后允许卸载）解决。
+// 不覆盖：钩子(detour) 与交给 Lua 引擎的函数指针。站点/跳板不提前回收；插件模块等
+//     引擎卸载 Lua 环境后释放。插件自建线程仍须在 OnUnload 中停止。
 //
 // ======================== 无锁门禁纪律（必读） ========================
-// 1) Enter / Guard 绝不允许在持 g_pluginLifecycleMutex 的情况下调用。
-//    卸载路径是：持 g_pluginLifecycleMutex -> SetAllowed(false) -> WaitAll()；
-//    而 Enter 在无锁下自增计数并读 allowed。若回调线程持该锁再 Enter，就与
-//    卸载线程成环（卸载线程持锁等排空，回调线程持锁等 Enter），死锁。
+// 1) 回调在 lifecycle 锁外执行；卸载方持该锁 SetAllowed(false)，放锁后才 WaitAll。
+//    若持 lifecycle 锁等待，会阻塞在途回调里的 HookAPI 调用并形成死锁。
 // 2) Enter 内部顺序固定：先加计数、后判放行、非法则回退。反过来会在无锁下
 //    重开“判定通过之后才被卸载”的窗口。
-// 3) Owner 条目在 Resolve 里常驻不删，指针终身稳定。
+// 3) Owner 指针终身稳定；每次加载用 BeginLifetime 新建一份，旧快照永远停用。
 // =====================================================================
 
 #include <atomic>
@@ -41,7 +39,8 @@ struct Owner {
 };
 
 Owner* Resolve(const std::wstring& owner);       // 取/建；只在加载或初始化路径调用；返回指针常驻稳定
-void SetAllowed(Owner* o, bool allowed);         // 状态镜像唯一写入口（store release）
+Owner* BeginLifetime(const std::wstring& owner); // 加载新一代；调用方持插件生命周期锁
+void SetAllowed(Owner* o, bool allowed);         // 状态镜像唯一写入口，与 Enter/WaitAll 全序同步
 uint32_t LocalDepth(const Owner* o);             // 本线程在该 owner 上的嵌套层数
 std::string Describe(const Owner* o);            // 诊断串
 void WaitAll(Owner* o, const wchar_t* ownerName); // 排空等待
