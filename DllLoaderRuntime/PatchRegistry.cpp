@@ -1,5 +1,5 @@
-// PatchRegistry.cpp — v2 单层补丁注册表（HookAPI Patch/Unpatch 后端）。
-// 域规则/补丁仲裁见 docs/ARCHITECTURE.md §4.1 与 §5.5；历史设计文档已删除。
+// PatchRegistry.cpp — 单层补丁注册表（HookAPI Patch/Unpatch 后端）。
+// 域规则/补丁仲裁见 docs/ARCHITECTURE.md §4.1 与 §5.5。
 #include "pch.h"
 #include "PatchRegistry.h"
 

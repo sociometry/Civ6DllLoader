@@ -40,7 +40,8 @@ using namespace std;
 
 static Civ6MessageBus g_bus;
 
-// v2 插件跟踪项：路径 + 句柄 + 名字(stem，作 Patch owner / OnMessage 注册名) + 类别(Global/GameCore)。
+// 插件跟踪项：路径 + 句柄 + 名字(stem，仅作 OnMessage 寻址名) + ownerId(规范化完整小写路径，
+// 作 Patch / hook / capture 的 owner) + 类别(Global/GameCore)。
 enum class PluginState {
     Loading,
     Active,
@@ -85,8 +86,10 @@ static void QueueGameCoreModuleForFree(HMODULE module) {
 }
 
 // 插件生命周期互斥锁（递归：OnLoad/OnUnload 期间插件会再调用 HookAPI 注册入口，
-// 需要重入）。保护 g_plugins、脚本全局注册表与 PushMethods 槽位的全部读写：
+// 需要重入）。保护 g_plugins 的全部读写，以及脚本全局 / PushMethods 槽位的【写】；
 // 唯一写者是游戏线程（LoadDLL/UnloadDLL detour → Load/UnloadPluginsOf）。
+// 热路径的【读】不取这把锁 —— detour 用各自的细粒度互斥量取快照
+// （脚本全局走 g_scriptStateMutex、PushMethods 走 g_pushStateMutex）。
 // Runtime::MinHookMutex（MinHook 调用 + owner 表）与 PatchRegistry 的
 // CRITICAL_SECTION 保持独立，锁序恒为 lifecycle → hook/patch。
 // [声明位置] 必须在 FreePendingPluginModules 之前：它在 FreeLibrary 之后要用它清悬垂句柄。
@@ -770,9 +773,9 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
     }
     auto owner = RequirePluginOwner(detour, "InstallHook");
     if (!owner) return false;
-    // 地址开放性门：调用方类别 × 目标地址域。此门取代原先的"Global owner 必须先注册
-    // GameCoreTeardown"门槛——域门之后 Global 已不可能指向当前 GameCore，那段判断
-    // 永远不可达（HasGameCoreTeardownCallback 随之删除）。
+    // 地址开放性门：调用方类别 × 目标地址域。此门取代原先那条"Global owner 必须先登记
+    // GameCore teardown 回调"的门槛——域门之后 Global 已不可能指向当前 GameCore，那段判断
+    // 永远不可达，相关登记机制随之整体删除。
     if (!IsTargetOpenToCaller(owner->category, target, "InstallHook")) return false;
 
     // 锁序 lifecycle -> MinHook -> capture：站点在 MinHook 站点锁下取/建。
@@ -1365,9 +1368,10 @@ bool RegisterGlobalCaptureImpl(void* providerAddress, uint32_t paramIndex, void*
     if (!owner) return false;
     // 地址开放性门：capture 现在是"取地址型"入口（providerAddress 由插件自己解析后传入），
     // 因此统一按地址开放性口径判：GameCore 类别 -> 目标须在当前 GameCore 映像内；Global
-    // 类别 -> 不得落在 GameCore 映像内（exe / 常驻模块放行）。原先"调用方类别必须是
-    // GameCore"那道特例门随之删除：它要防的悬垂已由本门 + CleanupAllCaptureSites 的
-    // GameCore 域过滤共同覆盖，而 Global 插件挂在常驻模块上的 capture 不再被误拒。
+    // 类别 -> 目标须落在【某个已加载的非 GameCore 模块】内（正面规则，见 IsTargetOpenToCaller）。
+    // 原先"调用方类别必须是 GameCore"那道特例门随之删除：它要防的悬垂已由本门 +
+    // CleanupAllCaptureSites 的 GameCore 域过滤共同覆盖，而 Global 插件挂在常驻模块上的
+    // capture 不再被误拒。
     if (!IsTargetOpenToCaller(owner->category, providerAddress, "RegisterGlobalCapture")) return false;
     return RegisterGlobalCaptureCore(providerAddress, paramIndex, out, owner->ownerId);
 }
@@ -1477,8 +1481,9 @@ void* LoaderCore::ResolveDataByAobCore(HookImageId image, const char* aob, uint3
 //     CleanupCaptureSitesForOwner）。
 // 硬约束：这里【只】清空 captureOuts / 翻转 hasCapture，绝不 MH_RemoveHook、绝不
 // g_captureRuntime.release、绝不 g_hookSites.erase。站点 / stub / MinHook trampoline
-// 全程存活，只在进程退出时随静态对象回收。本段只取 g_captureMutex（capture 侧），
-// 不取 MinHook 锁，因此不会与「MinHook -> capture」的注册路径成环。
+// 全程存活，只在进程退出时随静态对象回收。本段锁序与注册路径一致（MinHook -> capture）：
+// 站点表结构由 MinHook 站点锁保护，capture 字段是它内层的派发侧数据，两把锁都取、
+// 顺序恒定，因此不会与注册路径成环。
 // CaptureDispatch 在同一把 g_captureMutex 下复查 hasCapture/retiring/空 outs：陈旧读到
 // hasCapture=1 时因 outs 已清空而被兜住。
 
@@ -1882,12 +1887,14 @@ static bool GameEventInvokeLua(const char* name, GameEventPushFn pushFn,
 // 避免在途调用踩到已回滚的注册（与远程对引擎桥路径的加固同款）。
 #pragma intrinsic(_ReturnAddress)
 
-// 调用方归属校验（尽力而为）：
-//   - 正常情况：插件经函数指针表调用本函数，_ReturnAddress() 落在该插件自己的模块里，
-//     可精确判定；事件名若属于另一个插件则拒绝（挡住"抢注名字 + 用自己的 payload 触发
-//     别人的 pushFn"这条跨插件路径）。
-//   - 判定不出（尾调用 / 经第三方 wrapper 转发 / 调用方不是被跟踪插件）：只放行，保持旧行为。
-//     与 Patch 用 _ReturnAddress() 的 caveat 相同 —— 所以这里必须 fail-open，不能 fail-closed。
+// 调用方归属校验（严格 fail-closed）：
+//   正常情况：插件经函数指针表调用本函数，_ReturnAddress() 落在该插件自己的模块里，
+//   可精确判定；事件名若属于另一个插件则拒绝（挡住"抢注名字 + 用自己的 payload 触发
+//   别人的 pushFn"这条跨插件路径）。
+//   判定不出（尾调用 / 经第三方 wrapper 转发 / 调用方不是被跟踪插件）同样拒：下面的
+//   RequireGameCoreOwner 对 !owner 与"owner 不是 GameCore"一律 return false。
+//   注意这与 Patch 用 _ReturnAddress() 的 caveat 不同 —— Patch 的探测在页属性层面，
+//   失败可能只是探测不到；这里的 owner 查找失败就是"调用方身份不明"，没有放行理由。
 __declspec(noinline)
 bool TriggerGameEventImpl(const char* name, const void* payload) {
     if (!name || !*name) return false;
@@ -3141,7 +3148,8 @@ __declspec(noinline) static bool HookPatch(void* target, const void* bytes, size
     auto owner = RequirePluginOwner(_ReturnAddress(), "Patch");
     if (!owner) return false;
     // 地址开放性门（整段）：GameCore 类别要求 [target, target+len) 全落在当前 GameCore 映像内；
-    // Global 类别要求整段与 GameCore 映像不相交。
+    // Global 类别要求整段与 GameCore 映像不相交【且】整段落在同一个已加载的非 GameCore 模块内
+    // （正面规则，完整表述见 IsRangeOpenToCaller 的注释）。
     if (!IsRangeOpenToCaller(owner->category, target, len, "Patch")) return false;
     return PatchRegistry::Apply(target, bytesCopy.data(), len, owner->ownerId.c_str());
 }
@@ -3311,6 +3319,11 @@ void LoaderCore::VerifyHookApiTableProtection() {
 
 // exe 版本锚（SizeOfImage + FileHeader.TimeDateStamp）：无符号库时判断"能否直接信任原始 RVA"。
 // 由 tools/symdb.py aob 的同一份逆向数据得出；游戏更新后这里会失配 -> 只走 AOB 兜底。
+//
+// SizeOfImage 必须用【去 DRM 视图】（PdataMatch::NormalizedSizeOfImage）：下面的常量取自
+// 去 DRM 的 sidecar 数据，而 DRM 剥离只删末尾 .bind 段、TimeDateStamp 与 .pdata 逐字节不变。
+// 实测同一构建的两版 exe：修改版 DX11 0x36D1000 / 原版 0x3704000，TDS 都是 0x667C6FC6 ——
+// 直接比原始值会让跑原版 exe 的用户恒定失配，RVA 快路径失效。
 namespace {
 constexpr uint32_t kAnchorDx11SizeOfImage = 0x36D1000;
 constexpr uint32_t kAnchorDx11TimeDate   = 0x667C6FC6;
@@ -3326,7 +3339,7 @@ static bool ExeMatchesAnchor(HookImageId image) {
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
         reinterpret_cast<const uint8_t*>(info.base) + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    const uint32_t sizeOfImage = nt->OptionalHeader.SizeOfImage;
+    const uint32_t sizeOfImage = PdataMatch::NormalizedSizeOfImage(nt);
     const uint32_t timeDate = nt->FileHeader.TimeDateStamp;
     if (image == kHookImageExeDx11) {
         return sizeOfImage == kAnchorDx11SizeOfImage && timeDate == kAnchorDx11TimeDate;
@@ -3433,8 +3446,10 @@ __declspec(noinline) static bool CallPluginKindSafe(uint64_t(*fn)(), uint64_t* o
     }
 }
 
-// v2 统一插件加载流程：LoadLibraryExW + 类别/ABI 门禁(OnLoad 之前) + OnLoad(SEH) +
-// OnMessage 自动注册 + 记录跟踪项。
+// 统一插件加载流程：LoadLibraryExW + 类别/ABI 门禁(OnLoad 之前) + 记录跟踪项(Loading)
+// + OnLoad(SEH) + OnMessage 自动注册 + 激活(Active)。
+// 注意"记录跟踪项"必须在 OnLoad【之前】：插件在 OnLoad 里就可能经 HookAPI 注册钩子，
+// 那些入口要靠 owner 探针在 g_plugins 里找到本模块，条目缺席会把自己全部拒掉。
 // nameNarrow = 显示名（通常为文件名，内部取 stem 作 Patch owner / OnMessage 名）；已加载（同句柄）返回 false。
 static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& nameNarrow,
     LoaderCore::PluginCategory category) {
@@ -3678,7 +3693,7 @@ static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
 
 // 崩溃隔离（与 OnLoad 崩溃同构）：标记隔离 + 回滚该 owner 的全部注册
 // （MinHook 钩/Lua 方法/脚本全局/GameEvent/OnMessage）。模块驻留不卸；
-// 隔离后 reconcile 与阶段 B 全量扫描都不再重试。
+// 隔离后阶段 B 全量扫描不再重试（项目没有 reconcile 通路：状态变化要重启才生效）。
 // 【不回滚补丁】：隔离的语义是"模块驻留、代码仍在内存里"，此刻往可能正被执行的代码里
 // 写还原字节、又没有 quiesce，风险高于收益；补丁按"进程生命周期内不可撤销"处理，
 // 要撤销由插件在 OnUnload 里自己调 Unpatch。见 ARCHITECTURE §5.8。
@@ -3703,7 +3718,7 @@ static void QuarantinePluginByOwner(const std::wstring& ownerId) {
     Logger::Log("Plugin quarantined by owner: %ls", ownerId.c_str());
 }
 
-// 按跟踪项卸载单个插件（调用方保证 index 有效）：
+// 按 ownerId 卸载单个插件（索引在函数内部按 ownerId 查）：
 // OnUnload → RemovePluginHooks（拔槽，绝不在插件卸载时物理摘 MinHook 记录）→ 撤销 capture /
 // 回调类注册 → 从 g_plugins 摘除 →（freeModule 时）句柄入队，等引擎卸完 GameCore 才 Free。
 // freeModule 只由 GameCore 类别传 true：GameCore 插件随对局重载必须真正卸载，插件静态
@@ -3754,12 +3769,15 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) 
                    candidate.ownerId == entry.ownerId;
         });
     if (tracked != g_plugins.end()) g_plugins.erase(tracked);
-    // FreeLibrary 必须在生命周期锁【之外】调用：插件 DllMain(DLL_PROCESS_DETACH) 可能
-    // 反过来调 Loader，持锁卸载会让行为不可控，而且 FreeLibrary 本身可能阻塞。
+    // 生命周期锁【之外】做入队/放行决策：入队只碰 g_pendingFreeModules 自己的锁，
+    // 且此处已不再调用 FreeLibrary —— 真正的 FreeLibrary 在引擎卸完 GameCore 之后由
+    // FreePendingPluginModules 执行（见 g_pendingFreeModules 的说明）。
     // freeModule=false（Global）时继续驻留：游戏线程可能仍在该插件的 detour/回调内
     // 执行（MH_DisableHook 不等待所有类型的在飞调用），此刻卸下映像会把正在执行的
-    // 代码变成 UAF。驻留后钩已摘、补丁已回滚、Lua 方法/回调/OnMessage 已注销，映像
+    // 代码变成 UAF。驻留后钩已摘、Lua 方法/回调/OnMessage 已注销，映像
     // 休眠不会再被调用；代价是重启用时静态状态跨周期保留，OnLoad 必须可重入。
+    // 补丁不在上面这条清理链里：Loader 不替插件回滚，要撤销由插件在 OnUnload 里自己调
+    // Unpatch（见本函数上方的【不回滚补丁】与 ARCHITECTURE §5.8）。
     lifecycleLock.unlock();
     if (freeModule) {
         // 释放时机见 g_pendingFreeModules 的说明：等引擎卸完 GameCore（连同 gamecore 的
@@ -3778,8 +3796,10 @@ static const char* CategoryNameForLog(LoaderCore::PluginCategory cat) {
 }
 
 void LoaderCore::LoadPluginsOf(PluginCategory cat) {
-    // 扫描（文件系统/sqlite）在锁外做，避免长时间阻塞卸载/reconcile 路径；
-    // 单个插件的加载由 LoadSinglePlugin 在锁内原子完成。
+    // 扫描（文件系统/sqlite）在锁外做，避免长时间阻塞卸载路径；
+    // 单个插件的加载由 LoadSinglePlugin 驱动：去重与跟踪项写入持锁，而加载与回调阶段
+    // （LoadLibraryExW / Civ6PluginKind / OnLoad / OnMessage）会主动放锁以防自死锁，
+    // 因此"加载全程在锁内原子完成"并不成立。
     const auto wpaths = (cat == PluginCategory::GameCore)
         ? ModScan::FindGameCorePluginCandidates()
         : ModScan::FindGlobalPluginCandidates();
@@ -3866,7 +3886,7 @@ bool LoaderCore::IsInitialized() {
 // 早期实现：跨 GameCore 代际靠「域代际计数器」在注册路径重建站点，MinHook 记录与跳板
 // 一直驻留到进程退出。现在改为在 teardown 里趁旧映像还活着【物理摘钩】：
 //   1) DisableGameCoreDomainSites()：一次 MH_ApplyQueued 批量还原 GameCore 域全部入口字节；
-//   2) （Teardown 回调 / capture 清理 / GameCore 插件卸载之后）
+//   2) （capture 清理 / GameCore 插件卸载之后）
 //      RemoveGameCoreDomainSiteRecords()：按地址物理摘除 MinHook 记录（释放跳板）。
 // 为什么第 1 步必须先于 GameCore 插件 FreeLibrary：入口字节还原之后就不会再有新调用
 // 进入插件 detour；反过来先 FreeLibrary 就会留下「入口仍跳向已释放插件代码」的窗口。
@@ -4062,9 +4082,11 @@ void LoaderCore::ResetForReload() {
     UnloadPluginsOf(PluginCategory::GameCore);
 
     lifecycleLock.lock();
-    // 这里【不需要】补丁清账：唯一的补丁来源是插件的 PatchImpl，它已经过正面域规则
-    // （GameCore 插件只能落在当前 GameCore 映像内且卸载时按 owner 回滚；Global 插件只能
-    // 落在已加载的非 GameCore 模块内），所以拆映像时不可能存在落在旧映像区间里的记录。
+    // 这里【不做】补丁清账 —— 是设计决定而非"不可能有记录"：Loader 已删除补丁自动回滚
+    // （见【不回滚补丁】与 ARCHITECTURE §5.8），补丁记录只在插件自己调 Unpatch 时才从
+    // PatchRegistry 摘除。副作用是【未撤销的补丁记录会跨代存活】：GameCore 插件若没调
+    // Unpatch，它那条落在旧映像区间里的记录会留到进程退出；新一代 GameCore 映射到同一基址
+    // 时，这条陈旧记录仍会参与 OverlapsRegistered / OverlapsHookPrologue 的区间仲裁。
     // 第 2 步：重扫站点表物理摘除 GameCore 域的 MinHook 记录（释放跳板），并复位共享钩状态
     // （ScriptData/ForUI + PushMethods 槽位）。顺序理由见函数头注释。
     RemoveGameCoreDomainSiteRecords(lifecycleLock);

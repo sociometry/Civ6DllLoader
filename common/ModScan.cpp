@@ -220,7 +220,7 @@ void FilterByEnabledMods(std::vector<std::wstring>& paths, const char* what) {
 
 namespace {
 
-// v2: collect <mod>/Binaries/Win64/Plugins/<pluginSubdir>/*.dll candidates under one content root
+// Collect <mod>/Binaries/Win64/Plugins/<pluginSubdir>/*.dll candidates under one content root
 // (Plugins\Global\ and Plugins\GameCore\ are subdirectories of each mod's Plugins\ folder).
 void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::path& pluginSubdir,
                                        std::vector<std::wstring>& out) {
@@ -247,7 +247,8 @@ void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::pa
     }
 }
 
-// v2 shared pipeline: scan roots -> EnabledMods filter -> case-insensitive lexicographic sort ->
+// Shared pipeline (FindGlobalPluginCandidates / FindGameCorePluginCandidates 共用这条):
+// scan roots -> EnabledMods filter -> case-insensitive lexicographic sort ->
 // basename dedup (stable order, case-insensitive sort, dedup by filename).
 std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir) {
     std::vector<std::wstring> out;
@@ -326,7 +327,7 @@ static std::vector<std::wstring> CollectScanRoots() {
         }
     }
 
-    // 【不】加"游戏安装根"（FindContentRoot(exeDir)）：那不是模组容器。游戏自己
+    // 【不】加"游戏安装根"作为内容根：那不是模组容器。游戏自己
     // （Mods.sqlite 的 ScannedFiles）记录的安装内模组根是 <gameRoot>\DLC\<名> 与
     // <gameRoot>\Base\Assets\Scenarios\<名>，而 <gameRoot> 的直接子目录
     // （Base / CTP / DLC / Debug / LaunchPad）没有一个含 Binaries\Win64 —— 实测该根

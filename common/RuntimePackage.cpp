@@ -196,8 +196,11 @@ bool PublishStaged(const std::wstring& staged, const std::wstring& installed,
     const DWORD replaceError = GetLastError();
     Logger::Log("RuntimePackage: ReplaceFileW failed err=%lu; falling back to rename dance", replaceError);
 
-    // 回退路径：ReplaceFile 在"被替换文件正被映射为映像"等场合可能被拒，此时退回旧的两步
-    // 改名（已被实际使用验证过），行为不比旧版本更差；backup 已在上面清掉，不会撞名字。
+    // 回退路径：ReplaceFileW 在"被替换文件正被映射为映像"等场合会被拒
+    //（ShellBootstrap 接管外来 version.dll 时确实会走到），此时退回两步改名：
+    // 先把现役文件挪成 backup，再把 staged 改名到位。第二步失败就把 backup 改回原位；
+    // 连恢复都失败时保留两份完整文件（见下），绝不删掉唯一的旧副本。
+    // backup 已在上面清掉，不会撞名字。
     if (!MoveFileW(installed.c_str(), backup.c_str())) {
         Logger::Log("RuntimePackage: backup failed err=%lu", GetLastError());
         DeleteFileW(staged.c_str());

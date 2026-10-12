@@ -22,7 +22,8 @@ public:
 
     // 注册消息处理器（同 owner 同名覆盖；不同 owner 的同名注册返回 false）。
     // canRegister 在总线锁内、发布前执行，使生命周期校验与 UnregisterOwner 串行化；
-    // 不得重入总线。排空旧回调在总线锁外执行，调用者也不得持有回调需要的锁。
+    // 不得重入总线。覆盖旧 entry 时【不】排空（在途由 owner 级 WaitAll 统一等，见 .cpp）；
+    // 调用者也不得持有回调需要的锁。
     bool RegisterHandler(const std::string& name, MessageHandler handler,
                          const std::wstring& owner = {},
                          const std::function<bool()>& canRegister = {});

@@ -1,4 +1,4 @@
-// dllmain.cpp : thin GameCore proxy shell. v2: when the Loader (exe-dir
+// dllmain.cpp : thin GameCore proxy shell. When the Loader (exe-dir
 // version.dll) is missing, install it once from the highest-version runtime found
 // under the scan roots (deliberately NOT filtered by mod-enabled state); always
 // pass through to the real Expansion2 GameCore this session.

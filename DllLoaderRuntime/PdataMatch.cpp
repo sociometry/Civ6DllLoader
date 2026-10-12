@@ -31,11 +31,15 @@
 // 流程：Init（加载/解析 sidecar）→ BuildNewTable（身份判定 → 恒等 或 全表对齐 + 缓存）
 //   → CorrectRva / CorrectByName（查询 old->new 映射）。
 // BuildNewTable 身份判定顺序（与 sidecar 头记录比对）：
-//   1) SizeOfImage + FileHeader.TimeDateStamp 一致 = 同一构建 → 恒等映射，不再比较 pdata；
+//   1) 去 DRM SizeOfImage（NormalizedSizeOfImage，剥末尾 .bind）+ FileHeader.TimeDateStamp
+//      一致 = 同一构建 → 恒等映射，不再比较 pdata；
 //   2) 头身份不同 → 逐条比较 pdata 表，一致（纯重建、函数边界未变）→ 同样恒等映射；
 //   3) 两者都不同 → 启动跨版本匹配（缓存 / 全表对齐 / 叶子 AOB / vtable）。
 // 对齐 = 窗口哈希锚点（唯一候选）+ LIS 锚点链（old 递增且 new 递增）
-//   + 锚点间线性插值（插值处签名全等才接受）+ 头哈希校验（有 normHeadHash 的 Function）。
+//   + 锚点间线性插值（插值处签名全等才接受）+ 首锚点之前/末锚点之后外推（同规则）
+//   + 头哈希校验（有 normHeadHash 的 Function）
+//   + 头 hash 局部恢复 + 函数体 AOB 恢复（两条低置信度兜底路径）。
+// 这四条产出路径的不变量见 ValidateCachedMap 上方那段（校验缓存时逐条核对）。
 
 #include "pch.h"
 
@@ -57,6 +61,57 @@
 #include <vector>
 
 namespace PdataMatch {
+
+// ---- "去 DRM 视图"的 SizeOfImage（导出，见 PdataMatch.h）----
+//
+// DRM 剥离会删掉 exe 末尾的 .bind 段（SecVR 遗留段），SizeOfImage 随之变小，而
+// TimeDateStamp 与 .pdata 表逐字节不变。sidecar 的 baseSizeOfImage 记的是"去 DRM 视图"，
+// 故身份判定前先把末节连续的 DRM 段剥掉再比。
+//
+// 注意两个 SizeOfImage 的用途不同，不能混用：
+//   - 真实 SizeOfImage（nt->OptionalHeader.SizeOfImage）：所有越界/边界检查的基准，
+//     必须用镜像实际的值，否则会拿 sidecar 里的历史值去约束当前映像。
+//   - NormalizedSizeOfImage：只用于【构建身份判定】（本文件的 headerIdentity，以及
+//     Civ6DLLHookLoaderAPI.cpp 的 exe 版本锚 ExeMatchesAnchor）。
+namespace {
+
+// 只认 .bind。它的语义明确、位置固定（末节），不会误伤 GameCore 末尾的 .reloc；
+// 不用"末节且非代码段"之类的启发式，那是会误伤的。
+constexpr char kDrmSectionName[] = ".bind";
+constexpr size_t kDrmSectionNameLen = sizeof(kDrmSectionName) - 1;
+
+bool IsDrmSection(const IMAGE_SECTION_HEADER& section) {
+    return std::memcmp(section.Name, kDrmSectionName, kDrmSectionNameLen) == 0;
+}
+
+}  // namespace
+
+// 剥掉末节连续的 DRM 段后重算 SizeOfImage；无 DRM 段、或算出的值不合理时返回原值。
+uint32_t NormalizedSizeOfImage(const IMAGE_NT_HEADERS* nt) {
+    const uint32_t original = nt->OptionalHeader.SizeOfImage;
+    const uint32_t alignment = nt->OptionalHeader.SectionAlignment;
+    if (alignment == 0) return original;
+    const IMAGE_SECTION_HEADER* const first = IMAGE_FIRST_SECTION(nt);
+    const size_t count = nt->FileHeader.NumberOfSections;
+    if (count == 0) return original;
+
+    const IMAGE_SECTION_HEADER* keep = first + count - 1;
+    if (!IsDrmSection(*keep)) return original;          // 末节不是 DRM 段（GameCore 即如此）
+    while (keep > first && IsDrmSection(*keep)) --keep; // 跳过末节连续的 DRM 段
+    // 循环停在 keep == first 时，"只剩首段"与"全是 DRM 段"两种情形都成立，必须看 *keep
+    // 是不是 DRM 段才能区分：*first 仍是 DRM 才叫"全是 DRM 段"（布局异常，不采用）；
+    // 否则首段是正常段（如 .text），按它重算是对的。
+    if (IsDrmSection(*keep)) return original;
+
+    const uint32_t virtualSize = keep->Misc.VirtualSize;
+    const uint32_t end = keep->VirtualAddress +
+        (virtualSize > keep->SizeOfRawData ? virtualSize : keep->SizeOfRawData);
+    const uint64_t aligned = (static_cast<uint64_t>(end) + alignment - 1) / alignment * alignment;
+    // 剥离后不应变大；变大说明节表解析有问题，退回原值而不是拿一个错的去比身份。
+    if (aligned >= original) return original;
+    return static_cast<uint32_t>(aligned);
+}
+
 namespace {
 
 // ---- sidecar（Civ6DllLoader.symdb.bin）----
@@ -80,7 +135,8 @@ constexpr uint64_t kMaxHeapBytes = 256ull * 1024 * 1024;
 constexpr uint32_t kMaxVtableSlots = 4'000'000;
 constexpr uint32_t kUnmatched = UINT32_MAX;
 // "没有头 hash"的标记：符号表的 normHeadHash 字段 0 = 无。
-// 生成端（tools/symdb.py:737）统一写 0；Fnv1a64 至少哈希 1 个字节，取不到初值。
+// 生成端（tools/symdb.py 的 cmd_normhash：nhh 初值全 0，无头哈希或 SizeOfProlog<=0 时保持 0）
+// 统一写 0；Fnv1a64 至少哈希 1 个字节，取不到初值。
 // 早期版本的符号库曾用 FNV-1a64 初值当占位，那批文件已随 sidecar 重新生成而不复存在
 // （39,542 条占位值现均为 0），故运行时不再容忍该值——容忍它反而会让这些条目进入
 // 头 hash 校验，在 PdataMatch.cpp 的 mapping[oi] = kUnmatched 处抹掉正确锚点。
@@ -657,50 +713,6 @@ uint64_t ComputeTableFingerprint(const std::vector<PdataSig>& table) {
     return NormHash::Fnv1a64(bytes.data(), bytes.size());
 }
 
-// DRM 剥离会删掉 exe 末尾的 .bind 段（SecVR 遗留段），SizeOfImage 随之变小，而
-// TimeDateStamp 与 .pdata 表逐字节不变。sidecar 的 baseSizeOfImage 记的是"去 DRM 视图"，
-// 故身份判定前先把末节连续的 DRM 段剥掉再比。
-//
-// 注意两个 SizeOfImage 的用途不同，不能混用：
-//   - 真实 SizeOfImage（nt->OptionalHeader.SizeOfImage）：所有越界/边界检查的基准，
-//     必须用镜像实际的值，否则会拿 sidecar 里的历史值去约束当前映像。
-//   - NormalizedSizeOfImage：只用于 PdataMatch.cpp 里的构建身份判定。
-namespace {
-
-// 只认 .bind。它的语义明确、位置固定（末节），不会误伤 GameCore 末尾的 .reloc；
-// 不用"末节且非代码段"之类的启发式，那是会误伤的。
-constexpr char kDrmSectionName[] = ".bind";
-constexpr size_t kDrmSectionNameLen = sizeof(kDrmSectionName) - 1;
-
-bool IsDrmSection(const IMAGE_SECTION_HEADER& section) {
-    return std::memcmp(section.Name, kDrmSectionName, kDrmSectionNameLen) == 0;
-}
-
-// 剥掉末节连续的 DRM 段后重算 SizeOfImage；无 DRM 段、或算出的值不合理时返回原值。
-uint32_t NormalizedSizeOfImage(const IMAGE_NT_HEADERS* nt) {
-    const uint32_t original = nt->OptionalHeader.SizeOfImage;
-    const uint32_t alignment = nt->OptionalHeader.SectionAlignment;
-    if (alignment == 0) return original;
-    const IMAGE_SECTION_HEADER* const first = IMAGE_FIRST_SECTION(nt);
-    const size_t count = nt->FileHeader.NumberOfSections;
-    if (count == 0) return original;
-
-    const IMAGE_SECTION_HEADER* keep = first + count - 1;
-    if (!IsDrmSection(*keep)) return original;          // 末节不是 DRM 段（GameCore 即如此）
-    while (keep > first && IsDrmSection(*keep)) --keep; // 跳过末节连续的 DRM 段
-    if (keep == first) return original;                 // 全是 DRM 段：布局异常，不采用
-
-    const uint32_t virtualSize = keep->Misc.VirtualSize;
-    const uint32_t end = keep->VirtualAddress +
-        (virtualSize > keep->SizeOfRawData ? virtualSize : keep->SizeOfRawData);
-    const uint64_t aligned = (static_cast<uint64_t>(end) + alignment - 1) / alignment * alignment;
-    // 剥离后不应变大；变大说明节表解析有问题，退回原值而不是拿一个错的去比身份。
-    if (aligned >= original) return original;
-    return static_cast<uint32_t>(aligned);
-}
-
-}  // namespace
-
 // 解析目标映像的 .pdata：RUNTIME_FUNCTION 数组 -> (begin_rva, size, unwind_hash) 签名表。
 // 参数名 gameCore 是历史命名：exe（DX11/DX12）与 GameCore 都走这里。
 bool ParseNewPdata(HMODULE gameCore, std::vector<PdataSig>& outTable,
@@ -925,7 +937,7 @@ std::vector<uint32_t> AlignTables(
         for (size_t oi = 0; oi < n; ++oi) {
             if (mapping[oi] != kUnmatched && mapping[oi] < m) newUsed[mapping[oi]] = 1;
         }
-        // 已匹配 old 索引（升序，仅 v3 锚点/插值，不含 v9 恢复的低置信项）
+        // 已匹配 old 索引（升序，仅锚点/插值/首尾外推阶段匹配项，不含下面两条恢复路径的低置信项）
         std::vector<size_t> matchedOld;
         matchedOld.reserve(n);
         for (size_t oi = 0; oi < n; ++oi) {
@@ -966,7 +978,7 @@ std::vector<uint32_t> AlignTables(
             }
         }
         if (recovered != 0) {
-            Logger::Log("PdataMatch: v9 local recovery matched %zu", recovered);
+            Logger::Log("PdataMatch: head-hash local recovery matched %zu", recovered);
         }
     }
 
@@ -1032,7 +1044,7 @@ std::vector<uint32_t> AlignTables(
             ++recovered;
         }
         if (recovered != 0) {
-            Logger::Log("PdataMatch: v10 AOB recovery matched %zu", recovered);
+            Logger::Log("PdataMatch: body-AOB recovery matched %zu", recovered);
         }
     }
     return mapping;
@@ -1597,7 +1609,8 @@ static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
     size_t anchors = 0;
 
     // 身份判定（与 sidecar 头记录的两项比对，顺序即优先级）：
-    //  1) 去 DRM SizeOfImage + TimeDateStamp 相同 = 同一 GameCore 构建 -> 直接恒等映射，不再比较 pdata 表。
+    //  1) 去 DRM SizeOfImage + TimeDateStamp 相同 = 同一模块构建（当前 exe 或 GameCore 都走这条
+    //     路径；只有 exe 有 DRM 段）-> 直接恒等映射，不再比较 pdata 表。
     //  2) 头身份不同 -> 逐条比较 pdata 表；完全一致（纯重建、函数边界未变）同样恒等映射。
     //  3) 头身份与 pdata 都不同 -> 才启动跨版本匹配（缓存 / AlignTables / 叶子 AOB / vtable）。
     //
@@ -1636,9 +1649,12 @@ static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
             }
         }
         if (identical) {
+            // 两侧都用归一口径：sidecar 的 baseSizeOfImage 是去 DRM 视图，这里若打原始
+            // SizeOfImage，跑未剥离 DRM 的原版 exe 会打出 "0x3704000 vs 0x36d1000" 的
+            // 假差异，恰好是 NormalizedSizeOfImage 要消除的那种误导。
             Logger::Log("PdataMatch: header identity differs (size 0x%08X vs 0x%08X, ts 0x%08X vs 0x%08X) "
                         "but pdata tables identical -> identity mapping",
-                imageSize, g_baseSizeOfImage, timeDateStamp, g_baseTimeDateStamp);
+                normalizedImageSize, g_baseSizeOfImage, timeDateStamp, g_baseTimeDateStamp);
         } else {
             Logger::Log("PdataMatch: header identity and pdata both differ -> cross-version matching "
                         "(old=%zu new=%zu)", oldTable.size(), newTable.size());
