@@ -1075,7 +1075,9 @@ void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImag
 }
 
 // 内部核心：pattern 由调用方保证可读（Loader 用字面量 / 插件先抄写）。
-static void* ResolveByPatternCore(HookImageId image, const char* pattern, HookImageSection section) {
+static void* ResolveByPatternCore(HookImageId image, const char* pattern, HookImageSection section,
+    uint32_t index) {
+    if (index == 0) index = 1;   // 0 视为默认首命中
     // 解析 AOB："48 8B ?? ?? 74 ?? E8"（?? 整字节通配，也支持单 nibble 如 4?）。
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> masks;
@@ -1167,27 +1169,30 @@ static void* ResolveByPatternCore(HookImageId image, const char* pattern, HookIm
         return nullptr;
     }
 
-    // 线性首命中搜索（mask 0 位 = 通配）。
+    // 线性搜索第 index 个命中（mask 0 位 = 通配）。多命中场景由调用方用 index 消歧：
+    // 例如 GetRuleSet 那种函数体完全相同的兄弟函数，只能靠升序命中表的位置区分。
     const uint8_t* basePtr = reinterpret_cast<const uint8_t*>(searchBase);
     const size_t limit = searchSize - bytes.size() + 1;
+    uint32_t found = 0;
     for (size_t i = 0; i < limit; ++i) {
         bool match = true;
         for (size_t j = 0; j < bytes.size(); ++j) {
             if ((basePtr[i + j] & masks[j]) != bytes[j]) { match = false; break; }
         }
-        if (match) {
-            Logger::Log("ResolveByPattern: hit image=%u section=%d rva=0x%llX",
-                static_cast<unsigned>(image), static_cast<int>(section),
-                static_cast<unsigned long long>(i));
-            return const_cast<uint8_t*>(basePtr + i);
-        }
+        if (!match) continue;
+        if (++found < index) continue;
+        Logger::Log("ResolveByPattern: hit image=%u section=%d rva=0x%llX index=%u",
+            static_cast<unsigned>(image), static_cast<int>(section),
+            static_cast<unsigned long long>(i), index);
+        return const_cast<uint8_t*>(basePtr + i);
     }
-    Logger::Log("ResolveByPattern: no hit image=%u section=%d pattern=\"%s\"",
-        static_cast<unsigned>(image), static_cast<int>(section), pattern);
+    Logger::Log("ResolveByPattern: no hit image=%u section=%d index=%u (found %u) pattern=\"%s\"",
+        static_cast<unsigned>(image), static_cast<int>(section), index, found, pattern);
     return nullptr;
 }
 
-void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSection section) {
+void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSection section,
+    uint32_t index) {
     // 地址开放性门（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
     auto caller = RequirePluginOwner(_ReturnAddress(), "ResolveByPattern");
     if (!caller || !IsImageOpenToCaller(caller->category, image, "ResolveByPattern")) return nullptr;
@@ -1204,7 +1209,7 @@ void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSe
     }
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     PluginBoundary::LoaderLockScope pbLockScope;
-    return ResolveByPatternCore(image, patternCopy.c_str(), section);
+    return ResolveByPatternCore(image, patternCopy.c_str(), section, index);
 }
 
 // ---------------- RegisterGlobalCapture（全局参数捕获站） ----------------
@@ -1439,8 +1444,8 @@ void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbolIn, uint32_
 
 // 只给 Loader 内部使用的"无锁取址表"：解析类入口指向不加插件锁的 Core，其余字段保持
 // nullptr —— 这张表【绝不交给插件】。这样 common/HookAPI.h 里的 inline 取址工具
-// （HookCurrentExeImage / ResolveByHookInfo / ResolveDataByAob / HookScanPatternNth /
-//  HookFindSection）可以直接复用，既不经过插件表、也不加插件生命周期锁。
+// （HookCurrentExeImage / ResolveByHookInfo / ResolveDataByAob）
+// 可以直接复用，既不经过插件表、也不加插件生命周期锁。
 // 这些 inline 工具实际只用到下面这五个入口。
 // 契约：只读。返回非 const 指针只是为了配合 header 里 HookAPI* 的签名。
 static HookAPI* InternalToolApi() {
@@ -1615,7 +1620,7 @@ static void* GetCurrentGameSlot() {
     if (!g_gameEventContainerHit ||
             !ImageAddress::Contains(kHookImageGameCoreXP2, g_gameEventContainerHit)) {
         g_gameEventContainerHit = ResolveByPatternCore(kHookImageGameCoreXP2,
-            kGameEventCurrentGamePattern, kSectionText);
+            kGameEventCurrentGamePattern, kSectionText, 1);
         if (!g_gameEventContainerHit) return nullptr;
     }
     const int32_t disp = GameEventReadInt32Safe(
@@ -1669,7 +1674,7 @@ void* GetMainLuaStateImpl() {
             }
         }
         if (!slot) {
-            void* hit = ResolveByPatternCore(image, kLuaSingletonPattern, kSectionText);
+            void* hit = ResolveByPatternCore(image, kLuaSingletonPattern, kSectionText, 1);
             if (hit) {
                 g_mainLuaStateHit = hit;
                 const int32_t disp = GameEventReadInt32Safe(static_cast<const char*>(hit) + 3);
@@ -3117,6 +3122,25 @@ int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pus
     return 1;
 }
 
+// ---------------- 符号库状态查询（GetSymbolDbState / GetSymbolDbMatchRatio） ----------------
+// 纯查询：不取插件生命周期锁，也不碰插件表——状态来自 PdataMatch 自己的快照锁。
+// image 是标量，没有跨模块指针可解引用，因此不需要 RequirePluginOwner / 域门。
+
+HookApiSymbolDbState GetSymbolDbStateImpl(HookImageId image) {
+    switch (PdataMatch::GetMatchState(static_cast<uint32_t>(image))) {
+        case PdataMatch::MatchState::NoContext:   return kHookApiDbNoContext;
+        case PdataMatch::MatchState::NotBuilt:    return kHookApiDbNotReady;
+        case PdataMatch::MatchState::BuildFailed: return kHookApiDbBuildFailed;
+        case PdataMatch::MatchState::Identical:   return kHookApiDbIdentical;
+        case PdataMatch::MatchState::CrossVersion:return kHookApiDbCrossVersion;
+        default:                                  return kHookApiDbNoContext;
+    }
+}
+
+double GetSymbolDbMatchRatioImpl(HookImageId image) {
+    return PdataMatch::GetMatchRatio(static_cast<uint32_t>(image));
+}
+
 // ---------------- Patch/Unpatch (v2) ----------------
 
 #pragma intrinsic(_ReturnAddress)
@@ -3259,6 +3283,8 @@ static const HookAPI g_hookApi = {
     &GetEngineUtilityImpl,
     &GetMainLuaStateImpl,
     &LuaPushNilImpl,
+    &GetSymbolDbStateImpl,
+    &GetSymbolDbMatchRatioImpl,
 };
 
 // 编译期守卫（配套 common/HookAPI.h 的 CIV6_HOOK_API_ENTRY_COUNT）：
@@ -3266,7 +3292,7 @@ static const HookAPI g_hookApi = {
 //  2) 末尾字段的偏移抓住"重排或删除字段"（冻结前缀只允许尾部追加）。
 static_assert(sizeof(HookAPI) == sizeof(uint32_t) * 2 + CIV6_HOOK_API_ENTRY_COUNT * sizeof(void*),
     "HookAPI 字段数与 CIV6_HOOK_API_ENTRY_COUNT 不一致：追加字段后必须同步更新计数并补齐 g_hookApi");
-static_assert(offsetof(HookAPI, LuaPushNil) ==
+static_assert(offsetof(HookAPI, GetSymbolDbMatchRatio) ==
         sizeof(uint32_t) * 2 + (CIV6_HOOK_API_ENTRY_COUNT - 1) * sizeof(void*),
     "HookAPI 末尾字段位置变化：只允许在尾部追加，且必须同步 CIV6_HOOK_API_ENTRY_COUNT");
 
@@ -3367,7 +3393,7 @@ void* LoaderCore::ResolveExeTarget(const HookInfoExe& info, size_t span) {
     Logger::Log("ResolveExeTarget: [WARN] image=%u no symbol DB and PE identity != anchor; "
                 "RVA path skipped, AOB fallback only", static_cast<unsigned>(image));
     if (entry.aob && *entry.aob) {
-        return InternalToolApi()->ResolveByPattern(image, entry.aob, kSectionText);
+        return InternalToolApi()->ResolveByPattern(image, entry.aob, kSectionText, entry.index);
     }
     return nullptr;
 }

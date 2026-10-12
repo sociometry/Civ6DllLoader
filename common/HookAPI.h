@@ -162,6 +162,23 @@ typedef enum HookApiPushMethodsResult {
     kHookApiPushMethodsInstalled = 1
 } HookApiPushMethodsResult;
 
+// GetSymbolDbState 的返回值：内置符号库（sidecar）与目标映像的匹配状态。
+// 用途：插件在依赖硬编码旧 RVA / 符号名之前，先判断矫正机制是否可用，
+// 从而决定"照常用"还是"降级/关闭功能并提示用户更新 Loader"。
+typedef enum HookApiSymbolDbState {
+    // sidecar 里没有该映像的模块：完全没有符号数据，ResolveByRva/ResolveByName 必然失败。
+    kHookApiDbNoContext = 0,
+    // 有该映像的模块，但尚未建表（映像还没加载，或建表还没轮到）。稍后再查。
+    kHookApiDbNotReady,
+    // 建表失败：本次会话该映像不做矫正，旧 RVA 会解析失败（fail-closed，不回退原 RVA）。
+    kHookApiDbBuildFailed,
+    // 符号库与该映像**同一构建**：RVA 恒等，最可靠。此时 GetSymbolDbMatchRatio 返回 1.0。
+    kHookApiDbIdentical,
+    // 跨版本对齐成功：旧 RVA 会被矫正到当前映像。个别函数可能未匹配上，
+    // 用 GetSymbolDbMatchRatio 看整体比例；单点是否可用仍以解析结果为准。
+    kHookApiDbCrossVersion
+} HookApiSymbolDbState;
+
 typedef struct HookAPI {
     uint32_t apiVersion;   // 预发布阶段恒为 1；删改前缀不升版本号（见文件头说明）
     uint32_t structSize;   // sizeof(HookAPI) of the *runtime*; plugins compare against their sizeof
@@ -184,10 +201,12 @@ typedef struct HookAPI {
     // ---- Image resolution extensions ----
     // 不修正 + 段限定：原始 RVA 直接解析（镜像相对或段相对），不走 pdata 矫正。
     void* (*ResolveByRvaEx)(HookImageId image, uintptr_t rva, size_t span, HookImageSection section);
-    // AOB 特征搜索：pattern 形如 "48 8B ?? ?? 74 ?? E8"（?? 通配符），在指定段搜首个命中。
+    // AOB 特征搜索：pattern 形如 "48 8B ?? ?? 74 ?? E8"（?? 通配符），在指定段搜第 index 个命中。
     // 每字节两字符：?? 整字节通配，4? / ?F 分别固定高/低半字节；十六进制字母大小写均可。
     // 字节间可用空格、Tab、逗号分隔或直接相连；格式错误或未命中返回 nullptr。
-    void* (*ResolveByPattern)(HookImageId image, const char* pattern, HookImageSection section);
+    // index 从 1 起（0 视为 1），按地址升序计数；命中数不足 index 时返回 nullptr 并记日志。
+    void* (*ResolveByPattern)(HookImageId image, const char* pattern, HookImageSection section,
+        uint32_t index);
     // 注册全局变量捕获：hook providerAddress，运行时用机器码生成 stub 捕获其第 paramIndex 个
     // 参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。
     // providerAddress 是【绝对地址】（插件自行用 Resolve* 等入口取址后再传进来），且必须是
@@ -240,10 +259,19 @@ typedef struct HookAPI {
     // on error, or kHookApiLuaCall* for invalid arguments / missing imports.
     // Call on the thread owning L; L and callback must be non-null; userdata may be null.
     int (*LuaCPcall)(void* L, LuaMethodFunc callback, void* userdata);
+    // Lua 引用：把栈顶的值存进 t 指向的表，返回引用号（>=1），栈顶随之弹出。
+    //   t 是【表在栈上的位置】，支持伪索引：-10000 = registry、-10001 = 环境、
+    //   -10002 = globals（即 kHookApiLuaGlobal）；负数按栈顶算、正数按栈底算。
+    //   ⚠ 传 -1 之类的"值的位置"是错的：引擎会把它当表去索引，内部再按指针解引用
+    //   -> 访问违例（0xC0000005）。要用全局表就传 kHookApiLuaGlobal。
+    //   语义来源：HavokScript_FinalRelease.dll 的 hksi_luaL_ref 反编译（非标准 Lua，
+    //   但参数含义与 luaL_ref 一致，且额外支持上述伪索引）。
     int (*LuaRef)(void*, int);
     int (*LuaPcall)(void*, int, int, int);
     void (*LuaPushValue)(void*, int);
     void (*LuaRawGetI)(void*, int, int);
+    // Lua 释放引用：参数顺序是 (t = 表位置, ref = 引用号)，与 luaL_unref 一致。
+    // ref < 0 时忽略。t 用与 LuaRef 相同的伪索引（通常 kHookApiLuaGlobal）。
     void (*LuaUnref)(void*, int, int);
     void (*LuaSetTable)(void*, int);
     int (*LuaIsNumber)(void*, int);
@@ -344,6 +372,19 @@ typedef struct HookAPI {
     // Lua nil 入栈（hks ?hksi_lua_pushnil 导出）。参数打包回调里构造 nil 参数用。
     void (*LuaPushNil)(void* L);
 
+    // ---- 符号库状态查询 ----
+    // 内置符号库（sidecar）与指定映像的匹配状态，见 HookApiSymbolDbState 各值说明。
+    // 返回 kHookApiDbNoContext = 该映像根本没有符号数据；kHookApiDbBuildFailed = 有数据但
+    // 本次会话建表失败。两者都意味着该映像上的 ResolveByRva/ResolveByName 会返回 nullptr。
+    // 纯查询，不加锁竞争、不改任何状态，可在任意线程调用。
+    HookApiSymbolDbState (*GetSymbolDbState)(HookImageId image);
+
+    // 跨版本对齐的匹配率（已匹配的 .pdata 条目数 / 总条目数），取值 [0.0, 1.0]。
+    // 仅 kHookApiDbCrossVersion 状态下是"部分匹配"的度量；此时 1.0 表示全部对齐。
+    // 非跨版本状态返回：Identical -> 1.0（恒等映射，无失配），其它 -> 0.0（无数据/不可用）。
+    // 用于诊断与降级决策；单点能否解析仍以 ResolveByRva/ResolveByName 的返回值为准。
+    double (*GetSymbolDbMatchRatio)(HookImageId image);
+
 } HookAPI;
 
 // True if this runtime can serve a plugin built from this header.
@@ -364,7 +405,7 @@ static inline int HookAPI_IsCompatible(const HookAPI* api) {
 // HookAPI 里"入口"（函数指针）字段的数量。它是追加字段时唯一需要同步的计数：
 // 追加字段 -> 改这个常量 -> Civ6DLLHookLoaderAPI.cpp 的 static_assert 会逼着你把
 // g_hookApi 的位置初始化补齐（聚合初始化少写几项只会静默零填，运行时就是空指针调用）。
-constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT = 76;
+constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT = 78;
 
 template <typename T>
 T ResolveByName(HookAPI* api, HookImageId image, const char* name) {
@@ -387,8 +428,9 @@ T ResolveByRvaEx(HookAPI* api, HookImageId image, uintptr_t rva, HookImageSectio
 }
 
 template <typename T>
-T ResolveByPattern(HookAPI* api, HookImageId image, const char* pattern, HookImageSection section = kSectionImage) {
-    return reinterpret_cast<T>(api->ResolveByPattern(image, pattern, section));
+T ResolveByPattern(HookAPI* api, HookImageId image, const char* pattern,
+    HookImageSection section = kSectionImage, uint32_t index = 1) {
+    return reinterpret_cast<T>(api->ResolveByPattern(image, pattern, section, index));
 }
 
 template <typename T>
@@ -429,102 +471,6 @@ static constexpr HookInfo HookName(const char* name, const char* aob = nullptr,
     return info;
 }
 
-// AOB 语法解析（与 HookAPI::ResolveByPattern 完全一致：?? 整字节通配、4?/?F 半字节、十六进制）。
-static inline bool HookParsePattern(const char* pattern, uint8_t* values, uint8_t* masks,
-    int maxTokens, int* outCount) {
-    if (!pattern || !values || !masks || !outCount || maxTokens <= 0) return false;
-    int count = 0;
-    const char* p = pattern;
-    for (;;) {
-        while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n' || *p == '\r') ++p;
-        if (!*p) break;
-        if (count >= maxTokens) return false;
-        uint8_t value = 0;
-        uint8_t mask = 0;
-        for (int nib = 0; nib < 2; ++nib) {
-            value = static_cast<uint8_t>(value << 4);
-            mask = static_cast<uint8_t>(mask << 4);
-            const char c = *p;
-            if (c == '?') {
-                ++p;
-            } else if (c >= '0' && c <= '9') {
-                value = static_cast<uint8_t>(value | (c - '0'));
-                mask = static_cast<uint8_t>(mask | 0xF);
-                ++p;
-            } else if (c >= 'a' && c <= 'f') {
-                value = static_cast<uint8_t>(value | (c - 'a' + 10));
-                mask = static_cast<uint8_t>(mask | 0xF);
-                ++p;
-            } else if (c >= 'A' && c <= 'F') {
-                value = static_cast<uint8_t>(value | (c - 'A' + 10));
-                mask = static_cast<uint8_t>(mask | 0xF);
-                ++p;
-            } else {
-                return false;
-            }
-        }
-        values[count] = value;
-        masks[count] = mask;
-        ++count;
-    }
-    *outCount = count;
-    return count > 0;
-}
-
-// 定位映像里指定名字的段（PE 段表，语义同 runtime 内部 ResolveSectionRva；返回段起始指针）。
-static inline const uint8_t* HookFindSection(HookAPI* api, HookImageId image, const char* name,
-    size_t* outSize) {
-    if (!api || !name) return nullptr;
-    HookImageInfo info{};
-    info.structSize = sizeof(HookImageInfo);
-    if (!api->GetImageInfo(image, &info) || !info.base) return nullptr;
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(info.base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-        reinterpret_cast<const uint8_t*>(info.base) + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
-    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        bool match = true;
-        for (int k = 0; k < 8; ++k) {
-            if (sec->Name[k] != static_cast<unsigned char>(name[k])) { match = false; break; }
-            if (name[k] == '\0') break;
-        }
-        if (!match) continue;
-        const size_t size = sec->Misc.VirtualSize > sec->SizeOfRawData
-            ? sec->Misc.VirtualSize : sec->SizeOfRawData;
-        if (outSize) *outSize = size;
-        return reinterpret_cast<const uint8_t*>(info.base) + sec->VirtualAddress;
-    }
-    return nullptr;
-}
-
-// AOB 第 index 个命中（1 起；0 视为 1）：index <= 1 直接走 HookAPI::ResolveByPattern（行为不变），
-// index > 1 时在 .text 段内自行扫描取第 index 个（API 只给首命中，故无法纯组合实现）。
-static inline void* HookScanPatternNth(HookAPI* api, HookImageId image, const char* pattern,
-    uint32_t index) {
-    if (!api || !pattern || !*pattern) return nullptr;
-    if (index <= 1) return api->ResolveByPattern(image, pattern, kSectionText);
-    constexpr int kMaxTokens = 512;
-    uint8_t values[kMaxTokens];
-    uint8_t masks[kMaxTokens];
-    int count = 0;
-    if (!HookParsePattern(pattern, values, masks, kMaxTokens, &count) || count == 0) return nullptr;
-    size_t sectionSize = 0;
-    const uint8_t* begin = HookFindSection(api, image, ".text", &sectionSize);
-    if (!begin || sectionSize < static_cast<size_t>(count)) return nullptr;
-    const size_t limit = sectionSize - static_cast<size_t>(count) + 1;
-    uint32_t hits = 0;
-    for (size_t i = 0; i < limit; ++i) {
-        bool match = true;
-        for (int j = 0; j < count; ++j) {
-            if ((begin[i + j] & masks[j]) != values[j]) { match = false; break; }
-        }
-        if (match && ++hits == index) return const_cast<uint8_t*>(begin + i);
-    }
-    return nullptr;
-}
-
 // 解析一条 HookInfo：主路径（Rva / VTable / Name）失败时，若有 aob 则按 index 兜底定位。
 static inline void* ResolveByHookInfo(HookAPI* api, HookImageId image, const HookInfo& info,
     size_t span = 1) {
@@ -545,7 +491,7 @@ static inline void* ResolveByHookInfo(HookAPI* api, HookImageId image, const Hoo
             break;
     }
     if (!result && info.aob && *info.aob)
-        result = HookScanPatternNth(api, image, info.aob, info.index);
+        result = api->ResolveByPattern(image, info.aob, kSectionText, info.index);
     return result;
 }
 
@@ -646,7 +592,7 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
     const int E = segEnd;
     if (D < 0 || D + 4 > E) return nullptr;
 
-    void* hit = HookScanPatternNth(api, image, flat, index);
+    void* hit = api->ResolveByPattern(image, flat, kSectionText, index);
     if (!hit) return nullptr;
     int32_t disp = 0;
     memcpy(&disp, static_cast<const char*>(hit) + D, sizeof(disp));
