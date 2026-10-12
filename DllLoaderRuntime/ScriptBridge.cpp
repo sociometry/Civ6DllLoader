@@ -1489,12 +1489,12 @@ static EditPlayerFn ResolveEditPlayer() {
         ResolveCurrentGameCoreByName("GameCore::Context::Globals::EditPlayer"));
 }
 
-// ==== EditPlayerImpl ====
-void* EditPlayerImpl(int playerId) {
-    if (!PluginDomain::RequireGameCoreOwner(_ReturnAddress(), "EditPlayer")) return nullptr;
+// ==== GetPlayerImpl ====
+void* GetPlayerImpl(int playerId) {
+    if (!PluginDomain::RequireGameCoreOwner(_ReturnAddress(), "GetPlayer")) return nullptr;
     auto fn = ResolveEditPlayer();
     if (!fn) {
-        Logger::Log("EditPlayer: symbol missing");
+        Logger::Log("GetPlayer: symbol missing");
         return nullptr;
     }
     // 对局开始前 ms_pkCurrentGame 尚未初始化，引擎 EditPlayer 会
@@ -1502,7 +1502,7 @@ void* EditPlayerImpl(int playerId) {
     __try {
         return fn(playerId);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::Log("EditPlayer: engine call failed (game not started?)");
+        Logger::Log("GetPlayer: engine call failed (game not started?)");
         return nullptr;
     }
 }

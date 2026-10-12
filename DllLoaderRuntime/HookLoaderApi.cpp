@@ -106,7 +106,7 @@ static const HookAPI g_hookApi = {
     &ScriptBridge::LocPushArgumentImpl,
     &ScriptBridge::LocToUtf8Impl,
 
-    &ScriptBridge::EditPlayerImpl,
+    &ScriptBridge::GetPlayerImpl,
     &ScriptBridge::MakeHashImpl,
 
     &ScriptBridge::RegisterPushMethodsTargetImpl,

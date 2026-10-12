@@ -549,10 +549,11 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 ### 4.2 GameCore 专属（7 个，编译期 + 加载期 + 运行期三层限制）
 
-`EditPlayer`、`RegisterGameEvent`、`TriggerGameEvent`、`RegisterScriptGlobals`、
+`GetPlayer`、`RegisterGameEvent`、`TriggerGameEvent`、`RegisterScriptGlobals`、
 `RegisterScriptGlobalsForUI`、`PushLuaMethods`、`RegisterPushMethodsTarget`。
 
-为什么专属：`EditPlayer` 解析 `GameCore::Context::Globals::EditPlayer` 符号；其余六个操作
+为什么专属：`GetPlayer` 解析 `GameCore::Context::Globals::EditPlayer` 符号（引擎侧的函数名就是
+`EditPlayer`，接口名只表达"取玩家对象"）；其余六个操作
 **gamecore 的脚本环境**（往 Lua 表里放闭包、注册脚本全局、事件）。Global 插件用它们没有意义：
 对局前拿不到对象，对局中也不该持有 GameCore 域的引用。
 
@@ -578,7 +579,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   `lua_newstate()` 在 `Civ6App::GUIInit` 建一次，只在 `Civ6App::GUIShutdown` `lua_close`
   ——**换局不会失效、也不会被重写**（全 exe 仅一处写 `+0x10`）。未就绪返回 null。
   **Global 与 GameCore 两类插件都可调用，不限类别**——它是进程级 state，常驻插件持有它
-  不会因换局悬垂，所以与 `EditPlayer` 那类"GameCore 短命域"入口不同类，不受地址域门限制。
+  不会因换局悬垂，所以与 `GetPlayer` 那类"GameCore 短命域"入口不同类，不受地址域门限制。
 
   ⚠️ **别和"每局 thread state"混淆**：Civ6 确实是多 `lua_State` 引擎，但 GameCore 每局用
   `IScriptSystem1::CreateLuaThread` 建的是 `lua_newthread(main_state)` 派生的 coroutine，

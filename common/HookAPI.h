@@ -303,7 +303,7 @@ typedef struct HookAPI {
     int (*LocPushArgument)(void* loc, const char* arg);
     const char* (*LocToUtf8)(void* loc);
 
-    void* (*EditPlayer)(int playerId);
+    void* (*GetPlayer)(int playerId);
     // 字符串哈希：不再解析 GameCore 符号，改为 Loader 内部实现的原生 CRC32（raw，
     // 无最终异或，与官方 GameCore::Utilities::MakeHash 逐位一致）。对局前/重载后都能算。
     uint32_t (*MakeHash)(const char* str);
@@ -632,7 +632,7 @@ static inline void* ResolveDataByAob(HookAPI* api, HookImageId image, const char
 #endif
 /* GameCore 专属入口：对象式宏重命名 -> 调用或取地址都在编译期报"不是 HookAPI 的成员"。
    结构体字段一个没少、偏移一个没变，只是这些名字在本 TU 里指向了不存在的成员。 */
-#define EditPlayer                 CIV6_ERROR_EditPlayer_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
+#define GetPlayer                  CIV6_ERROR_GetPlayer_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define RegisterGameEvent          CIV6_ERROR_RegisterGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define TriggerGameEvent           CIV6_ERROR_TriggerGameEvent_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
 #define RegisterScriptGlobals      CIV6_ERROR_RegisterScriptGlobals_is_GameCoreOnly_rebuild_as_CIV6_PLUGIN_GAMECORE
