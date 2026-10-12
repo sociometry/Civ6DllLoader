@@ -64,19 +64,29 @@
 | 文件 | 职责 |
 |---|---|
 | `common/HookAPI.h` | 插件 ABI：HookAPI 表、类型、类别门禁、`HookAPI_IsCompatible` |
-| `DllLoaderRuntime/Civ6DLLHookLoaderAPI.cpp` | 一切的核心：站点表、capture、插件生命周期、
-|  |  HookAPI 实现、域门、teardown |
+| `DllLoaderRuntime/HookLoaderApi.cpp` | **ABI 汇聚点**：`g_hookApi` 表本身 + 只读性校验；它取各模块 `*Impl` 的地址，不反向被依赖 |
+| `DllLoaderRuntime/PluginRegistry.cpp` | 插件生命周期：`PluginEntry` 表、加载/卸载/隔离、类别判定、`ResetForReload`、排队释放 |
+| `DllLoaderRuntime/ScriptBridge.cpp` | Lua / GameEvent / 脚本注册 / PushMethods 槽位（最大的一个模块） |
+| `DllLoaderRuntime/HookEngine.cpp` | 站点表、stub 生成、capture、装钩与物理摘钩 |
+| `DllLoaderRuntime/PluginDomain.cpp` | 域门（`IsTargetOpenToCaller` 等）与调用者身份认证 |
+| `DllLoaderRuntime/AddressResolve.cpp` | 取址实现（RVA / 名称 / pattern / 虚表） |
 | `DllLoaderRuntime/LoaderHooks.cpp` | exe 域钩子（LoadDLL / UnloadDLL）的安装与 detour 编排 |
 | `DllLoaderRuntime/RuntimeEntry.cpp` | DllMain、休眠检测、一次性启动线程 |
 | `DllLoaderRuntime/UiInject.cpp` | 主菜单 UI 注入（LoadUI detour + LuaContext） |
 | `DllLoaderRuntime/ImageAddress.cpp` | PE 映像注册与 RVA 换算 |
 | `DllLoaderRuntime/PdataMatch.cpp` | sidecar 解析 + pdata 匹配 + RVA 矫正 |
 | `DllLoaderRuntime/PatchRegistry.cpp` | 补丁账本（按地址存原始字节）；**Loader 不自动回滚**，见 §5.8 |
-| `DllLoaderRuntime/PluginInFlight.*` | 插件回调的在途登记与排空 |
-| `DllLoaderRuntime/Civ6MessageBus.*` | 插件间消息 |
+| `DllLoaderRuntime/PluginInFlight.*` | 插件回调的在途登记与排空（**按加载代隔离**，见 §6.1） |
+| `DllLoaderRuntime/Civ6MessageBus.*` | 插件间消息；总线的全局实例与插件 ABI 转发层也在此 |
+| `DllLoaderRuntime/TeardownWindow.h` | teardown 窗口的共享状态（写侧 PluginRegistry/HookEngine，读侧 PluginDomain） |
+| `DllLoaderRuntime/PluginTableAccess.h` | 插件表的只读门面（供 ScriptBridge / HookLoaderApi 查询，不暴露表本身） |
 | `common/ModScan.cpp` / `common/EnabledMods.*` | 插件扫描与"启用 Mod"过滤（**只作用于插件**；安装/自更新 loader 的候选不看启用集） |
 | `DllLoader/ShellBootstrap.cpp` | 薄壳侧的补装（首次安装；运行时自更新在 `LoaderUpdate.cpp`） |
 | `tools/symdb.py` | 符号库流水线（唯一入口，含 AOB 生成/核对） |
+
+> 读源码的顺序建议：`HookLoaderApi.cpp`（看 ABI 表的 78 个指针各归谁）→ `PluginRegistry.cpp`（生命周期）
+> → `HookEngine.cpp`（挂钩）→ `ScriptBridge.cpp`（脚本面）。各模块的归属状态与门面见
+> `docs/REFACTOR_PLAN.md` §3/§5。
 
 ---
 
@@ -179,8 +189,11 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 2. `hks::InitHavokScript()` + `Localization::InitScript()`：两个**进程级静态导入**解析一次
    （缺失只降级各自的 API，不影响插件加载；为什么放这一阶段见 §1.5）；
 3. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
-4. `LoaderHooks::InstallAll()`：exe 域钩子。**`LoadDLL` 是必需项**（它失败会把本次已建的钩子全部回滚），
-   `UnloadDLL` 是**可选项**（失败只放弃它一个，`LoadDLL` 照常留着——丢一个可选功能不等于丢全部）；
+4. `LoaderHooks::InstallAll()`：exe 域钩子。**两个都是必需项**：`LoadDLL` 或 `UnloadDLL` 任一
+   校验失败都会把本次已建的钩子全部回滚。`UnloadDLL` 必需是因为插件模块的释放时机挂在它上面
+   （§2.4）——只装加载钩的话 GameCore 插件永远等不到释放点。
+   两个 `MH_CreateHook` 都成功、且引擎模块槽取址可用之后，才用一次
+   `MH_QueueEnableHook ×2 + MH_ApplyQueued` 同时启用：避免出现"只有加载钩生效"的窗口。
 5. `UiInject::Install()`：主菜单 UI 注入钩，失败静默降级；
 6. `LoaderUpdate::CheckAndApplyUpdate()`：runtime 级自更新检查（薄壳之外的第二道）；
 7. `LoaderCore::LoadPluginsOf(PluginCategory::Global)`：扫描并加载 **Global 插件**。
@@ -212,10 +225,12 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
   （`hks::InitHavokScript` / `Localization::InitScript` **不在**这里——见阶段 A 的说明。）
 - **退对局**：引擎调用 `UnloadDLL` → 我们的 detour 先 `ResetForReload()`（见 §2.3）再调原函数。
 
-`LoaderHooks::InstallAll()` 与 `UiInject::Install()` 都在阶段 A（那条一次性线程里）装钩子；两者失败都只
-记日志。`LoadUI` 的钩子归 `UiInject::Install()` 管，和 `LoadDLL`/`UnloadDLL` 是两套独立的事务。
+`LoaderHooks::InstallAll()` 与 `UiInject::Install()` 都在阶段 A（那条一次性线程里）装钩子。
+`LoadUI` 的钩子归 `UiInject::Install()` 管，和 `LoadDLL`/`UnloadDLL` 是两套独立的事务。
 
-> **关于自更新与装钩日志顺序**：`InstallAll()` 排在自更新检查之前，因此日志中先出现 "LoadDLL hook installed"，随后才出现自更新检查输出。更新成功的 DLL 将在下一次启动时随系统加载生效。
+> **关于自更新与装钩日志顺序**：`InstallAll()` 排在自更新检查之前，因此日志中先出现
+> `InstallAll: LoadDLL + UnloadDLL installed; module slot=...`，随后才出现自更新检查输出。
+> 更新成功的 DLL 将在下一次启动时随系统加载生效。
 
 ---
 
@@ -223,51 +238,65 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 
 ### 2.1 阶段状态
 
-- `g_gameCorePhaseReady`：阶段 B 是否就绪。`InitializeGameCorePhase()` 成功置 `true`，`ResetForReload()` 置 `false`；
-  `LoaderCore::IsInitialized()` 只回答这一件事。
+- 阶段 B 是否就绪：`ScriptBridge::SetGameCorePhaseReady` / `IsGameCorePhaseReady`
+  （`std::atomic<bool>`，定义在 `ScriptBridge.cpp`）。`InitializeGameCorePhase()`
+  置 `true`，`ResetForReload()` 置 `false`；`LoaderCore::IsInitialized()` 只回答这一件事。
+  用原子的理由：两个读点本来就持 lifecycle 锁，读侧无锁后少一次重入；写侧仍持锁，语义不变。
 - `g_gameCoreTransitionMutex`（递归）：把"阶段切换"与"插件加载/卸载"串起来，保证
   「attach → 装钩 → 加载 GameCore 插件」与「teardown → 卸载」不交错。三个入口都先拿它：
   `LoadPluginDllInternal` / `InitializeGameCorePhase` / `ResetForReload`。
-- `g_gameCoreTeardownAddress` / `g_gameCoreTeardownSizeOfImage`：**teardown 窗口**。窗口内
-  `TargetInTearingDownGameCore(target)` 为真，`InstallHook` 直接拒绝；窗口也是 teardown 后半段
+- **teardown 窗口**（`LoaderCore::Teardown::g_address` / `g_sizeOfImage`，定义在 `TeardownWindow.h`）：
+  窗口内 `TargetInTearingDownGameCore(target)` 为真，`InstallHook` 直接拒绝；窗口也是 teardown 后半段
   "哪些站点属于本次要拆的映像"的唯一判据（因为那时 `ImageAddress` 已经 detach）。
+  这两个字段被 4 个模块读写（PluginRegistry / HookEngine / PluginDomain + 头文件本身），因此必须
+  **跨 TU 共享同一份存储**：写成各 TU 独立的 `static` 会让窗口静默失效且不报错。
   两个字段是 `std::atomic`，成对生效有固定次序：写侧先 size 再 address(release)，清零点先
   address(release) 再 size；读侧先 address(acquire)，非 0 才读 size。写侧是游戏线程，读侧还有
   插件线程（`TargetInTearingDownGameCore`）。
 
 ### 2.2 LoadDLL / UnloadDLL 的编排（`LoaderHooks.cpp`）
 
+两个 detour 共用一份 exe 侧的引擎模块槽 `g_engineModuleSlot`（在 `InstallAll` 里由 `kAob_hModule` 解析，
+**必须在 MH_Enable/ApplyQueued 改写 LoadDLL 入口之前**取址——该 AOB 覆盖 LoadDLL 入口）。读它用
+`ReadEngineModule()`（`__try` 包裹，槽不可读就当作"拿不到"而不是崩）。
+
 `LoadDllDetour`：
 
-1. `GetRuleSetName()` 为空 → 还没进游戏，原样透传；非 `EXPANSION_2` → 透传（只支持 XP2）；
+1. `GetRuleSetName()` 返回空 → 还没进游戏（启动早期加载 Base 等），原样透传；非 `EXPANSION_2` → 透传（只支持 XP2）；
 2. 把入参（Mod 顶替 `GameCores` 后引擎请求的**薄壳**路径）**改写成官方 GameCore 的绝对路径**
    （`OfficialGameCoreRelPath` 给官方相对路径、`BuildOfficialPath` 拼到游戏根下；官方文件不存在才
    透传原路径）。重定向规则：**引擎槽位=官方**，薄壳只在 Loader 缺席、没有这个 detour 时才被加载；
-3. 若 `IsInitialized()` 仍为真（说明 `UnloadDLL` 钩子没生效 / 没清场）→ 先 `ResetForReload()` 兜底；
-4. 调原函数 `g_origLoadDLL(target)`；
-5. `ClearGameCoreTeardownWindow()`：**引擎这一步才真正换映像**，旧的 teardown 窗口（旧映像区间）
-   到此失效——提前清会让仍映射着的旧映像重新对 Global 插件变成"可钩的已加载模块"（§2.3 第 9 步）。
-   清窗无条件执行（不看返回值）：成功与失败两条路径下，旧映像都已经不在原位，都不该继续留在保护态；
-6. `FreePendingPluginModules()`：这次调用可能顺带卸掉了旧的 GameCore，排队中的插件模块此刻才释放；
-7. 成功 → `InitializeGameCorePhase()` + `LoadPluginsOf(GameCore)`；失败（`result == 0`）→ 只记日志。
-   引擎侧 `LoadDLL` 返回 0 只可能是真失败：唯一的调用者 `AppModdingFramework::LoadGameCore` 在调用
-   `GameCore::LoadDLL` 之前**必定**先调过 `GameCore::UnloadDLL`（`hModule` 已置空），而"路径相同、
-   不需要重载"的幂等请求在 `LoadGameCore` 开头就已经短路返回 1、根本进不到 `LoadDLL`。加载失败后
-   引擎既不建 GameContext 也不重试，自己会报错并终止初始化——没有映像可供挂钩，此时再去加载插件
-   只会撞上空上下文，因此这里不区分"幂等短路"，也不做任何补偿。
+3. **先调原函数** `g_origLoadDLL(target)`，把返回值原样带回；
+4. `IsInitialized() || g_unloadIncomplete` → 直接返回。两种情形都表示"当前这一局不该重新初始化"：
+   阶段 B 已经就绪，或引擎上一次的卸载还没走完（`UnloadDllDetour` 置位、原函数返回后若没观察到
+   模块槽清零就不清）；
+5. 读 `g_engineModuleSlot`：拿不到或为 `nullptr` → 记日志返回，**不**初始化（没有确认的映像就没有可挂的域）；
+6. `InitializeGameCorePhase()` 成功 → `LoadPluginsOf(GameCore)`；失败 → 只记日志。
+
+> **为什么不看 `LoadDLL` 的返回值**：反编译（`docs/analysis/LoadDLL_analysis.md` 第 15–16 行，
+> `0x1400F851F`）是 `if (hModule != nullptr) return 0;` —— 引擎的 `LoadDLL` 有**三条路径**返回 0：
+> 模块已加载（幂等短路）、`LoadLibraryW` 失败、缺 `Dll*` 导出。只有返回 1 才确定是"这次新加载成功"。
+> 唯一调用者 `AppModdingFramework::LoadGameCore` 会在调用前先 `UnloadDLL`，但那只保证不了模块槽
+> 一定被清空（失败路径）。读模块槽是唯一能区分"映像在不在位"的判据。
 
 `UnloadDllDetour`：
 
-1. `IsInitialized()` → `ResetForReload()`（清理 + 把 GameCore 插件模块**入队**）；
-2. 调原函数 `g_origUnloadDLL()`——**引擎在这里卸掉 GameCore 映像连同它的 gameplay/ui Lua 环境**；
-3. `ClearGameCoreTeardownWindow()`：映像已经没了，teardown 窗口可以清（§2.3 第 9 步）；
-4. `FreePendingPluginModules()`：真正 `FreeLibrary` 那些插件模块。
+1. 读模块槽得到 `before`；`before` 非空**或**阶段 B 已就绪 → 置 `g_unloadIncomplete = true`
+   （"引擎的卸载还没完成"）；
+2. `IsInitialized()` → `ResetForReload()`（清理 + 把 GameCore 插件模块**入队**）；
+3. 调原函数 `g_origUnloadDLL()`——**引擎在这里卸掉 GameCore 映像连同它的 gameplay/ui Lua 环境**；
+4. **只有观察到槽从非空变成空**（`hadModule && ReadEngineModule(after) && !after`）才
+   `ClearGameCoreTeardownWindow()` + `FreePendingPluginModules()`，并清 `g_unloadIncomplete`。
+   引擎的空操作或失败不能触发释放：此时 Lua 环境可能还在引用插件映像里的闭包。
+   这也是"LoadDLL 返回 0 不算卸载屏障"的另一半——卸载屏障是**槽被清零**，不是函数返回。
 
 ### 2.3 ResetForReload 的完整顺序（每一步的位置都有理由）
 
-1. 拿 `g_gameCoreTransitionMutex` + `g_pluginLifecycleMutex`；
-2. `g_gameCorePhaseReady = false`（此后 `EnsureScriptHooksInstalled` 等入口会自行早退）；
-3. 进入 teardown 窗口（写 `g_gameCoreTeardownAddress/SizeOfImage`；`ImageAddress` 仍 attach）；
+1. 拿 `g_gameCoreTransitionMutex` + `LoaderCore::LifecycleMutex()`；
+2. 阶段 B 就绪标志置 `false`（`ScriptBridge::SetGameCorePhaseReady(false)`；此后 `EnsureScriptHooksInstalled`
+   等入口会自行早退）；
+3. 进入 teardown 窗口（`LoaderCore::Teardown::SetWindow(base, sizeOfImage)`；`ImageAddress` 仍 attach；
+   取不到映像信息时显式设 `SetWindow(0, 0)`，见 §9.1 第 1 条）；
 4. 放掉 lifecycle 锁（下面要等回调、要加载/卸载插件，持锁等会锁反转）；
 5. `DisableGameCoreDomainSites()`：趁旧映像仍映射，把 GameCore 域**全部已挂钩站点**
    `MH_QueueDisableHook` 后**一次** `MH_ApplyQueued` → 所有入口字节还原、不会再有人进入 stub 或插件 detour。
@@ -280,9 +309,10 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
    - **排空在途调用**：临时释放 lifecycle 锁，等待 `g_activeSharedDetours` 归零以排空在途共享 detour；
    - **重锁并扫表复位**：重新获取 lifecycle 锁，重新扫描站点表以物理摘钩。成功则 `MH_RemoveHook` 并**原地复位站点**（保留并复用节点及 stub，清空 capture 槽；**绝不 erase**，因为 stub 机器码硬编码了 `&HookSite`）；失败则标记 `recordStale` 并拔除 detour 槽；
    - **复位共享入口**：复位 `g_origRegisterScriptData(/ForUI)` 与 16 个 PushMethods 槽位；
-   - **窗口存续**：**teardown 窗口不在此处清除**，必须维持到引擎真正完成换映像（由两个 detour 在调用原函数后通过 `ClearGameCoreTeardownWindow()` 清理）；
-10. 回到 detour，调 `g_origUnloadDLL()` → `ClearGameCoreTeardownWindow()` →
-    `FreePendingPluginModules()`（见 §2.4）；
+   - **窗口存续**：**teardown 窗口不在此处清除**，必须维持到引擎真正完成卸载——由 `UnloadDllDetour`
+     在原函数返回**且**确认模块槽从非空变空后调 `ClearGameCoreTeardownWindow()`（见 §2.2 第 4 步）；
+10. 回到 `UnloadDllDetour`：调 `g_origUnloadDLL()` → 若槽已清零则 `ClearGameCoreTeardownWindow()` →
+    `FreePendingPluginModules()`（见 §2.2、§2.4）；
 
 为什么是这个顺序：
 
@@ -298,8 +328,11 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 
 - `UnloadPluginByOwnerId`（GameCore 类别）**只把句柄入队**（`g_pendingFreeModules`，由 `g_pendingFreeMutex`
   保护）。类别/ABI 不符的拒载不走这条：那种拒载发生在 `OnLoad` 之前，直接释放引用（§3.3）；
-- `LoaderCore::FreePendingPluginModules()` 在两个 detour 里调用：`UnloadDllDetour` 的
-  `g_origUnloadDLL()` **之后**、`LoadDllDetour` 的 `g_origLoadDLL()` **之后**；
+- `LoaderCore::FreePendingPluginModules()` 在**唯一一处**被调用：`UnloadDllDetour` 的 `g_origUnloadDLL()`
+  返回之后，**且**满足"原函数确实把非空模块槽清成了空"。`LoadDllDetour` 不再调它——
+  LoadDLL 返回本身不是卸载屏障（引擎在模块已加载时也返回 0，见 §2.2 的说明）；
+- 条件是"槽已清零"而不是"函数返回了"：引擎的 `UnloadDLL` 可能什么都没做（空操作）或中途失败，
+  此时 Lua 环境还可能引用插件映像里的闭包，释放模块就是 UAF；
 - 于是"插件映像已释放、而它的 Lua 闭包还能被调用"这个前提不存在：gamecore 的 gameplay/ui Lua 环境
   是引擎卸载里拆的，闭包所在的 state 已经没了；
 - 代价与边界：`OnLoad` 崩溃被隔离的 GameCore 模块会一直映射到下一次 Load/Unload；Global 插件本来就永不卸载。
@@ -308,13 +341,13 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 
 | 锁 | 保护 | 备注 |
 |---|---|---|
-| `g_gameCoreTransitionMutex`（递归） | 阶段切换串行化 | 最外层 |
-| `g_pluginLifecycleMutex`（递归） | `g_plugins`、各类注册表、槽位表、owner 探针 | 最常被重入 |
-| `g_pushStateMutex` | PushMethods 的 16 个槽位 | 在 lifecycle 内层 |
+| `g_gameCoreTransitionMutex`（递归） | 阶段切换串行化 | 最外层；文件级 static，在 `PluginRegistry.cpp` |
+| `LoaderCore::LifecycleMutex()`（递归） | `g_plugins`、各类注册表、槽位表、owner 探针 | 最常被重入。实现是 `PluginRegistry.cpp` 里的文件级 static `g_pluginLifecycleMutex`，**不导出变量**，其它模块经这个访问器拿同一把锁 |
+| `g_pushStateMutex` | PushMethods 的 16 个槽位 | 在 lifecycle 内层；文件级 static，在 `ScriptBridge.cpp` |
 | `Runtime::MinHookMutex()` | 站点表 + 所有 `MH_*` 调用 | 在 pushState 内层 |
 | `g_captureMutex` | 站点上的捕获派发数据（`captureOuts`/`retiring`/`captureParamIndex`） | 最内层 |
 | `ImageAddress::g_mutex` | 映像登记（base/size/id） | 叶子 |
-| `g_scriptStateMutex` | ScriptGlobals 的两个注册表 | 叶子（持有它时不再取别的锁）；与 `pushState` 同为 lifecycle 的下层，两者**从不互相嵌套**（见 `RemovePluginOwnedRegistrations`） |
+| `g_scriptStateMutex` | ScriptGlobals 的两个注册表 | 叶子（持有它时不再取别的锁）；与 `pushState` 同为 lifecycle 的下层，两者**从不互相嵌套**（见 `ScriptBridge::RemovePluginRegistrations`） |
 | `Civ6MessageBus::mtx_` | 消息总线的 handler 表 | 出锁后才 `Enter`/排空（总线 → lifecycle） |
 | `PluginInFlight::Owner::mtx` | `WaitAll` 的条件变量等待 | 等待时只持这一把 |
 | `g_pendingFreeMutex` | 待释放句柄队列 | 叶子；`FreeLibrary` 一律在锁外做（插件 `DllMain(DETACH)` 可能回调 loader） |
@@ -323,6 +356,10 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 固定顺序：`transition → lifecycle →{ pushState | scriptState }→ MinHook → capture/ImageAddress`
 （消息总线自成一层：`mtx_ → lifecycle`，但它从不与站点锁嵌套）。
 凡是"插件代码可能被调用"的地方（`OnLoad`/`OnUnload`/回调/`WaitAll`）都必须**先放掉 lifecycle 锁**。
+
+跨模块状态一律走访问器而不是 extern 变量（`LifecycleMutex()` / `GlobalBus()` /
+`ScriptBridge::IsGameCorePhaseReady()` 等）。这是拆分的既定原则：extern 变量需要跨模块可见，
+文件级 static 则天然做不到，两者都不能保证"只有一份"。
 
 > **注意"锁序"只对嵌套持有成立。** 两个不相交的临界区（例如
 > `RemoveGameCoreDomainSiteRecords` 里先取 MinHook 的块与后取 pushState 的块，
@@ -340,6 +377,11 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
   `ResetForReload: ...`、`RemoveGameCoreDomainSiteRecords: reset N site(s) in place (MinHook record + trampoline released; node kept: stubs embed &HookSite), marked recordStale=M; ...`、
   `Plugin deactivated, module queued for free after engine GameCore unload`、
   `Plugin module freed after engine GameCore unload: <handle>`、`Plugin deactivated, module parked (kept mapped)`。
+
+排查"插件没加载"时按这个顺序看：`LoadDLL: no confirmed GameCore module; plugins not loaded`
+（引擎模块槽拿不到或为空 → 根本没进初始化）、`InitializeGameCorePhase failed`（阶段 B 初始化失败）。
+注意 `g_unloadIncomplete` 不写日志：它只让下一次 `LoadDllDetour` 提前返回，所以"LoadDLL 打了
+ruleset 日志但插件一条没加载"时，要先确认不是被这个标志挡下的。
 
 ---
 
@@ -364,7 +406,7 @@ exe 目录上溯拿 Workshop）。
 `DLC\Expansion1` / `DLC\Expansion2` 带 `Binaries\Win64`，而那是官方内容、不是 loader/插件的分发位置。
 
 
-类别判定（`Civ6DLLHookLoaderAPI.cpp:CategoryForPath`）：把路径规范化（全小写、`/`→`\`）后含
+类别判定（`PluginRegistry.cpp:CategoryForPath`）：把路径规范化（全小写、`/`→`\`）后含
 `\plugins\global\` → `Global`，**其余一律 `GameCore`**。注意默认方向：放到预期之外的位置会被当成
 GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
@@ -372,10 +414,10 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 ### 3.2 加载流程（`LoadPluginDllInternal`）
 
-1. 拿 `g_gameCoreTransitionMutex` + `g_pluginLifecycleMutex`；
+1. 拿 `g_gameCoreTransitionMutex` + lifecycle 锁；
 2. `GetModuleHandleExW(UNCHANGED_REFCOUNT, path)` 先看模块是否已驻留；没有再 `LoadLibraryExW`,
    用 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`。`ownsRef` 标记引用是否归本次调用。
-   这一步（以及紧接着的 `Civ6PluginKind` 调用）都在**不持 `g_pluginLifecycleMutex`** 时做：它们会执行
+   这一步（以及紧接着的 `Civ6PluginKind` 调用）都在**不持 lifecycle 锁**时做：它们会执行
    第三方 `DllMain`/插件导出，而那把锁是最常被重入的（插件回调、owner 探针都要它），持着它跑别人的代码
    会把插件回调路径一起卡住甚至自死锁；`g_gameCoreTransitionMutex` 仍罩整个加载过程，所以不会被 teardown 穿插；
 3. 句柄重复（同一模块已在跟踪表里）→ 释放自己拿到的引用并返回 false；
@@ -387,9 +429,11 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
    只释放本次自己拿到的引用。注意这不等于「插件一行代码都没跑过」——`LoadLibraryExW` 已经执行过它的
    `DllMain`/CRT 初始化，`Civ6PluginKind` 的调用也在 SEH 叶子里执行；那是信任边界，不是安全保证；
 5. 找 `OnLoad` 导出；缺失 → 拒载（释放引用）；
-6. 组装 `PluginEntry`（handle / path / stem 名 / `ownerId` = 规范化全路径 / category），
-   `SetPluginState(Loading)`（同步 `PluginInFlight` 放行镜像）并 push 进 `g_plugins`；
-7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadSafe(onLoad)`（SEH 包住）→ 清上下文 → 重新拿锁；
+6. 组装 `PluginEntry`（handle / path / stem 名 / `ownerId` = 规范化全路径 / category /
+   `inFlight` = **本次加载代**的 `PluginInFlight::Owner*`），
+   `SetPluginState(Loading)`（同步放行镜像）并 push 进 `g_plugins`。
+   **顺序不能反**：`SetPluginState` 要写 `entry.inFlight` 的放行镜像，先置状态会让它作用在 `nullptr` 上
+   而静默失效；`inFlight` 必须由 `BeginLifetime` 新建（不是 `Resolve`），否则代际隔离失效（§6.1）；7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadSafe(onLoad)`（SEH 包住）→ 清上下文 → 重新拿锁；
 8. `OnLoad` 崩溃 → `QuarantinePluginByOwner`（§3.3）+ **模块释放策略**（§3.3 末），返回 false；
 9. 有 `OnMessage` 导出 → 自动注册消息处理器；
 10. `SetPluginState(Active)`，加载完成。
@@ -491,7 +535,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 - `Global` 类别：目标必须落在**某个已加载的非 GameCore 模块**内 —— exe、常驻系统 dll（user32/dxgi…）、
   插件自己的模块都算；**堆、`VirtualAlloc` 的 JIT 页、空闲地址、将来会被 GameCore 占用的地址一律拒绝**。
 
-实现（`Civ6DLLHookLoaderAPI.cpp`）：`IsTargetOpenToCaller`（单点）/ `IsRangeOpenToCaller`（整段）/
+实现（`PluginDomain.cpp`）：`IsTargetOpenToCaller`（单点）/ `IsRangeOpenToCaller`（整段）/
 `IsImageOpenToCaller`（image 参数）；模块判定用 `RangeInsideOneLoadedModule`——两端各自的
 `GetModuleHandleExW(FROM_ADDRESS)` 返回同一模块句柄，即证明整段同属一个已加载模块（不解析 PE）。
 
@@ -517,8 +561,8 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 ### 4.3 Lua 原语（44 个）——不是 GameCore 专属
 
-全部是 `HavokScript_FinalRelease.dll` 导出的薄封装（`HavokScript.cpp`：约 40 个 `GetProcAddress` +
-`checkplayerid` + 极端情况下的原始栈兜底）。入口本身**与 GameCore 无关**：作用对象是**调用方传进来的**
+全部是 `HavokScript_FinalRelease.dll` 导出的薄封装（`HavokScript.cpp` 里由一张导入表 + 宏批量登记，
+加 `checkplayerid` + 极端情况下的原始栈兜底）。入口本身**与 GameCore 无关**：作用对象是**调用方传进来的**
 `lua_State*`，所以两类插件都开放。导入在**阶段 A** 解析一次（该 DLL 是 exe 静态导入、常驻）；
 缺失时逐个入口降级为安全默认值 + 限次日志，**不影响插件加载**。
 
@@ -622,6 +666,15 @@ stub 的慢路径把第 `paramIndex` 个寄存器参数写到所有 `out`。
 用的同一入口：detourOwner 恒空、同一 detour 幂等、与插件 detour 双向互斥。
 Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过站点表，直接 `MH_CreateHook`。
 
+**`MH_ERROR_ALREADY_CREATED` 的归属判定**（`GetOrCreateHookSiteLocked`）：MinHook 对已建过记录的
+target 返回这个状态。它有两种可能来源，处理方式相反：
+
+- 本站节点已存在（不是本次新建）**且**当前前导字节与本站 `prologueBackup` 一致 → 是**自己**的残留记录
+  （上次 teardown 的 `MH_RemoveHook` 失败），可以先 `MH_RemoveHook` 再重建；
+- 其余情况（全新站点，或字节对不上）→ 只能是**别人**（插件或其它机制）的钩子。**无条件摘除会释放对方的
+  trampoline**（跳板指针悬垂，且可能静默顶掉 Lua 脚本全局注册），还会把旧字节写进当前映像。
+  此时拒绝对该地址建站：新建的节点 `erase` 掉，已存在的节点打 `poisoned` 永久拉黑。
+
 ### 5.6 退役、摘除与 teardown
 
 - **拔槽**（插件卸载）：`RetireHookSiteDetoursForOwnerLocked(owner)`——只把 `activeDetour` 清空、
@@ -694,21 +747,54 @@ Loader 自己的 **exe 域**钩（`LoadDLL` / `UnloadDLL` / `LoadUI`）不经过
 
 ### 6.1 PluginInFlight（在途登记与排空）
 
-`PluginInFlight::Owner`：owner 的放行镜像 + 在途计数；`SetAllowed` 是镜像的**唯一写者**（只由
-`SetPluginState` 调用）。守卫入口用 `Enter(owner, kind)`（先增量再检查、失败回滚）与 `ReleaseCount`；
-卸载/隔离用 `WaitAll(owner, name)`：谓词是「本 owner 的在途计数 ≤ 本线程自己的深度」，5 秒未满足就
-限次记日志但**继续等**（不放弃）。
+`PluginInFlight::Owner`：owner 的放行镜像 + 在途计数 + 每类计数；`SetAllowed` 是镜像的**唯一写者**
+（只由 `SetPluginState` 调用）。守卫入口用 `Enter(owner, kind)`（先增量再检查、失败回退）与
+`ReleaseCount`；卸载/隔离用 `WaitAll(owner, name)`：谓词是「本 owner 的在途计数 ≤ 本线程自己的深度」，
+5 秒未满足就限次记日志但**继续等**（不放弃）。
 
 被它守卫的入口：消息 handler、`RegisterScriptGlobals`（含 UI）、`GameEvent` 触发、`PushLuaMethods` 推送。
 **不**被它守卫的：插件 detour（靠 teardown 顺序保证）、以及已经交给引擎的 Lua 函数指针。
 
+#### 按加载代隔离（`BeginLifetime`）
+
+`Resolve(ownerId)` 是"取/建"，同一 ownerId 永远返回**同一个** `Owner*`。对 GameCore 插件这是错的：
+它们每局重载，同一个 ownerId 会跨代复用同一个对象，于是**上一代尚未退出的回调会计进新一代的计数**，
+`WaitAll` 等错对象——而每局重载是必然发生的，不是边缘情形。
+
+因此加载路径不走 `Resolve`，走 `BeginLifetime(ownerId)`：
+
+- 每次加载**新建一个 `Owner`**，把它设为当前代，并置 `allowed = false`；
+- 上一代**置 `allowed = false` 但绝不删除、也绝不重新放行**——锁外的快照（消息总线的 handler 快照、
+  脚本注册表的快照）可能还握着那个指针，删了是 UAF，重新放行等于让上一代的回调又进来；
+- `PluginEntry::inFlight` 存的是**本代**那个指针，`SetPluginState` / `WaitAll` 都用它，不再按
+  ownerId 反查（反查会拿到当前代，从而失去代际隔离）；
+- `Owner*` 本身终身稳定，`Owner` 对象不回收。旧代的计数自然归零，但没人再等它。
+
+`SetAllowed`、`WaitAll` 的谓词、`Enter` 的加计数，三处的内存序统一为 `seq_cst`：这三者必须处在
+同一个全序里，否则卸载方与回调方可能各读到旧值，形成"卸载方以为排空了、回调方以为门还开着"的窗口。
+
 ### 6.2 消息总线（`Civ6MessageBus`）
 
-按 owner 注册 handler、`Broadcast`、`SendMessageTo`、`UnregisterOwner`；handler 调用走
+按 owner 注册 handler、`Broadcast`、`SendTo`、`UnregisterOwner`；handler 调用走
 `PluginInFlight::Enter`（owner 已停用则直接跳过）；注销在锁外 `WaitAll`。
 总线**没有** Loader 自己的处理器，也没有"按名字注销单个 handler"的入口：v1 的 `load-plugin`
 消息入口（任何插件都能让 Loader 去 `LoadLibrary` 任意路径并调其 `OnLoad`，绕过启用集过滤）
 已连同 `InitializeLoader` 一起删除，插件只能经 `LoaderCore::LoadSinglePlugin` 的扫描路径加载。
+
+每个 `HandlerEntry` 带一个独立的 `std::atomic<bool> active`，与 owner 级的 `inFlight` 分工：
+
+- `inFlight` 管"这个插件还允许被回调吗"（跨卸载 / 跨代）；
+- `active` 只管"这一个 handler 已被替换掉吗"（同 owner 内的换实现）。
+
+覆盖同名 handler（必须同 owner，异 owner 的同名注册直接拒绝）时**只把旧 entry 的 `active` 置 false、
+不排空不等待**：覆盖发生时插件仍然活着，把 owner 级门禁关掉会连带拒绝该 owner 的其它回调。旧 entry
+不删——已取出快照的并发派发还持有 `shared_ptr`，由它保活到最后一个使用者退出。代价是旧 handler
+至多被"已取出快照、尚未读 active"的那一次调用多跑一遍，随后被拦下。
+
+`UnregisterOwner` 则**会排空**：摘掉该 owner 的表项后，在总线锁外 `WaitAll`，返回时保证该 owner
+不再有回调在执行。这是总线自身的对外承诺，不依赖调用方补等——调用方
+（`UnloadPluginByOwnerId` / `QuarantinePluginByOwner`）在 `OnUnload` 与 `FreeLibrary` 之前也会各等一次，
+但那时等的是同一个 `Owner`、计数已归零，重复等待的成本是零。
 
 ### 6.3 ScriptGlobals（+ ForUI）
 
@@ -1029,7 +1115,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 | # | 问题 | 位置 | 说明 |
 |---|---|---|---|
-| 1 | teardown 窗口在取不到映像信息时被清成空 | `ResetForReload`（`SetGameCoreTeardownWindow(0,0)` 分支） | 当 `base == 0` 时保护判定直接返回 false，等于在最不确定时关掉了保护门；而同文件 `RemoveGameCoreDomainSiteRecords` 在同样情形下**刻意不清**，两者矛盾 |
+| 1 | teardown 窗口在取不到映像信息时被清成空 | `ResetForReload`（`LoaderCore::Teardown::SetWindow(0, 0)` 分支） | 当 `base == 0` 时保护判定直接返回 false，等于在最不确定时关掉了保护门；而 `HookEngine.cpp` 的 `RemoveGameCoreDomainSiteRecords` 在同样情形下**刻意不清**（只在 `GetInfo` 成功时才 `SetWindow`），两者矛盾 |
 | 2 | 状态码 `3`（预留 Frontend）与若干空槽 | `common/HookAPI.h` | 属于未实现功能，不应长期保留在核心 ABI 枚举定义中 |
 | 3 | `ShouldSkipPluginFile` 用文件名黑名单而非白名单 | `common/ModScan.cpp` | 存在隐患：若官方将来在目录下新增 DLL，可能会被误当成第三方插件加载 |
 
@@ -1064,10 +1150,15 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 2. 若它只对 GameCore 有意义：加进文件底部"类别门禁"块的对象式重命名列表（8 个之一的位置），
    并在实现里调用 `RequireGameCoreOwner`；
 3. 若它是"换地址 / 给地址"类：实现必须过 `IsTargetOpenToCaller` / `IsRangeOpenToCaller`；
-4. 在 `Civ6DLLHookLoaderAPI.cpp` 的 `Impl` 里实现，并**按顺序**填进 `g_hookApi` 的位置初始化表；
+4. 在**归属模块**里实现对应的 `*Impl`（取址类 → `AddressResolve.cpp`；脚本/Lua/GameEvent/PushMethods 类 →
+   `ScriptBridge.cpp`；插件生命周期类 → `PluginRegistry.cpp`；装钩/捕获 → `HookEngine.cpp`），
+   然后在 `HookLoaderApi.cpp` 的 `g_hookApi` 位置初始化表里**按顺序**填上它的地址。
    追加入口还必须同步 `common/HookAPI.h` 的 `CIV6_HOOK_API_ENTRY_COUNT`：`g_hookApi` 上方的两条
    `static_assert`（`sizeof` + 末尾字段偏移）挡住「加了字段却没改计数/没补初始化」，
    `VerifyHookApiTableProtection` 启动时还会扫描空项；
+   > 表是 `const` 的且 `*Impl` 不能是 `static`（`g_hookApi` 取的是它们的地址）；
+   > 反过来 `HookLoaderApi.cpp` include 全部子系统头文件，且没有任何下层模块反向 include 它——
+   > 它是组装根，不参与实现。
 5. 编译 loader 侧需要 `CIV6_HOOKAPI_BUILD_IMPL`（工程里已定义）；
 6. **不要**动已有字段的顺序，也不要改 `apiVersion`（见 10.3）。
 
@@ -1081,7 +1172,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 1. `common/HookAPI.h` 的 `CIV6_PLUGIN_KIND_VALUE` 加值（3 起是保留位）+ 头文件里的
    `CIV6_PLUGIN_KIND_VALUE` 取值分支（新宏 → 新 kind）；
-2. 加载期映射：`KindToCategory`（API cpp 内）+ `CategoryForPath` 的目录名判断；
+2. 加载期映射：`KindToCategory` + `CategoryForPath` 的目录名判断（都在 `PluginRegistry.cpp`）；
 3. 域规则：`IsTargetOpenToCaller` 里加一条"该类别能碰哪块内存"的**正向**规则；
 4. teardown 策略：想清楚它的模块什么时候能 `FreeLibrary`（现在只有 GameCore 类别会排队释放）。
 

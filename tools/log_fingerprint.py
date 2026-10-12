@@ -55,11 +55,24 @@ PID_RE = re.compile(r"\bpid=\d+")
 # 用 (?<![\w]) 防止截断更长的十六进制串（如 fingerprint=0x8DDC... 已被 0x 规则排除）。
 ADDR_RE = re.compile(r"(?<![\w])(?:0x)?(?=[0-9A-F]{16}(?![\w]))[0-9A-F]{16}")
 
+# 【ASLR 基址】：DLL 每次加载的基址由系统决定，必然不同。
+# 实测漏掉这条会让每次比对都误报 6 处（GameCore attached / ApiSmokeTest 的三行 ×2 轮）。
+#
+# 只抹【明确的基址字段】（base=0x...），不抹所有 0x 值 ——
+# 0x 前缀的确定性值（sizeOfImage / timestamp / fingerprint / Protect）必须保留，
+# 它们变了说明跑的不是同一映像，那是真差异。
+BASE_RE = re.compile(r"\bbase=0x[0-9A-Fa-f]+")
+# 插件/模块句柄同理（Plugin module freed 的 %p 已被 ADDR_RE 处理，
+# 但显式 0x 形式出现在其它行时也要抹）。
+MODULE_RE = re.compile(r"\bmodule=0x[0-9A-Fa-f]+")
+
 
 def normalize_line(line: str) -> str:
     s = line.rstrip("\r\n")
     s = TS_RE.sub("[TIME] ", s)
     s = PID_RE.sub("pid=<PID>", s)
+    s = BASE_RE.sub("base=<BASE>", s)
+    s = MODULE_RE.sub("module=<MODULE>", s)
     # 只把【不带 0x 前缀】的 16 位十六进制当地址；
     # 带 0x 的是显式值（fingerprint 等），保留原样。
     s = ADDR_RE.sub(lambda m: m.group(0) if m.group(0).startswith("0x") else "<ADDR>", s)
