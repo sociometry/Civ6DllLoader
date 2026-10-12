@@ -38,7 +38,10 @@ bool ReadAt(HANDLE file, LONGLONG offset, void* buffer, DWORD size) {
 }
 
 // 持有源文件只读句柄期间验证磁盘 PE；映射只用于资源 API。
-bool ProbeLocked(HANDLE file, const std::wstring& path, uint32_t& outVersion) {
+// allowCodeMapped：见 ProbeVersion 的说明。默认 false = 只认"独立数据映射"，
+// 避免从"同名但内容已被换掉的旧代码映射"读出错误的版本（staging/自更新路径需要这个严格性）。
+bool ProbeLocked(HANDLE file, const std::wstring& path, uint32_t& outVersion,
+                 bool allowCodeMapped) {
     LARGE_INTEGER size{};
     IMAGE_DOS_HEADER dos{};
     if (!GetFileSizeEx(file, &size) || size.QuadPart < static_cast<LONGLONG>(sizeof(dos)) ||
@@ -60,8 +63,18 @@ bool ProbeLocked(HANDLE file, const std::wstring& path, uint32_t& outVersion) {
         LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
     if (!module) return false;
     bool ok = false;
-    // 已作为代码加载的同名模块会被 Windows 复用；不从该旧映像读取版本。
-    if ((reinterpret_cast<uintptr_t>(module) & 3u) != 0) {
+    // (module & 3) != 0 表示拿到的是【独立的数据映射】；为 0 表示 Windows 复用了进程里
+    // 已有的【代码映射】。严格路径（候选筛选 / staging / 自更新）要求前者：
+    // 后者的句柄属于进程里已加载的同名模块，它的资源可能来自另一个（已被替换的）文件内容。
+    //
+    // 但"已安装的是不是我们的 loader"这个判定必须放宽到 allowCodeMapped ——
+    // 因为游戏 exe 静态导入 version.dll，薄壳运行时目标文件【必然】已被代码映射
+    // （实测 LoadLibraryExW 直接返回该代码映射句柄，m&3==0）。若沿用严格判据，
+    // 已装载的【我们自己的 loader】会被误判成"不是我们的"，进而被错误地接管覆盖。
+    // 放宽后仍由下面的资源校验兜底：
+    //   我们的 loader（无论是否已代码映射）-> 有 RCDATA 105 且 magic/format 正确 -> ok
+    //   外来 version.dll（含 System32 原生）-> 没有该资源 -> false
+    if (allowCodeMapped || (reinterpret_cast<uintptr_t>(module) & 3u) != 0) {
         HRSRC resource = FindResourceW(module,
             MAKEINTRESOURCEW(CIV6_DLL_LOADER_VERSION_RESOURCE_ID), RT_RCDATA);
         if (resource && SizeofResource(module, resource) == sizeof(VersionResource)) {
@@ -95,8 +108,21 @@ bool ProbeVersion(const std::wstring& path, uint32_t& outVersion) {
     if (!std::filesystem::path(path).is_absolute()) return false;
     FileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (file.get() == INVALID_HANDLE_VALUE || !ProbeLocked(file.get(), path, outVersion)) {
+    if (file.get() == INVALID_HANDLE_VALUE || !ProbeLocked(file.get(), path, outVersion, false)) {
         Logger::Log("RuntimePackage: rejected candidate (x64 DLL/version resource required): %ls", path.c_str());
+        return false;
+    }
+    return true;
+}
+
+// "已安装的是不是我们的 loader"专用：放宽 (module & 3) 判据，见 ProbeLocked 的说明。
+// 与 ProbeVersion 的区别只在这一点；PE 校验与 RCDATA 105 校验完全相同。
+bool ProbeVersionIncludingLoaded(const std::wstring& path, uint32_t& outVersion) {
+    outVersion = 0;
+    if (!std::filesystem::path(path).is_absolute()) return false;
+    FileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE || !ProbeLocked(file.get(), path, outVersion, true)) {
         return false;
     }
     return true;
@@ -109,7 +135,7 @@ bool StageCandidate(const std::wstring& source, const std::wstring& staged, uint
     FileHandle input(CreateFileW(source.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     uint32_t actualVersion = 0;
-    if (input.get() == INVALID_HANDLE_VALUE || !ProbeLocked(input.get(), source, actualVersion) ||
+    if (input.get() == INVALID_HANDLE_VALUE || !ProbeLocked(input.get(), source, actualVersion, false) ||
         actualVersion != expectedVersion) {
         Logger::Log("RuntimePackage: candidate changed or invalid before staging: %ls", source.c_str());
         return false;
