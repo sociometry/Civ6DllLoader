@@ -3,10 +3,24 @@
 // 实现分布：RuntimeEntry.cpp（早期初始化与一次性启动线程）、
 // Civ6DLLHookLoaderAPI.cpp（插件生命周期）、LoaderHooks.cpp（exe 域 hook 与阶段 B 编排）。
 #include <string>
+#include <mutex>
 
 #include "../common/HookAPI.h"
 
 namespace LoaderCore {
+
+// 插件生命周期锁（递归）。所有模块都用它把"插件表状态"与"插件回调执行"串起来，
+// 故必须共享同一把 —— 见 REFACTOR_PLAN.md §5.2：它被 4 个模块、34 个函数引用，
+// 是拆分里引用面最广的一个共享对象。
+//
+// 锁层级（§5.4，实测 5 级）：
+//   g_gameCoreTransitionMutex → LifecycleMutex() → g_pushStateMutex
+//     → Runtime::MinHookMutex() → g_captureMutex
+// 递归获取不会死锁，但不要在持 MinHook/capture 锁时反向取它（ABBA）。
+//
+// 实现仍在 Civ6DLLHookLoaderAPI.cpp（阶段 6 随插件表迁到 PluginRegistry.cpp），
+// 声明与调用方不变。
+std::recursive_mutex& LifecycleMutex();
 
 enum class PluginCategory {
     Global,   // Plugins\Global\*.dll：Loader 启动时加载（阶段 A）

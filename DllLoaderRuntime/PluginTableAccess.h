@@ -31,4 +31,14 @@ namespace PluginRegistry {
 // 地址不在任何已加载模块内、或模块不对应任何插件 -> nullopt。
 std::optional<PluginDomain::CallerPluginInfo> ResolveOwnerByModule(HMODULE module);
 
+// 该 owner 是否处于 Loading/Active（即"还活着、可以给它注册东西"）。
+//
+// 对应拆分前 PushLuaMethodsImpl 里的
+//   std::find_if(g_plugins..., [](const PluginEntry& e){
+//       return e.ownerId == ownerId && (e.state == Loading || e.state == Active); })
+// —— 原代码拿到迭代器后【只与 end() 比较，从不解引用】，所以这个 bool 是精确替换。
+//
+// 【锁约定】调用方须持 LoaderCore::LifecycleMutex()（原调用点本来就持着）。
+bool IsOwnerActive(const std::wstring& ownerId);
+
 }  // namespace PluginRegistry
