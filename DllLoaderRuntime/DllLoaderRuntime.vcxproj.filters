@@ -131,6 +131,9 @@
     <ClInclude Include="SymbolResolve.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="TeardownWindow.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="HavokScript.h">
       <Filter>头文件</Filter>
     </ClInclude>

@@ -22,6 +22,7 @@
 #include "PluginBoundary.h"
 #include "PluginInFlight.h"
 #include "SymbolResolve.h"   // 阶段 1 拆出的地址解析（*Core / 符号库状态查询）
+#include "TeardownWindow.h"  // 阶段 3a：teardown 窗口的共享存储（跨 TU 必须同一份）
 
 #include <cstdarg>
 #include <cstdlib>
@@ -246,12 +247,11 @@ static bool KindToCategory(uint32_t kind, LoaderCore::PluginCategory& out) {
 // （TargetInTearingDownGameCore），两个字段必须"成对生效"而不是各写各的裸变量。
 // 写序固定：先 size 再 address(release)；清零点：先 address(release) 再 size。
 // 读序固定：先 address(acquire)，非 0 才读 size。见 docs/ARCHITECTURE.md §2.1。
-static std::atomic<uintptr_t> g_gameCoreTeardownAddress{ 0 };
-static std::atomic<uint32_t> g_gameCoreTeardownSizeOfImage{ 0 };
-
+//
+// 存储与两个 setter 已移到 TeardownWindow.h（阶段 3a）：HookEngine 与 PluginDomain
+// 分属不同 TU，若各自留一份 static 就会静默失效。这里只保留母体内沿用的名字。
 static void SetGameCoreTeardownWindow(uintptr_t base, uint32_t sizeOfImage) {
-    g_gameCoreTeardownSizeOfImage.store(sizeOfImage, std::memory_order_relaxed);
-    g_gameCoreTeardownAddress.store(base, std::memory_order_release);
+    LoaderCore::Teardown::SetWindow(base, sizeOfImage);
 }
 
 struct PushTargetConfig {
@@ -454,11 +454,8 @@ static bool IsRangeOpenToCaller(LoaderCore::PluginCategory caller, const void* t
 }
 
 static bool TargetInTearingDownGameCore(void* target) {
-    const uintptr_t base = g_gameCoreTeardownAddress.load(std::memory_order_acquire);
-    if (base == 0) return false;   // 窗口未进入（或已清）：size 不必读
-    const uint32_t sizeOfImage = g_gameCoreTeardownSizeOfImage.load(std::memory_order_relaxed);
-    const uintptr_t p = reinterpret_cast<uintptr_t>(target);
-    return p >= base && p - base < sizeOfImage;
+    // 判据与窗口的读写序都在 TeardownWindow.h 里，保持单一来源。
+    return LoaderCore::Teardown::IsTargetInWindow(target);
 }
 
 // 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
@@ -3741,8 +3738,7 @@ static void RemoveGameCoreDomainSiteRecords(
 // teardown 窗口的清零点：由 LoaderHooks 的两个 detour 在引擎原函数返回之后调用。
 // 见 §2.3 第 9 步：窗口必须在引擎 LoadDLL/UnloadDLL 真正换映像之后才失效。
 void LoaderCore::ClearGameCoreTeardownWindow() {
-    g_gameCoreTeardownAddress.store(0, std::memory_order_release);   // 读者见 0 即短路
-    g_gameCoreTeardownSizeOfImage.store(0, std::memory_order_relaxed);
+    LoaderCore::Teardown::ClearWindow();
 }
 
 void LoaderCore::ResetForReload() {
