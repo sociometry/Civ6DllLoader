@@ -52,11 +52,12 @@ namespace hks {
 	// 因此不存在"官方导出优先"的候选可解析。
 	hksi_lua_pushlightuserdataType pushlightuserdataReal = nullptr;
 
-	// 本次 Init 缺失的导入名清单（含重复解析失败）；InitHavokScript 据此判定整体失败。
+	// 本次 Init 缺失的导入名清单；InitHavokScript 据此汇总告警并返回 false。
 	std::vector<std::string> g_missingImports;
 
-	// 解析并登记：缺失的导入名记录在案，InitHavokScript 汇总告警并返回 false
-	// （GameCore 插件随之停用——半可用的 Lua API 对插件是崩溃源，宁可不加载）。
+	// 解析并登记：缺失的导入名记录在案，InitHavokScript 汇总告警并返回 false。
+	// 返回 false 只表示"Lua API 降级"——各包装（HKS_GUARD_* 宏 / PushLuaMethod）已逐入口
+	// 判空并返回安全默认值。**不要**把它当成"拒载插件"的理由：插件可能压根不用 Lua。
 #define RESOLVE_IMPORT(var, mangled) \
     do { \
         (var) = reinterpret_cast<decltype(var)>(GetProcAddress(hksDll, (mangled))); \
@@ -187,14 +188,14 @@ namespace hks {
 		RawPushTValue(L, 2, reinterpret_cast<uintptr_t>(ptr));  // LUA_TLIGHTUSERDATA
 	}
 
-	// 每次阶段 B 重新解析（模块是 exe 的静态导入、常驻；重新解析的是导入地址），可重复调用。
-	// 返回 false = 有导入缺失，调用方（InitializeGameCorePhase）据此停用 GameCore 插件加载（宁缺毋崩）。
+	// 阶段 A（WorkerMain）调一次。HavokScript_FinalRelease.dll 是 exe 的静态导入
+	// （PE 导入表实证），随进程装载、不会卸载，所以导入地址恒定，无需"每局重新解析"。
+	// 返回 false = 模块缺失或任一导入未解析，调用方按降级处理（见 g_missingImports 注释）。
 	bool InitHavokScript() {
 		HMODULE hksDll = GetModuleHandle(TEXT("HavokScript_FinalRelease.dll"));
 		if (hksDll == NULL) {
 			// 不打 GetLastError：GetModuleHandle 失败不保证设置 last error。
-			// 不清旧导入指针也是安全的：该模块是 exe 静态导入、进程内不会卸载，
-			// "缺失"只可能发生在首次解析之前（那时所有指针都还是 nullptr）。
+			// 此时所有导入指针本来就是 nullptr，不需要额外清理。
 			Logger::Log("HavokScript_FinalRelease.dll not found; lua API unavailable");
 			return false;
 		}

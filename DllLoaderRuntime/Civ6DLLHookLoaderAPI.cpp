@@ -1561,7 +1561,7 @@ namespace {
 // ——AOB 自锚定，避免硬编码 RVA 的版本脆性。
 constexpr const char* kLuaSingletonPattern =
     "48 8B 05 ?? ?? ?? ?? 48 8B 48 10 E9";
-void* g_activeLuaStateHit = nullptr;   // AOB 命中缓存（Contains 校验，跨代自动重扫）
+void* g_mainLuaStateHit = nullptr;   // AOB 命中缓存（Contains 校验，跨代自动重扫）
 constexpr size_t   kGameEventNameMax           = 96;    // 事件名副本容量（注册表）
 
 // ms_pkCurrentGame 定位 pattern（GameSignals::Subscribe 开头 mov rdi, cs:ms_pkCurrentGame
@@ -1636,33 +1636,37 @@ void* GetEngineUtilityImpl() {
     return GetEngineUtilityCore();
 }
 
-// 当前活跃游戏 Lua 状态——官方 GameCore::ScriptSystem::CallHook 同款（IDA 实证）：
-//   mov rax, cs:?ms_apSingletonInstance@LuaScriptSystem@LuaSystem@@2PEAV12@EA   ; exe RVA 0x2D08F88
-//   mov rcx, [rax+10h]                                                          ; 活跃 lua_State
-// 每次实时读（引擎在对局/脚本切换时更新 +0x10），不缓存。
-void* GetActiveLuaStateImpl() {
+// 引擎主 Lua VM（进程级，见 HookAPI.h 的 GetMainLuaState 说明）。
+// **不限插件类别**：它是进程级 state，Global 插件持有它不会因换局悬垂，所以不需要
+// 地址域门（域门防的是 GameCore 那种"随对局重载的短命域地址"）。Loader 内部
+// GameEvent 路径（GameEventInvokeLuaImpl）也直接调它。
+void* GetMainLuaStateImpl() {
     // 定位 exe 的 ScriptSystem::CallHook 内的全局读取序列（IDA 实证）：
     //   48 8B 05 ?? ?? ?? ??   mov rax, cs:ms_apSingletonInstance
-    //   48 8B 48 10            mov rcx, [rax+10h]      ← 活跃 lua_State
+    //   48 8B 48 10            mov rcx, [rax+10h]      ← 主 lua_State
     //   E9 ?? ?? ?? ??         jmp GameEventLibrary::CallHook
     // AOB 自锚定（不依赖硬编码 RVA，游戏版本更新时该序列由编译器稳定生成）；
     // 命中地址按镜像缓存（Contains 校验，跨代/重载自动重扫）。
+    //
+    // 注：该 pattern 在 PC exe 上命中 6 处（CallHook / CallAccumulator×2 / CallProcessor /
+    // CallTestAll / CallTestAny），但 6 处的 disp32 全部指向同一个单例槽、且都是 mov rcx,[rax+10h]，
+    // 所以取任一处结果等价，不需要唯一性。
     static const HookImageId kCandidates[] = { kHookImageExeDx11, kHookImageExeDx12 };
     for (HookImageId image : kCandidates) {
         if (!ImageAddress::IsLoaded(image)) continue;
         // 缓存命中（地址仍属该镜像）直接用
         void* slot = nullptr;
-        if (g_activeLuaStateHit && ImageAddress::Contains(image, g_activeLuaStateHit)) {
+        if (g_mainLuaStateHit && ImageAddress::Contains(image, g_mainLuaStateHit)) {
             const int32_t disp = GameEventReadInt32Safe(
-                static_cast<const char*>(g_activeLuaStateHit) + 3);
+                static_cast<const char*>(g_mainLuaStateHit) + 3);
             if (disp != 0) {
-                slot = static_cast<char*>(g_activeLuaStateHit) + 7 + disp;
+                slot = static_cast<char*>(g_mainLuaStateHit) + 7 + disp;
             }
         }
         if (!slot) {
             void* hit = ResolveByPatternCore(image, kLuaSingletonPattern, kSectionText);
             if (hit) {
-                g_activeLuaStateHit = hit;
+                g_mainLuaStateHit = hit;
                 const int32_t disp = GameEventReadInt32Safe(static_cast<const char*>(hit) + 3);
                 if (disp != 0) slot = static_cast<char*>(hit) + 7 + disp;
             }
@@ -1672,16 +1676,16 @@ void* GetActiveLuaStateImpl() {
         if (!singleton) continue;
         void* L = GameEventReadPtrSafe(static_cast<const char*>(singleton) + 0x10, 0);
         // 每个进程只打一次命中 RVA（预期 slot RVA=0x2D08F88）：确认 AOB 锚点落对位置，
-        // 是"活跃 state 取不到"这类现场问题的第一手证据。
+        // 是"主 state 取不到"这类现场问题的第一手证据。
         static bool s_logged = false;
         if (!s_logged && L) {
             s_logged = true;
             HookImageInfo info{ sizeof(HookImageInfo) };
             if (ImageAddress::GetInfo(image, &info) && info.base) {
-                Logger::Log("GetActiveLuaState: image=%u hitRva=0x%llX slotRva=0x%llX L=%p",
+                Logger::Log("GetMainLuaState: image=%u hitRva=0x%llX slotRva=0x%llX L=%p",
                     static_cast<unsigned>(image),
                     static_cast<unsigned long long>(
-                        reinterpret_cast<uintptr_t>(g_activeLuaStateHit) - info.base),
+                        reinterpret_cast<uintptr_t>(g_mainLuaStateHit) - info.base),
                     static_cast<unsigned long long>(
                         reinterpret_cast<uintptr_t>(slot) - info.base), L);
             }
@@ -1780,9 +1784,9 @@ static void WarnEngineUtilityUnavailable(const char* name) {
 static bool GameEventInvokeLuaImpl(const char* name, GameEventPushFn pushFn,
                                    const void* payload) {
     if (!name || !*name) return false;
-    void* L = GetActiveLuaStateImpl();
+    void* L = GetMainLuaStateImpl();
     if (!L) {
-        Logger::Log("GameEvent: InvokeLua no-active-state name=%s", name);
+        Logger::Log("GameEvent: InvokeLua no-main-state name=%s", name);
         return false;
     }
     if (!hks::getfield || !hks::setfield || !hks::createtable || !hks::pcall ||
@@ -2606,7 +2610,7 @@ void* InstallPushMethodsWithManager(void* target, const std::vector<StoredLuaMet
 }
 
 // hks 导入缺失时的统一降级：安全默认值 + 限次日志（脚本可能高频调用，不能每次刷日志）。
-// 导入缺失在 InitHavokScript 已整体告警并停用 GameCore 插件加载；此处是纵深防御
+// 导入在阶段 A（WorkerMain）已整体告警；此处是纵深防御（防"告警漏了/新加导入没跟上"）。
 // （阶段 A 已加载的 Global 插件仍可能在调用这些包装）。
 static void WarnHksImportMissing(const char* name) {
     static std::atomic<int> s_warned{ 0 };
@@ -3245,7 +3249,7 @@ static const HookAPI g_hookApi = {
     &TriggerGameEventImpl,
 
     &GetEngineUtilityImpl,
-    &GetActiveLuaStateImpl,
+    &GetMainLuaStateImpl,
     &LuaPushNilImpl,
 };
 
@@ -3840,17 +3844,11 @@ bool LoaderCore::InitializeGameCorePhase() {
         Logger::Log("InitializeGameCorePhase: AttachGameCore failed");
         return false;
     }
-    // 阶段 B 固定顺序：AttachGameCore（映像登记 + pdata 表 + 作用域记账）→ HavokScript 导入 →
-    // 本地化导入 → 共享脚本钩重装（EnsureScriptHooksInstalled，见本函数末尾）→ 加载 GameCore 插件。
+    // 阶段 B 固定顺序：AttachGameCore（映像登记 + pdata 表 + 作用域记账）→ 共享脚本钩重装
+    // （EnsureScriptHooksInstalled，见本函数末尾）→ 加载 GameCore 插件。
     // （历史步骤 InitializeLoader 已删除，见文件上方说明。）
-    // HavokScript 导入缺失 = Lua API 半可用，对插件是崩溃源：停用 GameCore 插件
-    // 加载（本会话游戏本体照常运行）。
-    if (!hks::InitHavokScript()) {
-        Logger::Log("InitializeGameCorePhase: InitHavokScript incomplete; GameCore plugins disabled");
-        ImageAddress::DetachGameCore();
-        return false;
-    }
-    Localization::InitScript();
+    // HKS / Localization 的导入不在这里做：它们是进程级静态导入，已在阶段 A
+    // （WorkerMain）解析完成，缺失只降级各自的 API，不影响本阶段成败。
     g_gameCorePhaseReady = true;
     // 共享脚本钩的 MinHook 记录随旧映像在 ResetForReload 里被摘除，这里按【当次】仍存在的
     // 注册项重装。首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。

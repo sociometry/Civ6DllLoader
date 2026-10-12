@@ -5,9 +5,9 @@
 //   - DllMain：DisableThreadLibraryCalls → 休眠检测（自身父目录 == 游戏 exe 目录，且宿主进程是
 //     CivilizationVI*.exe）通过才 spawn 工作线程；其它任何加载场合（别的进程加载了这份
 //     version.dll、或开发中直接 LoadLibrary 本模块）→ 直接返回 TRUE，什么都不做。
-//   - WorkerMain（阶段 A）：LoaderCore::InitEarly → UiInject::ExtractResources
-//     → LoaderHooks::InstallAll → UiInject::Install → LoaderUpdate::CheckAndApplyUpdate
-//     → LoadPluginsOf(Global) → 线程退出。
+//   - WorkerMain（阶段 A）：LoaderCore::InitEarly → HKS/Localization 导入
+//     → UiInject::ExtractResources → LoaderHooks::InstallAll → UiInject::Install
+//     → LoaderUpdate::CheckAndApplyUpdate → LoadPluginsOf(Global) → 线程退出。
 //   - 阶段 B（LoadDLL detour）在游戏线程 detour 内同步执行（LoaderCore::InitializeGameCorePhase）。
 //   - Global 插件仅启动时加载一次：运行期不再卸载/重装、也不再被 park；
 //     主菜单开关 mod 需要重启才生效。
@@ -26,6 +26,8 @@
 #include "PdataMatch.h"
 #include "ImageAddress.h"
 #include "UiInject.h"
+#include "HavokScript.h"
+#include "Localization.h"
 
 namespace {
 
@@ -104,6 +106,20 @@ bool LoadedFromExeDirectory(HMODULE hModule, const wchar_t** whyOut) {
 DWORD WINAPI WorkerMain(LPVOID) {
     // 1) 基础初始化：Logger / PdataMatch / MinHook
     LoaderCore::InitEarly();
+
+    // 1.2) 进程级依赖导入：HavokScript（Lua VM）与 Localization。
+    // 这两个模块都是 **exe 的静态导入**（PE 导入表实证：Localization_FinalRelease.dll、
+    // HavokScript_FinalRelease.dll），随进程装载、随进程退出，与对局的加载/卸载周期无关。
+    // 所以在这里解析一次即可，不能放到阶段 B —— 放那里会把"进程级依赖"误表达成
+    // "每局重建的能力"，且导入不全时会连累 GameCore 阶段的成败判定。
+    //
+    // 缺失的处置是**降级**而非拒载：各自的包装（HKS_GUARD_* 宏 / Localization 的判空）
+    // 已经逐入口返回安全默认值 + 限次日志。插件可能压根不用 Lua 或本地化，
+    // 没有理由因为一个可选依赖残缺就拒绝加载它。
+    if (!hks::InitHavokScript()) {
+        Logger::Log("WorkerMain: HavokScript imports incomplete; Lua APIs degraded");
+    }
+    Localization::InitScript();
 
     // 1.5) 释放内嵌 FrontEnd UI 资源到 exe 目录的 Civ6DllLoader 子目录
     UiInject::ExtractResources();
