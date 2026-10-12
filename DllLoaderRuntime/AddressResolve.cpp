@@ -1,5 +1,5 @@
 #include "pch.h"
-#include "SymbolResolve.h"
+#include "AddressResolve.h"
 
 #include <Windows.h>
 #include <vector>
@@ -13,18 +13,20 @@
 #include "Runtime.h"
 #include "../common/Logger.h"
 
-// 从 Civ6DLLHookLoaderAPI.cpp 拆出（阶段 1）。原文件里的 *Impl（插件侧入口）
-// 仍留在母体，它们调本文件的 *Core；因此这些 *Core 有外部链接（见 SymbolResolve.h）。
+// 从 Civ6DLLHookLoaderAPI.cpp 拆出（阶段 1；阶段 6 补入 5 个 *Impl）。
+//
+// 【命名】：本模块输出一律是地址，故叫 AddressResolve 而非 SymbolResolve。
+// 符号名只是四条输入路径之一；符号库归 PdataMatch。详见 AddressResolve.h。
 //
 // static 的取舍（REFACTOR_PLAN.md §4.4）：
-//   * ResolveSectionRva / *Core / GetSymbolDb*Impl —— 去掉 static（母体的 *Impl 与
-//     g_hookApi 初始化表要用）；
+//   * ResolveSectionRva / *Core / *Impl / GetSymbolDb*Impl —— 外部链接
+//     （HookAPI 表与其它模块要用）；
 //   * ReadVTableSlotSafe / ExeMatchesAnchor / InternalToolApi —— 保持 static
 //     （只被本 TU 调用；InternalToolApi 另外被同 TU 的 LoaderCore::* 调用）。
 
 using namespace std;
 
-namespace SymbolResolve {
+namespace AddressResolve {
 
 // 按段名（.text/.idata/.rdata/.data；PE 段名为 8 字节非 NUL 终止数组）定位镜像内段的
 // RVA 与大小（大小 = max(SizeOfRawData, VirtualSize)）。找不到段返回 false。
@@ -332,7 +334,7 @@ static bool ExeMatchesAnchor(HookImageId image) {
 // 契约：只读。返回非 const 指针只是为了配合 header 里 HookAPI* 的签名。
 //
 // 保持 static（只被本 TU 调用：ResolveDataByAobCore / ResolveExeTarget）。
-// 命名空间内的 static 函数仍可用限定名在本 TU 内引用（SymbolResolve::InternalToolApi）。
+// 命名空间内的 static 函数仍可用限定名在本 TU 内引用（AddressResolve::InternalToolApi）。
 static HookAPI* InternalToolApi() {
     static const HookAPI api = [] {
         HookAPI t{};
@@ -361,7 +363,7 @@ void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
     if (!caller || !PluginDomain::IsImageOpenToCaller(caller->category, image, "ResolveByRva")) return nullptr;
     lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
     PluginBoundary::LoaderLockScope pbLockScope;
-    return SymbolResolve::ResolveByRvaCore(image, rva, span);
+    return AddressResolve::ResolveByRvaCore(image, rva, span);
 }
 
 // ==== ResolveByNameImpl ====
@@ -381,7 +383,7 @@ void* ResolveByNameImpl(HookImageId image, const char* name) {
 
     lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
     PluginBoundary::LoaderLockScope pbLockScope;
-    return SymbolResolve::ResolveByNameCore(image, nameCopy.c_str());
+    return AddressResolve::ResolveByNameCore(image, nameCopy.c_str());
 }
 
 // ==== ResolveByRvaExImpl ====
@@ -410,7 +412,7 @@ void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImag
     }
     uintptr_t sectionRva = 0;
     size_t sectionSize = 0;
-    if (!SymbolResolve::ResolveSectionRva(image, sectionName, &sectionRva, &sectionSize)) {
+    if (!AddressResolve::ResolveSectionRva(image, sectionName, &sectionRva, &sectionSize)) {
         Logger::Log("ResolveByRvaEx: section %s not found image=%u",
             sectionName, static_cast<unsigned>(image));
         return nullptr;
@@ -437,7 +439,7 @@ void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSe
     }
     lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
     PluginBoundary::LoaderLockScope pbLockScope;
-    return SymbolResolve::ResolveByPatternCore(image, patternCopy.c_str(), section, index);
+    return AddressResolve::ResolveByPatternCore(image, patternCopy.c_str(), section, index);
 }
 
 // ==== ResolveByVTableImpl ====
@@ -457,10 +459,10 @@ void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbolIn, uint32_
     }
     lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
     PluginBoundary::LoaderLockScope pbLockScope;
-    return SymbolResolve::ResolveByVTableCore(image, symbolCopy.c_str(), index);
+    return AddressResolve::ResolveByVTableCore(image, symbolCopy.c_str(), index);
 }
 
-}  // namespace SymbolResolve
+}  // namespace AddressResolve
 
 // ---------------- LoaderCore 入口（声明在 LoaderCore.h） ----------------
 // 这三个是 Loader 自身用的入口，母体与其他 TU 都按 LoaderCore:: 调用。
@@ -476,7 +478,7 @@ HookImageId LoaderCore::CurrentExeImage() {
 // Loader 内部解 exe 全局数据槽：算法与 common/HookAPI.h 的 ResolveDataByAob 完全相同，
 // 只是走无锁内部表。供 LoaderHooks / UiInject 使用。
 void* LoaderCore::ResolveDataByAobCore(HookImageId image, const char* aob, uint32_t index) {
-    return ResolveDataByAob(SymbolResolve::InternalToolApi(), image, aob, index);
+    return ResolveDataByAob(AddressResolve::InternalToolApi(), image, aob, index);
 }
 
 void* LoaderCore::ResolveExeTarget(const HookInfoExe& info, size_t span) {
@@ -485,8 +487,8 @@ void* LoaderCore::ResolveExeTarget(const HookInfoExe& info, size_t span) {
     if (image == kHookImageInvalid) return nullptr;
     const HookInfo& entry = (image == kHookImageExeDx12) ? info.dx12 : info.dx11;
     const bool haveContext = PdataMatch::HasContext(image);
-    if (haveContext || SymbolResolve::ExeMatchesAnchor(image)) {
-        if (void* p = ResolveByHookInfo(SymbolResolve::InternalToolApi(), image, entry, span)) return p;
+    if (haveContext || AddressResolve::ExeMatchesAnchor(image)) {
+        if (void* p = ResolveByHookInfo(AddressResolve::InternalToolApi(), image, entry, span)) return p;
         Logger::Log("ResolveExeTarget: image=%u kind=%d unresolved (rva=0x%llX aob=%s)",
             static_cast<unsigned>(image), static_cast<int>(entry.kind),
             static_cast<unsigned long long>(entry.kind == kHookInfoRva ? entry.u.rva : 0),
@@ -496,7 +498,7 @@ void* LoaderCore::ResolveExeTarget(const HookInfoExe& info, size_t span) {
     Logger::Log("ResolveExeTarget: [WARN] image=%u no symbol DB and PE identity != anchor; "
                 "RVA path skipped, AOB fallback only", static_cast<unsigned>(image));
     if (entry.aob && *entry.aob) {
-        return SymbolResolve::InternalToolApi()->ResolveByPattern(
+        return AddressResolve::InternalToolApi()->ResolveByPattern(
             image, entry.aob, kSectionText, entry.index);
     }
     return nullptr;

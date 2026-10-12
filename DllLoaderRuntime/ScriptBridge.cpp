@@ -25,7 +25,7 @@
 #include "PluginTableAccess.h"
 #include "ProxyTypes.h"
 #include "Runtime.h"
-#include "SymbolResolve.h"
+#include "AddressResolve.h"
 #include "TeardownWindow.h"
 #include "HookEngine.h"        // InstallLoaderDetourOnSite
 #include "../common/Logger.h"
@@ -258,7 +258,7 @@ static int32_t GameEventReadInt32Safe(const void* addr) {
 static void* GetCurrentGameSlot() {
     if (!g_gameEventContainerHit ||
             !ImageAddress::Contains(kHookImageGameCoreXP2, g_gameEventContainerHit)) {
-        g_gameEventContainerHit = SymbolResolve::ResolveByPatternCore(kHookImageGameCoreXP2,
+        g_gameEventContainerHit = AddressResolve::ResolveByPatternCore(kHookImageGameCoreXP2,
             kGameEventCurrentGamePattern, kSectionText, 1);
         if (!g_gameEventContainerHit) return nullptr;
     }
@@ -314,7 +314,7 @@ void* GetMainLuaStateImpl() {
             }
         }
         if (!slot) {
-            void* hit = SymbolResolve::ResolveByPatternCore(image, kLuaSingletonPattern, kSectionText, 1);
+            void* hit = AddressResolve::ResolveByPatternCore(image, kLuaSingletonPattern, kSectionText, 1);
             if (hit) {
                 g_mainLuaStateHit = hit;
                 const int32_t disp = GameEventReadInt32Safe(static_cast<const char*>(hit) + 3);
@@ -656,7 +656,7 @@ bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn) {
 void* ResolveCurrentGameCoreByName(const char* name) {
     const HookImageId image = ImageAddress::LoadedGameCore();
     if (image == kHookImageInvalid) return nullptr;
-    return SymbolResolve::ResolveByNameCore(image, name);
+    return AddressResolve::ResolveByNameCore(image, name);
 }
 
 // ==== SameLuaMethod ====

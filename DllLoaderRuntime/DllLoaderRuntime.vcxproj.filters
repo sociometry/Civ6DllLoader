@@ -72,7 +72,7 @@
     <ClCompile Include="HookLoaderApi.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="SymbolResolve.cpp">
+    <ClCompile Include="AddressResolve.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="PluginDomain.cpp">
@@ -140,7 +140,7 @@
     <ClInclude Include="Civ6MessageBus.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="SymbolResolve.h">
+    <ClInclude Include="AddressResolve.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="TeardownWindow.h">

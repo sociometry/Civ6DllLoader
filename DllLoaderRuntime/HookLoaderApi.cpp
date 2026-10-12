@@ -11,7 +11,7 @@
 #include "PluginRegistry.h"
 #include "PluginTableAccess.h"
 #include "ScriptBridge.h"
-#include "SymbolResolve.h"
+#include "AddressResolve.h"
 #include "PluginDomain.h"
 #include "../common/HookAPI.h"
 #include "../common/Logger.h"
@@ -39,12 +39,12 @@ static const HookAPI g_hookApi = {
 
     &PluginRegistry::IsImageLoadedImpl,
     &PluginRegistry::GetImageInfoImpl,
-    &SymbolResolve::ResolveByRvaImpl,
-    &SymbolResolve::ResolveByNameImpl,
-    &SymbolResolve::ResolveByRvaExImpl,
-    &SymbolResolve::ResolveByPatternImpl,
+    &AddressResolve::ResolveByRvaImpl,
+    &AddressResolve::ResolveByNameImpl,
+    &AddressResolve::ResolveByRvaExImpl,
+    &AddressResolve::ResolveByPatternImpl,
     &HookEngine::RegisterGlobalCaptureImpl,
-    &SymbolResolve::ResolveByVTableImpl,
+    &AddressResolve::ResolveByVTableImpl,
 
     &ScriptBridge::PushLuaMethodsImpl,
 
@@ -120,8 +120,8 @@ static const HookAPI g_hookApi = {
     &ScriptBridge::GetEngineUtilityImpl,
     &ScriptBridge::GetMainLuaStateImpl,
     &ScriptBridge::LuaPushNilImpl,
-    &SymbolResolve::GetSymbolDbStateImpl,
-    &SymbolResolve::GetSymbolDbMatchRatioImpl,
+    &AddressResolve::GetSymbolDbStateImpl,
+    &AddressResolve::GetSymbolDbMatchRatioImpl,
 };
 
 // ==== RuntimeHookApi ====

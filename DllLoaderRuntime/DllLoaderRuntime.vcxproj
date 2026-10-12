@@ -154,7 +154,7 @@
     </ClCompile>
     <ClCompile Include="PluginRegistry.cpp" />
     <ClCompile Include="HookLoaderApi.cpp" />
-    <ClCompile Include="SymbolResolve.cpp" />
+    <ClCompile Include="AddressResolve.cpp" />
     <ClCompile Include="PluginDomain.cpp" />
     <ClCompile Include="ScriptBridge.cpp" />
     <ClCompile Include="HookEngine.cpp" />

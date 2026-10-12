@@ -19,7 +19,7 @@
 #include "PluginDomain.h"
 #include "Runtime.h"
 #include "ScriptBridge.h"      // WaitForDetourDrain / ResetForTeardown
-#include "SymbolResolve.h"
+#include "AddressResolve.h"
 #include "TeardownWindow.h"
 #include "../common/Logger.h"
 
