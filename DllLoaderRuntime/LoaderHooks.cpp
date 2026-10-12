@@ -1,7 +1,6 @@
 // LoaderHooks.cpp — Civ6DllLoader v2 游戏内 hook 安装。
 //
-// 安装 2 个 MinHook detour（证据见 docs/analysis/LoadDLL_analysis.md，编排见
-// docs/ARCHITECTURE.md §2.2）：
+// 安装 2 个 MinHook detour（编排见 docs/ARCHITECTURE.md §2.2）：
 //   - GameCore::LoadDLL            （阶段 B：接管 GameCore 加载）
 //   - GameCore::UnloadDLL          （阶段 B 收尾：卸 GameCore 前先卸插件）
 // Global 插件仅启动时加载一次；主菜单开关 Mod 需重启才生效（不再挂 lEnableMod/lDisableMod 钩）。
@@ -9,7 +8,6 @@
 //
 // exe 域取址：双版本 HookInfoExe（DX11 / DX12 各自的 RVA + 唯一 AOB），运行时按当前 exe
 // 自动选取；RVA 走 pdata 矫正，AOB 作兜底（common/HookAPI.h 的 ResolveByHookInfoExe）。
-// 数据槽（hModule）用 ResolveDataByAob 从 RIP 相对指令解出，不写数据地址。
 // 入口特征码仍由本文件持有，作为"地址正确性"的硬门。
 
 #include "pch.h"
@@ -47,9 +45,6 @@ constexpr HookInfoExe kExeGetConfiguration = { HookRva(0x100390, kAob_GetConfigu
 // 无法用内容唯一区分 -> 用 HookInfo.index 选升序命中表里的第 2 个（两版 exe 都是第 2 个）。
 constexpr char kAob_GetRuleSet[] = "48 83 EC 28 48 8B 89 88 00 00 00 8B 15 ?? ?? ?? ?? 48 8B 01 FF 50 68 8B 48 14 C1 E9 1D F6 C1 01 74 ?? 66 83 38 05 75 ?? 48 8B 40 08 48 83 C4 28 C3 33 C0 48 83 C4 28 C3";
 constexpr HookInfoExe kExeGetRuleSet = { HookRva(0x100F40, kAob_GetRuleSet, 2), HookRva(0x101890, kAob_GetRuleSet, 2) };
-
-// 数据槽：| 分指令段，xx = disp32，用 ResolveDataByAob 解出全局地址
-constexpr char kAob_hModule[] = "48 81 EC 48 02 00 00 | 48 83 3D xx xx xx xx 00 | 74 0A 32 C0 48 81 C4 48 02 00 00";
 
 // 入口特征码（定义在后面；GetRuleSetName 先用到）
 bool CheckGetConfigurationSignature(uintptr_t addr);
@@ -293,18 +288,11 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
             Logger::Log("InitializeGameCorePhase failed; GameCore plugins not loaded");
         }
     } else {
-        // 区分幂等短路与真失败：读 exe 全局 hModule 槽（由 RIP 相对指令解出，不写数据地址）。
-        const uintptr_t hModAddr = reinterpret_cast<uintptr_t>(
-            LoaderCore::ResolveDataByAobCore(ExeImage(), kAob_hModule));
-        HMODULE* hMod = reinterpret_cast<HMODULE*>(hModAddr);
-        if (hMod && *hMod != nullptr) {
-            Logger::Log("LoadDLL idempotent short-circuit; (re)initializing plugins against loaded module");
-            if (LoaderCore::InitializeGameCorePhase()) {
-                LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::GameCore);
-            }
-        } else {
-            Logger::Log("LoadDLL failed to load GameCore (game will report its own error)");
-        }
+        // 引擎侧 LoadDLL 返回 0 只可能是真失败：唯一调用者 AppModdingFramework::LoadGameCore
+        // 在调用前必定先 UnloadDLL（hModule 已置空），且路径相同的幂等请求在更上层就已短路返回 1、
+        // 根本进不到这里；加载失败后引擎既不建 GameContext 也不重试，自己会报错并终止初始化。
+        // 无映像可挂钩，加载插件只会撞空上下文，因此这里只记日志。
+        Logger::Log("LoadDLL returned 0 (GameCore image not loaded); GameCore plugins not loaded");
     }
     return result;
 }

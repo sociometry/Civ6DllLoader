@@ -46,6 +46,9 @@ tools/out/
 # Local leftovers
 example1.log
 
+# 审查报告（本地工作稿，不入版本管理）
+AUDIT_REPORT.md
+
 # third_party：保留 sqlite、hde、lzma；asmjit_src 仅保留 asmjit 子目录，其余不纳入版本管理
 third_party/*
 !third_party/sqlite/

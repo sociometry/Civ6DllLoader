@@ -1394,8 +1394,6 @@ FUNC_TARGETS = [
 
 # 数据槽：(名字, AOB) —— | 分段，xx 标 disp32
 DATA_SLOTS = [
-    ("hModule",
-     "48 81 EC 48 02 00 00 | 48 83 3D xx xx xx xx 00 | 74 0A 32 C0 48 81 C4 48 02 00 00"),
     ("UIManager",
      "48 8B 0D xx xx xx xx | E8 ?? ?? ?? ?? 48 89 87 30 02 00 00"),
 ]
