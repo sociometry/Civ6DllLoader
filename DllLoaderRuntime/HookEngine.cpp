@@ -652,6 +652,21 @@ bool RegisterGlobalCaptureImpl(void* providerAddress, uint32_t paramIndex, void*
     return RegisterGlobalCaptureCore(providerAddress, paramIndex, out, owner->ownerId);
 }
 
+// ---------------- 站点捕获槽退役（只拔插槽，绝不物理脱钩） ----------------
+// 两个失效场景：
+//  1) GameCore 重载：目标位于旧 GameCore 映像内，重载后地址失效，清空落在当前 GameCore
+//     映像内的捕获订阅（ResetForReload 调用 CleanupAllCaptureSites），等插件下次 OnLoad
+//     自行重新注册；exe / 常驻模块域上的订阅与重载无关，保留；
+//  2) 插件卸载：捕获槽的 out 指向插件内存，卸载后悬空（UnloadPluginByOwnerId 调用
+//     CleanupCaptureSitesForOwner）。
+// 硬约束：这里【只】清空 captureOuts / 翻转 hasCapture，绝不 MH_RemoveHook、绝不
+// g_captureRuntime.release、绝不 g_hookSites.erase。站点 / stub / MinHook trampoline
+// 全程存活，只在进程退出时随静态对象回收。本段锁序与注册路径一致（MinHook -> capture）：
+// 站点表结构由 MinHook 站点锁保护，capture 字段是它内层的派发侧数据，两把锁都取、
+// 顺序恒定，因此不会与注册路径成环。
+// CaptureDispatch 在同一把 g_captureMutex 下复查 hasCapture/retiring/空 outs：陈旧读到
+// hasCapture=1 时因 outs 已清空而被兜住。
+
 // ==== CleanupAllCaptureSites ====
 // 只清 GameCore 域：GameCore 映像随对局重载而换地址，它的站点订阅必须随代际重注册；
 // exe / 其它常驻模块域上的站点（例如 Global 插件挂在 user32 上的 capture）永不失效，
@@ -718,6 +733,7 @@ void CleanupCaptureSitesForOwner(const std::wstring& owner) {
     Logger::Log("CleanupCaptureSitesForOwner: owner=%ls removed=%zu out(s) emptied=%zu site(s) "
                 "(no physical unhook)", owner.c_str(), removed, emptied);
 }
+
 
 // ==== DisableGameCoreDomainSites ====
 // 第 1 步：把「GameCore 域（当前已加载映像 或 正在拆除的区间）+ 已挂钩」的站点批量停用。
@@ -862,3 +878,10 @@ void RemoveGameCoreDomainSiteRecords(
 }
 
 }  // namespace HookEngine
+
+// ---------------- LoaderCore 入口（不在 namespace 内） ----------------
+// teardown 窗口的清零点：由 LoaderHooks 的两个 detour 在引擎原函数返回之后调用。
+// 见 ARCHITECTURE §2.3 第 9 步：窗口必须在引擎 LoadDLL/UnloadDLL 真正换映像之后才失效。
+void LoaderCore::ClearGameCoreTeardownWindow() {
+    LoaderCore::Teardown::ClearWindow();
+}

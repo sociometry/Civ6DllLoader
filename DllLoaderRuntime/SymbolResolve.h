@@ -36,8 +36,18 @@ void* ResolveByPatternCore(HookImageId image, const char* pattern, HookImageSect
 void* ResolveByVTableCore(HookImageId image, const char* vtableSymbol, uint32_t index);
 
 // 符号库状态查询（转发 PdataMatch 的匹配状态/匹配率）。
-// 【为什么必须导出】：母体里的 g_hookApi 初始化表取这两个函数的地址。
+// 【为什么必须导出】：g_hookApi 初始化表取这两个函数的地址。
 HookApiSymbolDbState GetSymbolDbStateImpl(HookImageId image);
 double GetSymbolDbMatchRatioImpl(HookImageId image);
+
+// ---------------- 插件侧入口（阶段 6 从母体归位） ----------------
+// 它们先过 PluginDomain 的归属/域门，再调上面的 *Core；是 HookAPI 表的目标。
+// 签名与实现逐字一致（从源码提取）。
+void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span);
+void* ResolveByNameImpl(HookImageId image, const char* name);
+void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImageSection section);
+void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSection section,
+    uint32_t index);
+void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbolIn, uint32_t index);
 
 }  // namespace SymbolResolve

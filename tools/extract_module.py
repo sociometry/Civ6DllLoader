@@ -44,17 +44,16 @@ PHASE_MODULE = {
     4: "ScriptBridge",
     5: "HookEngine",
     6: "PluginRegistry",
+    7: "SymbolResolve",     # §4.5：5 个缓迁 *Impl 归位（追加到已有 SymbolResolve.cpp）
+    8: "HookLoaderApi",
 }
 
 # 某些代码块不属于任何函数，但必须随指定函数一起走。
 # 格式：模块 -> [(锚点函数名, 起始行, 结束行, 说明)]
 # 健壮性由 _verify_extra() 保证：行内容与预期不符就报错而不是盲删。
 EXTRA_BLOCKS = {
-    "SymbolResolve": [
-        ("ExeMatchesAnchor", 3353, 3365,
-         "exe 版本锚常量（匿名 namespace）+ 其上方 7 行注释；"
-         "这四个常量只被 ExeMatchesAnchor 使用"),
-    ],
+    # 阶段 1 已把 anchor 常量随 ExeMatchesAnchor 一起搬走（那时它还在这张表里）。
+    # 阶段 7 再迁 5 个 *Impl 时不需要附加块 —— 保留空表以免旧条目误触发。
 }
 
 
@@ -72,6 +71,7 @@ def _verify_extra(lines, start, end, expect_substrings):
 ALREADY_REFACTORED = {
     "ResolvePluginOwnerForAddress",   # -> PluginRegistry::ResolveOwnerByModule（阶段 2）
 }
+
 
 
 def functions_of(module):

@@ -152,7 +152,8 @@
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
-    <ClCompile Include="Civ6DLLHookLoaderAPI.cpp" />
+    <ClCompile Include="PluginRegistry.cpp" />
+    <ClCompile Include="HookLoaderApi.cpp" />
     <ClCompile Include="SymbolResolve.cpp" />
     <ClCompile Include="PluginDomain.cpp" />
     <ClCompile Include="ScriptBridge.cpp" />

@@ -307,6 +307,16 @@ _assign("Civ6MessageBus", """
 BroadcastMessageImpl SendMessageToImpl
 """)
 
+# 阶段 2/4 新增的门面实现：归 PluginRegistry
+_assign("PluginRegistry", """
+LifecycleMutex IsOwnerActive ResolveOwnerByModule
+""")
+
+# §4.5：5 个缓迁 *Impl 在阶段 6 归入 SymbolResolve（此前留在母体避开 C 依赖）
+_assign("SymbolResolve", """
+ResolveByRvaImpl ResolveByNameImpl ResolveByRvaExImpl ResolveByPatternImpl ResolveByVTableImpl
+""")
+
 _assign("HookLoaderApi", """
 VerifyHookApiTableProtection RuntimeHookApi
 """)

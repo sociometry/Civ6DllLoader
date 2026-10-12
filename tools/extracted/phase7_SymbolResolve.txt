@@ -1,0 +1,107 @@
+// ==== ResolveByRvaImpl ====
+// 插件入口：参数全是标量（没有需要锁外抄写的插件内存），只需加锁。
+void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
+    // 地址开放性门：调用方类别 × 解析目标映像域（本入口没有 loader 内部调用者，内部走 *Core）。
+    auto caller = PluginDomain::RequirePluginOwner(_ReturnAddress(), "ResolveByRva");
+    if (!caller || !PluginDomain::IsImageOpenToCaller(caller->category, image, "ResolveByRva")) return nullptr;
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return SymbolResolve::ResolveByRvaCore(image, rva, span);
+}
+
+// ==== ResolveByNameImpl ====
+void* ResolveByNameImpl(HookImageId image, const char* name) {
+    // 地址开放性门（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    auto caller = PluginDomain::RequirePluginOwner(_ReturnAddress(), "ResolveByName");
+    if (!caller || !PluginDomain::IsImageOpenToCaller(caller->category, image, "ResolveByName")) return nullptr;
+    if (!name || !*name) return nullptr;
+
+    // name 是插件内存：锁外先抄进 Loader 自有 string，锁内只碰副本
+    // （PdataMatch 查表与日志都读它）。坏指针在这里失败，此时没有任何锁被持有。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(name, nameCopy) || nameCopy.empty()) {
+        Logger::Log("ResolveByName rejected: name pointer unreadable");
+        return nullptr;
+    }
+
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return SymbolResolve::ResolveByNameCore(image, nameCopy.c_str());
+}
+
+// ==== ResolveByRvaExImpl ====
+void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImageSection section) {
+    // 地址开放性门：调用方类别 × 解析目标映像域。
+    auto caller = PluginDomain::RequirePluginOwner(_ReturnAddress(), "ResolveByRvaEx");
+    if (!caller || !PluginDomain::IsImageOpenToCaller(caller->category, image, "ResolveByRvaEx")) return nullptr;
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    if (section == kSectionImage) {
+        // 不修正：镜像相对 RVA 直接解析（供已按新映像坐标算好的调用方使用）。
+        return ImageAddress::ResolveByRva(image, rva, span);
+    }
+    const char* sectionName = nullptr;
+    switch (section) {
+        case kSectionText:  sectionName = ".text";  break;
+        case kSectionIdata: sectionName = ".idata"; break;
+        case kSectionRdata: sectionName = ".rdata"; break;
+        case kSectionData:  sectionName = ".data";  break;
+        default: break;
+    }
+    if (!sectionName) {
+        Logger::Log("ResolveByRvaEx: unknown section=%d image=%u rva=0x%llX span=%zu",
+            static_cast<int>(section), static_cast<unsigned>(image),
+            static_cast<unsigned long long>(rva), span);
+        return nullptr;
+    }
+    uintptr_t sectionRva = 0;
+    size_t sectionSize = 0;
+    if (!SymbolResolve::ResolveSectionRva(image, sectionName, &sectionRva, &sectionSize)) {
+        Logger::Log("ResolveByRvaEx: section %s not found image=%u",
+            sectionName, static_cast<unsigned>(image));
+        return nullptr;
+    }
+    return ImageAddress::ResolveByRva(image, sectionRva + rva, span);
+}
+
+// ==== ResolveByPatternImpl ====
+void* ResolveByPatternImpl(HookImageId image, const char* patternIn, HookImageSection section,
+    uint32_t index) {
+    // 地址开放性门（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    auto caller = PluginDomain::RequirePluginOwner(_ReturnAddress(), "ResolveByPattern");
+    if (!caller || !PluginDomain::IsImageOpenToCaller(caller->category, image, "ResolveByPattern")) return nullptr;
+    if (!patternIn || !*patternIn) {
+        Logger::Log("ResolveByPattern: empty pattern");
+        return nullptr;
+    }
+    // pattern 是插件内存：锁外抄写（原实现在锁内逐字节遍历它，一个没有结尾符的指针
+    // 会一路读到出错 -> lock_guard 不析构 -> 锁永久泄漏），锁内只碰副本。
+    std::string patternCopy;
+    if (!PluginBoundary::CopyCString(patternIn, patternCopy) || patternCopy.empty()) {
+        Logger::Log("ResolveByPattern rejected: pattern pointer unreadable");
+        return nullptr;
+    }
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return SymbolResolve::ResolveByPatternCore(image, patternCopy.c_str(), section, index);
+}
+
+// ==== ResolveByVTableImpl ====
+void* ResolveByVTableImpl(HookImageId image, const char* vtableSymbolIn, uint32_t index) {
+    // 地址开放性门（RequirePluginOwner 只做模块归属查询，不解引用插件指针）。
+    auto caller = PluginDomain::RequirePluginOwner(_ReturnAddress(), "ResolveByVTable");
+    if (!caller || !PluginDomain::IsImageOpenToCaller(caller->category, image, "ResolveByVTable")) return nullptr;
+    if (!vtableSymbolIn || !*vtableSymbolIn) {
+        Logger::Log("ResolveByVTable rejected: empty vtable symbol");
+        return nullptr;
+    }
+    // vtableSymbol 是插件内存：锁外抄写（锁内会被 PdataMatch 查表与日志反复读取）。
+    std::string symbolCopy;
+    if (!PluginBoundary::CopyCString(vtableSymbolIn, symbolCopy) || symbolCopy.empty()) {
+        Logger::Log("ResolveByVTable rejected: symbol pointer unreadable");
+        return nullptr;
+    }
+    lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
+    PluginBoundary::LoaderLockScope pbLockScope;
+    return SymbolResolve::ResolveByVTableCore(image, symbolCopy.c_str(), index);
+}
+
