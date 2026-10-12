@@ -8,6 +8,7 @@
 //
 // exe 域取址：双版本 HookInfoExe（DX11 / DX12 各自的 RVA + 唯一 AOB），运行时按当前 exe
 // 自动选取；RVA 走 pdata 矫正，AOB 作兜底（common/HookAPI.h 的 ResolveByHookInfoExe）。
+// 数据槽（hModule）用 ResolveDataByAob 从 RIP 相对指令解出，不写数据地址。
 // 入口特征码仍由本文件持有，作为"地址正确性"的硬门。
 
 #include "pch.h"
@@ -46,6 +47,9 @@ constexpr HookInfoExe kExeGetConfiguration = { HookRva(0x100390, kAob_GetConfigu
 constexpr char kAob_GetRuleSet[] = "48 83 EC 28 48 8B 89 88 00 00 00 8B 15 ?? ?? ?? ?? 48 8B 01 FF 50 68 8B 48 14 C1 E9 1D F6 C1 01 74 ?? 66 83 38 05 75 ?? 48 8B 40 08 48 83 C4 28 C3 33 C0 48 83 C4 28 C3";
 constexpr HookInfoExe kExeGetRuleSet = { HookRva(0x100F40, kAob_GetRuleSet, 2), HookRva(0x101890, kAob_GetRuleSet, 2) };
 
+// 数据槽：| 分指令段，xx = disp32，用 ResolveDataByAob 解出全局地址
+constexpr char kAob_hModule[] = "48 81 EC 48 02 00 00 | 48 83 3D xx xx xx xx 00 | 74 0A 32 C0 48 81 C4 48 02 00 00";
+
 // 入口特征码（定义在后面；GetRuleSetName 先用到）
 bool CheckGetConfigurationSignature(uintptr_t addr);
 bool CheckGetRuleSetSignature(uintptr_t addr);
@@ -62,7 +66,20 @@ typedef char(__fastcall* UnloadDllFn)();                  // GameCore::UnloadDLL
 // ---- 匿名命名空间状态 ----
 LoadDllFn g_origLoadDLL = nullptr;
 UnloadDllFn g_origUnloadDLL = nullptr;
+HMODULE* g_engineModuleSlot = nullptr; // 在入口改写前解析，exe 生命周期内地址稳定
+bool g_unloadIncomplete = false;      // 引擎尚未完成上一次卸载，不重启插件
 wchar_t g_officialPath[260] = {};  // Loader 自有缓冲：官方 GameCore 绝对路径（不改调用者栈缓冲）
+
+static bool ReadEngineModule(HMODULE& module) {
+    module = nullptr;
+    __try {
+        if (!g_engineModuleSlot) return false;
+        module = *g_engineModuleSlot;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 // 进程 exe 所在目录（去文件名段）。失败返回空串。
 std::wstring GetExeDir() {
@@ -267,32 +284,19 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
         target = g_officialPath;  // 官方 DLL（文件存在才改写；否则透传原路径）
     }
 
-    // 兜底：正常时序下 UnloadDLL detour 已在更早清场（映像卸载前）；此处防御
-    // UnloadDLL hook 未安装/未生效的情况（IsInitialized 仍为 true 意味着没人清场）。
-    if (LoaderCore::IsInitialized()) {
-        Logger::Log("LoadDLL re-entry: resetting GameCore phase (UnloadDLL hook missed?)");
-        LoaderCore::ResetForReload();
+    // 非空 hModule 会让原函数直接返回 0；保留当前插件和 Lua 闭包。
+    // 清理和释放只能由配套的 UnloadDLL detour 发起，LoadDLL 返回本身不是卸载屏障。
+    const char result = g_origLoadDLL(target);
+    if (LoaderCore::IsInitialized() || g_unloadIncomplete) return result;
+    HMODULE loaded = nullptr;
+    if (!ReadEngineModule(loaded) || !loaded) {
+        Logger::Log("LoadDLL: no confirmed GameCore module; plugins not loaded");
+        return result;
     }
-
-    char result = g_origLoadDLL(target);  // 调原函数（已 hook 前 snapshot，MinHook trampoline）
-    // 引擎这一步才真正换映像：此刻旧的 teardown 窗口（旧映像区间）使命结束，可以清。
-    // 清早了会把"仍映射着的旧映像"重新变成 Global 插件可钩的目标（见 §2.3 第 9 步）。
-    LoaderCore::ClearGameCoreTeardownWindow();
-    // 这次调用可能顺带卸掉了旧的 GameCore（连同 gamecore Lua 环境）：此刻才释放排队中的
-    // 插件模块（重入兜底路径下，ResetForReload 也会把待卸模块入队）。
-    LoaderCore::FreePendingPluginModules();
-    if (result != 0) {
-        if (LoaderCore::InitializeGameCorePhase()) {
-            LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::GameCore);
-        } else {
-            Logger::Log("InitializeGameCorePhase failed; GameCore plugins not loaded");
-        }
+    if (LoaderCore::InitializeGameCorePhase()) {
+        LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::GameCore);
     } else {
-        // 引擎侧 LoadDLL 返回 0 只可能是真失败：唯一调用者 AppModdingFramework::LoadGameCore
-        // 在调用前必定先 UnloadDLL（hModule 已置空），且路径相同的幂等请求在更上层就已短路返回 1、
-        // 根本进不到这里；加载失败后引擎既不建 GameContext 也不重试，自己会报错并终止初始化。
-        // 无映像可挂钩，加载插件只会撞空上下文，因此这里只记日志。
-        Logger::Log("LoadDLL returned 0 (GameCore image not loaded); GameCore plugins not loaded");
+        Logger::Log("InitializeGameCorePhase failed; GameCore plugins not loaded");
     }
     return result;
 }
@@ -306,14 +310,21 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
 // 里才拆掉的，而 Lua 表里可能还留着指向插件映像的闭包 -> 排到原函数返回之后再 Free
 // （见 LoaderCore::FreePendingPluginModules）。
 static char __fastcall UnloadDllDetour() {
+    HMODULE before = nullptr;
+    const bool hadModule = ReadEngineModule(before) && before != nullptr;
+    if (hadModule || LoaderCore::IsInitialized()) g_unloadIncomplete = true;
     if (LoaderCore::IsInitialized()) {
         Logger::Log("UnloadDLL: resetting GameCore phase (unloading plugins before core unload)");
         LoaderCore::ResetForReload();
     }
     const char result = g_origUnloadDLL();
-    // 引擎已卸掉 GameCore 映像：teardown 窗口（旧映像区间）可以清了（§2.3 第 9 步）。
-    LoaderCore::ClearGameCoreTeardownWindow();
-    LoaderCore::FreePendingPluginModules();   // 引擎已卸掉 GameCore 及其 Lua 环境
+    HMODULE after = nullptr;
+    if (hadModule && ReadEngineModule(after) && !after) {
+        // 必须观察到原卸载函数把非空槽清零；空操作/失败不能释放 Lua 仍可能引用的 DLL。
+        LoaderCore::ClearGameCoreTeardownWindow();
+        LoaderCore::FreePendingPluginModules();
+        g_unloadIncomplete = false;
+    }
     return result;
 }
 
@@ -358,33 +369,6 @@ bool LoaderHooks::InstallAll() {
         return false;
     };
 
-    // 可选 hook 的统一安装事务：失败只放弃这一个并记日志，**不连坐**已装好的钩子。
-    // 关键点：一个可选 hook（UnloadDLL）的签名或启用失败，
-    // 绝不该把核心的 LoadDLL 钩子一起回滚掉 —— 原实现在这里 return rollback(...)，
-    // 等于"丢一个可选功能 = 丢全部功能"。
-    const auto installOptional = [&](const char* name, uintptr_t addr,
-                                     bool (*check)(uintptr_t), void* detour, void** original) {
-        if (!addr || !check(addr)) {
-            Logger::Log("%s signature mismatch; hook skipped (addr=0x%llX)", name,
-                static_cast<unsigned long long>(addr));
-            return;
-        }
-        MH_STATUS s = MH_CreateHook(reinterpret_cast<LPVOID>(addr), detour,
-            reinterpret_cast<LPVOID*>(original));
-        if (s != MH_OK) {
-            Logger::Log("%s MH_CreateHook failed: %s", name, MH_StatusToString(s));
-            return;
-        }
-        s = MH_EnableHook(reinterpret_cast<LPVOID>(addr));
-        if (s != MH_OK) {
-            Logger::Log("%s MH_EnableHook failed: %s", name, MH_StatusToString(s));
-            MH_RemoveHook(reinterpret_cast<LPVOID>(addr));  // 摘掉半成品记录，避免下次 ALREADY_CREATED
-            return;
-        }
-        createdHooks.push_back(reinterpret_cast<LPVOID>(addr));
-        Logger::Log("%s hook installed at 0x%llX", name, static_cast<unsigned long long>(addr));
-    };
-
     // ---- LoadDLL（RVA 0xF8510 / 0xF8850，AOB 兜底）----
     const uintptr_t loadDllAddr = reinterpret_cast<uintptr_t>(
         LoaderCore::ResolveExeTarget(kExeLoadDLL, 1));
@@ -393,25 +377,34 @@ bool LoaderHooks::InstallAll() {
             static_cast<unsigned long long>(loadDllAddr), GetLastError());
         return rollback("LoadDLL validation failed");
     }
+    const uintptr_t unloadDllAddr = reinterpret_cast<uintptr_t>(
+        LoaderCore::ResolveExeTarget(kExeUnloadDLL, 1));
+    if (!unloadDllAddr || !CheckUnloadDllSignature(unloadDllAddr)) {
+        return rollback("UnloadDLL validation failed (required for plugin lifetime)");
+    }
+    // 这个 AOB 包含 LoadDLL 的入口，必须在 MH_Enable/ApplyQueued 改写它之前解析。
+    g_engineModuleSlot = static_cast<HMODULE*>(
+        LoaderCore::ResolveDataByAobCore(exeImage, kAob_hModule));
+    if (!Runtime::IsReadableSpan(g_engineModuleSlot, sizeof(HMODULE))) {
+        g_engineModuleSlot = nullptr;
+        return rollback("GameCore module slot unavailable");
+    }
     if ((st = MH_CreateHook((LPVOID)loadDllAddr, &LoadDllDetour, (LPVOID*)&g_origLoadDLL))
             != MH_OK) {
         Logger::Log("LoadDLL MH_CreateHook failed: %s", MH_StatusToString(st));
         return rollback("LoadDLL create failed");
     }
     createdHooks.push_back((LPVOID)loadDllAddr);
-    if ((st = MH_EnableHook((LPVOID)loadDllAddr)) != MH_OK) {
-        Logger::Log("LoadDLL MH_EnableHook failed: %s", MH_StatusToString(st));
-        return rollback("LoadDLL enable failed");
+    if ((st = MH_CreateHook((LPVOID)unloadDllAddr, &UnloadDllDetour,
+            (LPVOID*)&g_origUnloadDLL)) != MH_OK) {
+        return rollback("UnloadDLL create failed");
     }
-    Logger::Log("LoadDLL hook installed at 0x%llX",
-        static_cast<unsigned long long>(loadDllAddr));
-
-    // ---- UnloadDLL（RVA 0xF8E30 / 0xF9170，AOB 兜底；可选）----
-    installOptional("UnloadDLL",
-        reinterpret_cast<uintptr_t>(LoaderCore::ResolveExeTarget(kExeUnloadDLL, 1)),
-        &CheckUnloadDllSignature, reinterpret_cast<void*>(&UnloadDllDetour),
-        reinterpret_cast<void**>(&g_origUnloadDLL));
-
-    Logger::Log("InstallAll: %zu hook(s) installed (LoadDLL is the required one)", createdHooks.size());
+    createdHooks.push_back((LPVOID)unloadDllAddr);
+    // 两个 original 和 hModule 槽都备好后一次启用，避免只有加载钩工作的窗口。
+    if (MH_QueueEnableHook((LPVOID)loadDllAddr) != MH_OK ||
+        MH_QueueEnableHook((LPVOID)unloadDllAddr) != MH_OK || MH_ApplyQueued() != MH_OK) {
+        return rollback("LoadDLL/UnloadDLL enable failed");
+    }
+    Logger::Log("InstallAll: LoadDLL + UnloadDLL installed; module slot=%p", g_engineModuleSlot);
     return true;
 }
