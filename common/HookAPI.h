@@ -7,27 +7,13 @@
 
 // Plugin <-> Runtime HookAPI ABI.
 //
-// FROZEN PREFIX RULES (the backward-compatibility contract - read before touching HookAPI):
-//  1. Fields may only be APPENDED at the end of the HookAPI struct. Never reorder,
-//     never remove, never change the type or meaning of an existing field.
-//  2. A pure append does NOT bump CIV6_HOOK_API_VERSION. This is what keeps the loader
-//     forward compatible: an old plugin keeps using its prefix and never needs a rebuild
-//     just because the loader was updated.
-//  3. Bump CIV6_HOOK_API_VERSION only when the prefix must break (reorder / removal /
-//     semantic change). That is a deliberate breaking change and cannot be made compatible.
-//  4. Compatibility is decided by structSize (see HookAPI_IsCompatible), not by the version
-//     number: a plugin built from a newer header observes runtime structSize < its own
-//     sizeof(HookAPI) and must refuse to run. apiVersion only covers rule 3.
-//  5. Every plugin MUST call HookAPI_IsCompatible(api) at the top of OnLoad - see the example
-//     at the bottom of this header. It checks the header version and the struct size.
-//     The plugin KIND needs no call at all: this header emits a "Civ6PluginKind" export
-//     (low 32 = kind, high 32 = apiVersion) that the loader reads with GetProcAddress BEFORE
-//     calling OnLoad. A plugin built from an older header has no such export and is rejected
-//     before OnLoad - i.e. before any loader-mediated hook / patch / callback is registered.
-//     That is NOT the same as "its code never ran": LoadLibraryExW already ran the plugin's
-//     DllMain and CRT initializers, so a rejected module may already own threads or raw
-//     OS-level hooks. It is a trust boundary, not a safety guarantee. The kind
-//     gate at the bottom makes GameCore-only entries uncompilable in a Global plugin.
+// 【预发布阶段：没有任何存量插件需要兼容】删改这个表不升版本号——从未对外发布过插件，
+// 1 是 apiVersion 唯一出现过的值。首次对外发布之后若再破坏前缀，才需要递增版本号，
+// 并把配套的兼容约定补回来。
+//
+// 拒载插件 ≠ "它的代码没跑过"：LoadLibraryExW 已经执行过插件的 DllMain 与 CRT 初始化，
+// 所以被拒的模块可能已经持有线程或裸 OS 级钩子。这是一个信任边界，不是安全保证。
+// 文件尾部的类别门禁让 GameCore 专属入口在 Global 插件里编译期就报错。
 /* Loader 侧（非插件 TU）：DllLoaderRuntime 在 vcxproj 预处理宏里【显式】定义
    CIV6_HOOKAPI_BUILD_IMPL。没有它，Loader 那些包含 HookAPI.h 的 TU 会命中文件尾部的
    "必须声明插件类别" #error；插件工程不得定义它。（薄壳 DllLoader 不包含本头，也就不
@@ -177,7 +163,7 @@ typedef enum HookApiPushMethodsResult {
 } HookApiPushMethodsResult;
 
 typedef struct HookAPI {
-    uint32_t apiVersion;   // rule 2/3: appends do NOT bump this; only a breaking prefix change does.
+    uint32_t apiVersion;   // 预发布阶段恒为 1；删改前缀不升版本号（见文件头说明）
     uint32_t structSize;   // sizeof(HookAPI) of the *runtime*; plugins compare against their sizeof
 
     bool (*InstallHook)(void* targetFunc, void* detour, void** original);
@@ -344,7 +330,7 @@ typedef struct HookAPI {
 // True if this runtime can serve a plugin built from this header.
 // Call it once at the top of OnLoad and abort if it returns 0: the second test is the
 // append-only case (runtime table shorter than this plugin's header), the first is the
-// breaking-change case (rule 3). The plugin kind is NOT declared here - it travels in the
+// breaking-change case. The plugin kind is NOT declared here - it travels in the
 // Civ6PluginKind export emitted above, and the loader checks it before OnLoad.
 static inline int HookAPI_IsCompatible(const HookAPI* api) {
     if (!api) return 0;
