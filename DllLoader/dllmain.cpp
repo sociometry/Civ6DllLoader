@@ -71,8 +71,9 @@ extern "C" {
             return nullptr;
         }
 
-        // v2 shell: never starts the runtime. If the Loader (exe-dir version.dll)
-        // is missing, install it once from the highest-version enabled-mod runtime;
+        // v2 shell: never starts the runtime. If the Loader (exe-dir version.dll) is
+        // missing, install it once from the highest-version runtime found under the ModScan
+        // scan roots (no mod-enabled filter here: installation elects by version only);
         // either way this session passes through to the stock GameCore.
         if (ShellBootstrap::InstallLoaderIfMissing(g_hModule)) {
             Logger::Log("Loader present after installer (installed or already installed)");
@@ -263,7 +264,8 @@ extern "C" {
 #pragma comment(linker,"/export:?setGlobalMemoization@HksCompilerSettings@@QEAAXH@Z=GameCore_XP2_FinalRelease.?setGlobalMemoization@HksCompilerSettings@@QEAAXH@Z,@153")
 #pragma comment(linker,"/export:?setIntLiteralsEnabled@HksCompilerSettings@@QEAAXW4IntLiteralOptions@1@@Z=GameCore_XP2_FinalRelease.?setIntLiteralsEnabled@HksCompilerSettings@@QEAAXW4IntLiteralOptions@1@@Z,@154")
 // 注意：DllCreateGameContext / DllDestroyGameContext 由本模块自己实现（见文件顶部），
-// 不转发给官方 GameCore；官方导出表里的 155/156 号在这里留空。
+// 不转发给官方 GameCore。引擎按**名字**解析这两个入口（LoadLibrary + GetProcAddress），
+// 序号不参与——这里的 @155/@156 留空只是让导出表外形与官方一致，不是接口的一部分。
 #pragma comment(linker,"/export:EXP_GetTelemetrySessionHash=GameCore_XP2_FinalRelease.EXP_GetTelemetrySessionHash,@157")
 #pragma endregion
 

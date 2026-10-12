@@ -231,8 +231,17 @@ static bool KindToCategory(uint32_t kind, LoaderCore::PluginCategory& out) {
     return false;
 }
 
-static uintptr_t g_gameCoreTeardownAddress;
-static uint32_t g_gameCoreTeardownSizeOfImage;
+// teardown 窗口：写侧是游戏线程（ResetForReload / 两个 detour），读侧还有插件线程
+// （TargetInTearingDownGameCore），两个字段必须"成对生效"而不是各写各的裸变量。
+// 写序固定：先 size 再 address(release)；清零点：先 address(release) 再 size。
+// 读序固定：先 address(acquire)，非 0 才读 size。见 docs/ARCHITECTURE.md §2.1。
+static std::atomic<uintptr_t> g_gameCoreTeardownAddress{ 0 };
+static std::atomic<uint32_t> g_gameCoreTeardownSizeOfImage{ 0 };
+
+static void SetGameCoreTeardownWindow(uintptr_t base, uint32_t sizeOfImage) {
+    g_gameCoreTeardownSizeOfImage.store(sizeOfImage, std::memory_order_relaxed);
+    g_gameCoreTeardownAddress.store(base, std::memory_order_release);
+}
 
 struct PushTargetConfig {
     PushMethodSigType signature = PushMethodSigType::NoManager;
@@ -434,9 +443,11 @@ static bool IsRangeOpenToCaller(LoaderCore::PluginCategory caller, const void* t
 }
 
 static bool TargetInTearingDownGameCore(void* target) {
+    const uintptr_t base = g_gameCoreTeardownAddress.load(std::memory_order_acquire);
+    if (base == 0) return false;   // 窗口未进入（或已清）：size 不必读
+    const uint32_t sizeOfImage = g_gameCoreTeardownSizeOfImage.load(std::memory_order_relaxed);
     const uintptr_t p = reinterpret_cast<uintptr_t>(target);
-    return g_gameCoreTeardownAddress && p >= g_gameCoreTeardownAddress &&
-        p - g_gameCoreTeardownAddress < g_gameCoreTeardownSizeOfImage;
+    return p >= base && p - base < sizeOfImage;
 }
 
 // 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
@@ -732,9 +743,11 @@ static bool OverlapsHookPrologue(const void* target, size_t len) {
 // target 的统一站点（MinHook 只挂一次，挂到站点 stub）。同一 target 已有 Detour 时
 // 明确拒绝（Detour 槽独占）；Capture 槽可与之共存，挂载顺序无关。
 bool InstallHookImpl(void* target, void* detour, void** original) {
-    // target / original 都是插件内存：必须在取锁【之前】用页属性探测拦掉坏地址。
+    // target 是插件解析出来的【游戏代码地址】，original 是插件给自己的【输出槽】：
+    // 两者都是调用方传入的指针值，有效性无法假定，必须在取锁【之前】用页属性探测拦掉坏地址。
     // 否则 MinHook 读目标前导字节时出错，会把 g_pluginLifecycleMutex 与
     // Runtime::MinHookMutex() 一起泄漏（/EHsc 下 lock_guard 不析构 -> 永久死锁）。
+    // 注意：target 属于游戏模块，不是插件内存——判据是"这个指针值可不可信"，不是"它属于谁"。
     if (!PluginBoundary::IsReadable(target, PluginBoundary::kMinHookTargetSpan)) {
         Logger::Log("InstallHook rejected: target not readable %p (span=%zu)",
             target, PluginBoundary::kMinHookTargetSpan);
@@ -879,7 +892,15 @@ bool RegisterMessageHandlerImpl(MessageHandlerFn handler) {
 }
 
 void SendMessageToImpl(const char* pluginName, const char* topic, const void* data, size_t len) {
-    g_bus.SendTo(pluginName, topic, data, len);
+    // pluginName 是插件内存，而 SendTo 收 const std::string&：直接传进去会按 NUL 边界读它。
+    // MSVC 的 basic_string(const char*) 不检查空指针（直接 traits::length），空指针/野指针
+    // 都是一次裸 strlen。与其它字符串入口同一口径：锁外先抄进 Loader 自有存储。
+    std::string nameCopy;
+    if (!PluginBoundary::CopyCString(pluginName, nameCopy) || nameCopy.empty()) {
+        Logger::Log("SendMessageTo rejected: pluginName pointer unreadable or empty");
+        return;
+    }
+    g_bus.SendTo(nameCopy, topic, data, len);
 }
 
 bool IsImageLoadedImpl(HookImageId image) {
@@ -2232,8 +2253,9 @@ static void EnsureScriptHooksInstalled() {
 
 }  // namespace
 
-// 前置声明（定义于本文件后部）：隔离某 owner 的全部注册（OnLoad 失败 / 未声明插件类别 /
-// 回调崩溃），与 OnLoad 崩溃同构。
+// 前置声明（定义于本文件后部）：OnLoad 失败时隔离该 owner 的全部注册。
+// （未声明插件类别的模块在 OnLoad 之前就被拒载；消息回调崩溃由 Civ6MessageBus 的 SEH
+// 兜住并只记日志——两者都不走隔离。）
 static void QuarantinePluginByOwner(const std::wstring& ownerId);
 
 void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
@@ -2964,13 +2986,27 @@ void* EditPlayerImpl(int playerId) {
 //   ms_Hasher->m_table 就是标准反射表（多项式 0xEDB88320，init 0xFFFFFFFF）。
 // 官方写入里 `char i` 配合 (unsigned __int8)(a3 ^ i) 的截断，使 char 的符号扩展不生效，
 // 所以这里用 uint8_t 与之逐位一致。内化后不再解析 GameCore 符号：对局前也能算，也不受重载影响。
+// 单字节推进（8 轮反射多项式）：两个入口共用同一核，保证逐位一致。
+constexpr uint32_t CivCrc32Byte(uint32_t h, uint8_t b) {
+    h ^= b;
+    for (int i = 0; i < 8; ++i) {
+        h = (h & 1u) ? ((h >> 1) ^ 0xEDB88320u) : (h >> 1);
+    }
+    return h;
+}
+// NUL 结尾版（下面 static_assert 的编译期自检走这条）。
 constexpr uint32_t CivCrc32Raw(const char* str) {
     uint32_t h = 0xFFFFFFFFu;
     for (const char* p = str; p && *p; ++p) {
-        h ^= static_cast<uint8_t>(*p);
-        for (int i = 0; i < 8; ++i) {
-            h = (h & 1u) ? ((h >> 1) ^ 0xEDB88320u) : (h >> 1);
-        }
+        h = CivCrc32Byte(h, static_cast<uint8_t>(*p));
+    }
+    return h;
+}
+// 定长版：长度已由边界探针确定的路径走这条，不再做无界循环。
+constexpr uint32_t CivCrc32RawLen(const char* str, size_t len) {
+    uint32_t h = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        h = CivCrc32Byte(h, static_cast<uint8_t>(str[i]));
     }
     return h;
 }
@@ -2992,7 +3028,16 @@ static_assert(CivCrc32Raw("TERRA7")             == 0x16D22538u, "Civ CRC32 self-
 static_assert(CivCrc32Raw("NOTIFICATION_ADDED") == 0xF26F3ACFu, "Civ CRC32 self-check: NOTIFICATION_ADDED");
 
 uint32_t MakeHashImpl(const char* str) {
-    return str ? CivCrc32Raw(str) : 0;   // 空指针返回 0（官方实现会直接解引用）
+    if (!str) return 0;   // 空指针返回 0（官方实现会直接解引用）
+    // str 是插件内存：先按插件字符串的统一口径量长度（限长内找不到结尾符 = 坏数据），
+    // 之后读的就只有探针已证明可读的那 len 个字节——野指针/未终止串不会把游戏带崩。
+    size_t len = 0;
+    if (!PluginBoundary::TryStrLenRaw(str, PluginBoundary::kMaxPluginString, len)) {
+        Logger::Log("MakeHash rejected: string pointer unreadable or unterminated %p "
+                    "(span limit=%zu)", str, PluginBoundary::kMaxPluginString);
+        return 0;
+    }
+    return CivCrc32RawLen(str, len);
 }
 
 int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pushMethodsSymbol) {
@@ -3496,16 +3541,14 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         [&ownerId](const PluginEntry& tracked) {
             return tracked.ownerId == ownerId;
         });
-    const bool alreadyQuarantined =
-        trackedAfterLoad != g_plugins.end() &&
-        trackedAfterLoad->state == PluginState::Quarantined;
-
     if (!onLoadOk) {
         // 崩溃隔离：按 owner 回滚全部注册并标记隔离，防止半初始化状态持续生效、
         // 以及阶段 B 全量扫描反复重试崩溃的 OnLoad（条目留在 g_plugins，按路径去重拦住重试）。
         Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
         lifecycleLock.unlock();
-        if (!alreadyQuarantined) QuarantinePluginByOwner(ownerId);
+        // 此处必然还没被隔离：隔离的唯一调用点就是这一行（OnLoad 期间没有别的路径能先把
+        // 本 owner 标成 Quarantined）。
+        QuarantinePluginByOwner(ownerId);
         // 模块释放策略（崩溃 = OnLoad 已经跑过，插件可能留有待执行的 detour）：
         //   GameCore 类别：入队，等引擎卸完 GameCore（连同它的 Lua 环境）之后再 FreeLibrary；
         //                  Free 时 FreePendingPluginModules 会把这里的悬垂句柄置空。
@@ -3521,7 +3564,7 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         }
         return false;
     }
-    if (alreadyQuarantined || trackedAfterLoad == g_plugins.end()) {
+    if (trackedAfterLoad == g_plugins.end()) {
         return false;
     }
 
@@ -3561,7 +3604,8 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
 // （stub 与 MinHook 钩保持存活，纯透传）。不这样做的话，插件卸载后再 OnLoad 会因
 // 站点 activeDetour 非空而无法重新挂钩。
 // 站点表是唯一的挂钩账本：Loader 共享钩的 detourOwner 恒为空，不会被这里命中。
-// 在卸载插件的 FreeLibrary 之前调用；owner 为插件 stem（空串代表 Loader 自身，不在此退役）。
+// 在卸载插件的 FreeLibrary 之前调用；调用方传的是 ownerId（规范化小写的插件全路径）。
+// Loader 自身共享钩的 detourOwner 是空串，不会被这里命中。
 static void RemovePluginHooks(const wchar_t* owner) {
     if (!owner || !*owner) return;
     lock_guard<mutex> lock(Runtime::MinHookMutex());
@@ -3882,8 +3926,9 @@ static void DisableGameCoreDomainSites() {
 //      -> MH_DisableHook 的 VirtualProtect 失败）时给站点打 recordStale 并拔掉 detour 槽，
 //      避免下次误判「已装」；
 //   3) 复位 g_orig* 与全部 PushMethods 槽位（与旧实现完全一致）。
-// 本函数不碰 capture 槽：capture 的清理由 ResetForReload 里更早的 CleanupAllCaptureSites()
-// 与插件卸载路径的 CleanupCaptureSitesForOwner 负责。
+// 本函数不做 capture 的【订阅清理】（拔插槽 + 排空）——那是 ResetForReload 里更早的
+// CleanupAllCaptureSites() 与插件卸载路径 CleanupCaptureSitesForOwner 的职责；这里只清
+// 站点复位时必须一并清掉的 capture 数据字段（hasCapture / retiring / captureOuts）。
 static void RemoveGameCoreDomainSiteRecords(
         unique_lock<std::recursive_mutex>& lifecycleLock) {
     // 禁止新的 GameCore API 解析后释放生命周期锁，让已经进入 detour 的插件回调
@@ -3891,8 +3936,7 @@ static void RemoveGameCoreDomainSiteRecords(
     HookImageInfo current{ sizeof(HookImageInfo) };
     const HookImageId currentId = ImageAddress::LoadedGameCore();
     if (ImageAddress::GetInfo(currentId, &current)) {
-        g_gameCoreTeardownAddress = current.base;
-        g_gameCoreTeardownSizeOfImage = static_cast<uint32_t>(current.imageSize);
+        SetGameCoreTeardownWindow(current.base, static_cast<uint32_t>(current.imageSize));
     }
     ImageAddress::DetachGameCore();
     lifecycleLock.unlock();
@@ -3975,8 +4019,8 @@ static void RemoveGameCoreDomainSiteRecords(
 // teardown 窗口的清零点：由 LoaderHooks 的两个 detour 在引擎原函数返回之后调用。
 // 见 §2.3 第 9 步：窗口必须在引擎 LoadDLL/UnloadDLL 真正换映像之后才失效。
 void LoaderCore::ClearGameCoreTeardownWindow() {
-    g_gameCoreTeardownAddress = 0;
-    g_gameCoreTeardownSizeOfImage = 0;
+    g_gameCoreTeardownAddress.store(0, std::memory_order_release);   // 读者见 0 即短路
+    g_gameCoreTeardownSizeOfImage.store(0, std::memory_order_relaxed);
 }
 
 void LoaderCore::ResetForReload() {
@@ -3987,11 +4031,9 @@ void LoaderCore::ResetForReload() {
     HookImageInfo current{ sizeof(HookImageInfo) };
     const HookImageId currentId = ImageAddress::LoadedGameCore();
     if (ImageAddress::GetInfo(currentId, &current)) {
-        g_gameCoreTeardownAddress = current.base;
-        g_gameCoreTeardownSizeOfImage = static_cast<uint32_t>(current.imageSize);
+        SetGameCoreTeardownWindow(current.base, static_cast<uint32_t>(current.imageSize));
     } else {
-        g_gameCoreTeardownAddress = 0;
-        g_gameCoreTeardownSizeOfImage = 0;
+        SetGameCoreTeardownWindow(0, 0);
     }
     lifecycleLock.unlock();
 

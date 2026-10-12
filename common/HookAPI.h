@@ -28,10 +28,10 @@
 //     DllMain and CRT initializers, so a rejected module may already own threads or raw
 //     OS-level hooks. It is a trust boundary, not a safety guarantee. The kind
 //     gate at the bottom makes GameCore-only entries uncompilable in a Global plugin.
-/* Loader 侧（非插件 TU）：Loader 自己的两个工程在 vcxproj 预处理宏里【显式】定义
-   CIV6_HOOKAPI_BUILD_IMPL（DllLoaderRuntime.vcxproj / DllLoader.vcxproj 两侧的
-   PreprocessorDefinitions）。没有它，Loader 那些包含 HookAPI.h 的 TU 会命中文件尾部的
-   "必须声明插件类别" #error；插件工程不得定义它。 */
+/* Loader 侧（非插件 TU）：DllLoaderRuntime 在 vcxproj 预处理宏里【显式】定义
+   CIV6_HOOKAPI_BUILD_IMPL。没有它，Loader 那些包含 HookAPI.h 的 TU 会命中文件尾部的
+   "必须声明插件类别" #error；插件工程不得定义它。（薄壳 DllLoader 不包含本头，也就不
+   再定义该宏。） */
 
 // 插件类别取值（1=Global，2=GameCore；3 预留给未来的 Frontend）。
 // 这里先按插件宏定值：紧随其后的 Civ6PluginKind 导出要用它；文件尾部的门禁块再用 #ifndef

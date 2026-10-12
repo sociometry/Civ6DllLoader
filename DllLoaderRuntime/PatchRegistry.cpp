@@ -38,6 +38,17 @@ CRITICAL_SECTION& Cs() {
     return *cs;
 }
 
+// 临界区 RAII 守卫。只兜 **C++ 异常**：临界区内还有 std::vector / std::map / std::wstring
+// 分配，一次 bad_alloc 从裸 Enter/Leave 之间逃出去就会把补丁表的锁永久留在持有状态。
+// 不兜硬件异常（AV）——/EHsc 下 SEH 不走析构，那类访存错误靠上游"取锁前先探页属性"的
+// 纪律挡（见 PluginBoundary.h 的不变量）。
+struct CsGuard {
+    CsGuard() { EnterCriticalSection(&Cs()); }
+    ~CsGuard() { LeaveCriticalSection(&Cs()); }
+    CsGuard(const CsGuard&) = delete;
+    CsGuard& operator=(const CsGuard&) = delete;
+};
+
 // 基本可写性检查（IsBadReadPtr 不可靠）：整段 [p, p+len) 必须落在
 // MEM_COMMIT 且保护非 PAGE_NOACCESS/PAGE_GUARD 的区域内。
 // 失败返回 false，调用方直接拒绝，不打补丁。
@@ -170,7 +181,7 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
         owner = L"unknown";
     }
 
-    EnterCriticalSection(&Cs());
+    CsGuard csGuard;
     const auto existing = Registry().find(target);
     const bool isFirst = existing == Registry().end();
     if (isFirst) {
@@ -179,7 +190,6 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
             uintptr_t otherEnd = 0;
             if (RangeEnd(otherBegin, kv.second.original.size(), otherEnd) &&
                     RangesOverlap(targetBegin, targetEnd, otherBegin, otherEnd)) {
-                LeaveCriticalSection(&Cs());
                 Logger::Log("PatchRegistry::Apply: range overlap target=%p len=%zu existing=%p len=%zu",
                     target, len, kv.first, kv.second.original.size());
                 return false;
@@ -189,14 +199,12 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     } else {
         if (existing->second.owner != owner) {
             const std::wstring currentOwner = existing->second.owner;
-            LeaveCriticalSection(&Cs());
             Logger::Log("PatchRegistry::Apply: owner conflict target=%p current=%ls requested=%ls",
                         target, currentOwner.c_str(), owner);
             return false;
         }
         if (existing->second.original.size() != len) {
             const size_t currentLen = existing->second.original.size();
-            LeaveCriticalSection(&Cs());
             Logger::Log("PatchRegistry::Apply: repeat length mismatch target=%p current=%zu requested=%zu owner=%ls",
                 target, currentLen, len, owner);
             return false;
@@ -212,7 +220,6 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     std::vector<SavedProtection> saved;
     if (!MakeWritableRecording(target, len, saved)) {
         RestoreProtections(saved);         // 部分成功也要恢复，别留下可写/可执行的页
-        LeaveCriticalSection(&Cs());
         Logger::Log("PatchRegistry::Apply: protect failed target=%p len=%zu err=%lu",
             target, len, GetLastError());
         return false;
@@ -228,7 +235,6 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
         e.owner = owner;
         Registry().emplace(target, std::move(e));
     }
-    LeaveCriticalSection(&Cs());
     return true;
 }
 
@@ -238,26 +244,23 @@ bool OverlapsRegistered(const void* target, size_t len) {
     const uintptr_t end = begin + len;
     if (end < begin) return true;   // 地址回绕：按冲突处理
 
-    EnterCriticalSection(&Cs());
+    CsGuard csGuard;
     for (const auto& kv : Registry()) {
         const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(kv.first);
         uintptr_t otherEnd = 0;
         if (RangeEnd(otherBegin, kv.second.original.size(), otherEnd) &&
                 RangesOverlap(begin, end, otherBegin, otherEnd)) {
-            LeaveCriticalSection(&Cs());
             return true;
         }
     }
-    LeaveCriticalSection(&Cs());
     return false;
 }
 
 bool RevertOwned(void* target, const wchar_t* owner) {
     if (!target || !owner || !*owner) return false;
-    EnterCriticalSection(&Cs());
+    CsGuard csGuard;
     const auto it = Registry().find(target);
     if (it == Registry().end() || it->second.owner != owner) {
-        LeaveCriticalSection(&Cs());
         Logger::Log("PatchRegistry::RevertOwned: owner mismatch target=%p owner=%ls",
                     target, owner);
         return false;
@@ -267,7 +270,6 @@ bool RevertOwned(void* target, const wchar_t* owner) {
     std::vector<SavedProtection> saved;
     if (!MakeWritableRecording(target, origSize, saved)) {
         RestoreProtections(saved);
-        LeaveCriticalSection(&Cs());
         Logger::Log("PatchRegistry::RevertOwned: protect failed target=%p err=%lu",
                     target, GetLastError());
         return false;
@@ -276,7 +278,6 @@ bool RevertOwned(void* target, const wchar_t* owner) {
     RestoreProtections(saved);
     FlushInstructionCache(GetCurrentProcess(), target, origSize);
     Registry().erase(it);
-    LeaveCriticalSection(&Cs());
     return true;
 }
 
@@ -284,7 +285,7 @@ size_t RevertAllFor(const wchar_t* owner) {
     if (!owner || !*owner) {
         return 0;
     }
-    EnterCriticalSection(&Cs());
+    CsGuard csGuard;
 
     // 先收集目标再逐个回滚（回滚会擦除条目，避免迭代器失效）。
     std::vector<void*> targets;
@@ -319,7 +320,6 @@ size_t RevertAllFor(const wchar_t* owner) {
         Registry().erase(it);
         ++reverted;
     }
-    LeaveCriticalSection(&Cs());
     if (reverted > 0) {
         Logger::Log("PatchRegistry::RevertAllFor: rolled back %zu patch(es) for owner=%ls", reverted, owner);
     }

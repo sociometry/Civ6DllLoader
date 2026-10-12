@@ -7,6 +7,22 @@
 // 头文件内联实现，两个工程（Shell / Loader）通过各自的 common include 路径直接包含，无需改动 vcxproj。
 namespace RestartGame {
 
+// 当前命令行里 argv[0] 之后的部分（原样透传：保留 -dx11/-dx12、Steam 与玩家的自定义参数）。
+// GetCommandLineW 的 argv[0] 可能带引号（路径含空格），也可能不带。
+inline const wchar_t* CommandLineArguments() {
+    const wchar_t* p = GetCommandLineW();
+    if (!p) return L"";
+    if (*p == L'"') {
+        for (++p; *p && *p != L'"'; ++p) {
+        }
+        if (*p == L'"') ++p;
+    } else {
+        while (*p && *p != L' ' && *p != L'\t') ++p;
+    }
+    while (*p == L' ' || *p == L'\t') ++p;
+    return p;
+}
+
 // 成功时不会返回（TerminateProcess）；失败返回 false（调用方记日志、继续本会话，玩家可手动重启）。
 inline bool LaunchAndExit() {
     wchar_t exePath[MAX_PATH]{};
@@ -20,7 +36,10 @@ inline bool LaunchAndExit() {
     // 它能工作的真实原因是**继承了本进程已有的 Steam 环境变量**（SteamAppId / SteamClientLaunch
     // 等，由当初拉起游戏的那次 Steam 启动设置），steam_api64 因此能完成握手；
     // CreateProcessW 同样继承这些变量，这里没有"必须走 shell"的硬要求。
-    const HINSTANCE r = ShellExecuteW(nullptr, L"open", exePath, nullptr, nullptr, SW_SHOWNORMAL);
+    // lpParameters 必须带上原命令行 argv[0] 之后的部分：重启后的进程要和原来同参，
+    // 否则 -dx11/-dx12、Steam 或玩家自定义参数会在重启时丢掉（等于换了一个会话）。
+    const HINSTANCE r = ShellExecuteW(nullptr, L"open", exePath, CommandLineArguments(),
+        nullptr, SW_SHOWNORMAL);
     if (reinterpret_cast<INT_PTR>(r) <= 32) {
         return false;  // <=32 表示错误码
     }

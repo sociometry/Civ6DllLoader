@@ -10,7 +10,8 @@ This repository contains **loader infrastructure only**. Plugin examples live in
 common/              HookAPI, ModScan, LoaderProtocol
 DllLoader/           Thin shell (GameCore_XP2_Shell_FinalRelease.dll)
 DllLoaderRuntime/    Runtime + HookAPI implementation
-third_party/sqlite/  Bundled SQLite used by shell/runtime
+third_party/sqlite/  Bundled SQLite for the enabled-mod filter (runtime; the shell
+                     just links the same TU via ModScan)
 tools/               Symbol DB packing and maintained aliases
 DllLoader.sln        Shell + Runtime projects only
 ```
@@ -24,7 +25,9 @@ Outputs (typical):
 - `x64\Release\GameCore_XP2_Shell_FinalRelease.dll`
 - `x64\Release\Civ6DllLoader.runtime.dll`
 
-Copy both into a Workshop mod under `Binaries\Win64\`.
+Copy both into a Workshop mod under `Binaries\Win64\`. On the first launch the shell elects the
+highest-version runtime, copies it to `<game exe dir>\version.dll` and asks to restart; after that
+restart the proxy DLL is what pulls the loader in (the shell then only serves vanilla sessions).
 
 Runtime candidates carry static version metadata (RCDATA 105). Installation and
 updates read this resource without executing candidate DLL entry points or exports.

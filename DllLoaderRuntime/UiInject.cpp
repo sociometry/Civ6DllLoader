@@ -378,8 +378,9 @@ bool IsSafeUiFilePath(const std::string& file, std::string& baseName) {
     }
     size_t slash = file.find_last_of("/\\");
     const std::string fname = slash == std::string::npos ? file : file.substr(slash + 1);
+    // 到这里 fname.size() >= 12（上面的 <= 11 已挡掉更短的），末尾 4 字节必在范围内。
     if (fname.size() <= 11 || _strnicmp(fname.c_str(), kModUiPrefix, 11) != 0 ||
-        fname.size() < 4 || _stricmp(fname.c_str() + fname.size() - 4, ".xml") != 0) {
+        _stricmp(fname.c_str() + fname.size() - 4, ".xml") != 0) {
         return false;
     }
     size_t begin = 0;

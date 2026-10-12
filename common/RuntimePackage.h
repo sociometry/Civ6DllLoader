@@ -5,7 +5,8 @@
 namespace RuntimePackage {
 
 // 只读 x64 DLL 的静态版本资源；没有资源的旧候选拒绝，不回退到执行导出。
-// 资源用于识别格式和排序；候选来源的信任仍由 ModScan 的启用集/本地规则决定。
+// 资源用于识别格式和排序；候选来源由 ModScan 的扫描根（游戏根 / Documents Mods /
+// Workshop 库）与 loader 自身目录决定——**不经启用集过滤**（启用集只约束插件加载）。
 bool ProbeVersion(const std::wstring& path, uint32_t& outVersion);
 
 // 从禁止写入/替换的源文件复制并校验临时文件；失败不改动已安装的 DLL。

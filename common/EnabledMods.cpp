@@ -99,7 +99,10 @@ Snapshot Load() {
         return snap;
     }
 
-    // Read-only URI so we never take a write lock against the game.
+    // 只读打开：SQLITE_OPEN_READONLY 本身就保证不取写锁，不需要 URI 形式。
+    // 别用 `file:...?mode=ro` + SQLITE_OPEN_URI：那会把路径交给 URI 解析器，路径里的
+    // # / % 会被当成 fragment / 转义（用户名或目录名里出现就 CANTOPEN），而 mode=ro
+    // 相对 READONLY 是多余的。
     const int n = WideCharToMultiByte(CP_UTF8, 0, dbPath.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (n <= 0) {
         snap.error = "Mods.sqlite path UTF-8 conversion failed";
@@ -111,13 +114,9 @@ Snapshot Load() {
         return snap;
     }
     utf8.pop_back();
-    for (char& ch : utf8) {
-        if (ch == '\\') ch = '/';
-    }
-    const std::string uri = std::string("file:") + utf8 + "?mode=ro";
 
     sqlite3* db = nullptr;
-    const int openRc = sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
+    const int openRc = sqlite3_open_v2(utf8.c_str(), &db, SQLITE_OPEN_READONLY, nullptr);
     if (openRc != SQLITE_OK || !db) {
         snap.error = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
         if (db) sqlite3_close(db);

@@ -209,7 +209,6 @@ std::unordered_map<uint32_t, uint32_t> g_leafMap;  // 叶子符号 old_rva -> ne
 
 std::vector<PdataSig> g_newPdata;                 // new 签名表（按 begin_rva 升序）
 std::vector<uint32_t> g_map;                      // old_idx -> new_idx / kUnmatched
-uint64_t g_fingerprint = 0;
 bool g_tableReady = false;
 
 // ---- 多模块上下文（每个 HookImageId 一份）----
@@ -444,11 +443,16 @@ bool ParseModuleData(const uint8_t* data, size_t size, const ModuleDesc& m, cons
         const uint32_t slotCount = se.vtableSlotCount;
 
         if (sym.kind == 1 && slotCount != 0) {
+            // 上界以【本模块声明的槽位总数】m.vtableSlotCount 为准（它的 extent 已在上面的
+            // 范围校验里证明落在文件内）。只比整文件 size 的话，槽位游标越过 vtable 块之后
+            // 会继续把紧邻的名字堆 / AOB 字节当成槽位读出来。
+            const uint64_t slotEndCursor = static_cast<uint64_t>(slotCursor) + slotCount;
             if (m.vtableOffset == 0 ||
-                static_cast<uint64_t>(slotCursor) + slotCount > kMaxVtableSlots ||
-                static_cast<uint64_t>(m.vtableOffset) +
-                    (static_cast<uint64_t>(slotCursor) + slotCount) * sizeof(VtableSlot) > size) {
-                Logger::Log("PdataMatch: %s vtable slot overflow at symbol %u", sourceTag, i);
+                slotEndCursor > kMaxVtableSlots ||
+                slotEndCursor > m.vtableSlotCount) {
+                Logger::Log("PdataMatch: %s vtable slot overflow at symbol %u "
+                            "(cursor=%u count=%u declared=%u)", sourceTag, i,
+                    slotCursor, slotCount, m.vtableSlotCount);
                 return false;
             }
             sym.slots.reserve(slotCount);
@@ -1370,7 +1374,6 @@ void ResetAllParsedState() {
     g_loaded = false;
     g_newPdata.clear();
     g_map.clear();
-    g_fingerprint = 0;
     g_tableReady = false;
 }
 
@@ -1648,7 +1651,6 @@ static bool BuildNewTableImpl(uint32_t imageId, HMODULE gameCore) {
         g_newPdata = std::move(newTable);
         g_map = std::move(mapping);
         g_leafMap = std::move(leafMap);
-        g_fingerprint = fingerprint;
         g_identical = identical;
         g_tableReady = true;
     }
@@ -1714,7 +1716,6 @@ bool BuildNewTable(uint32_t imageId, HMODULE target) {
         g_leafMap.clear();
         g_newPdata.clear();
         g_map.clear();
-        g_fingerprint = 0;
         g_tableReady = false;
     }
 
