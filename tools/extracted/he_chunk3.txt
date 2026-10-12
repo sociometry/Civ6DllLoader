@@ -1,0 +1,3 @@
+extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr);
+static bool BuildHookHubStub(HookSite* site, void** outStub);
+static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);

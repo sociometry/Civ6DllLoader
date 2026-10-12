@@ -78,6 +78,9 @@
     <ClCompile Include="ScriptBridge.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="HookEngine.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="Civ6MessageBus.cpp">
       <Filter>源文件</Filter>
     </ClCompile>

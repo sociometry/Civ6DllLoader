@@ -1,0 +1,864 @@
+#include "pch.h"
+#include "HookEngine.h"
+#include "LoaderCore.h"
+
+#include <Windows.h>
+#include <algorithm>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <asmjit/x86.h>
+
+#include "MinHook.h"
+#include "ImageAddress.h"
+#include "PatchRegistry.h"
+#include "PluginBoundary.h"
+#include "PluginDomain.h"
+#include "Runtime.h"
+#include "ScriptBridge.h"      // WaitForDetourDrain / ResetForTeardown
+#include "SymbolResolve.h"
+#include "TeardownWindow.h"
+#include "../common/Logger.h"
+
+// 从 Civ6DLLHookLoaderAPI.cpp 拆出（阶段 5）：挂钩站点表 / JIT stub / capture /
+// teardown 站点操作。
+//
+// 本模块拥有（不导出，见 REFACTOR_PLAN.md §5.1）：
+//   struct HookSite（含嵌套 CaptureOut）、g_hookSites、g_captureMutex、g_captureRuntime
+// 跨模块常量 kHookPrologueWindow 放 HookEngine.h（PluginRegistry 的 HookPatch 也要用）。
+//
+// static 取舍：InstallLoaderDetourOnSite 等被 ScriptBridge / PluginRegistry 调用的
+// 函数去掉 static；纯本 TU 辅助保持 static。
+
+using namespace std;
+
+namespace HookEngine {
+
+// ---------------- 站点状态（随本模块私有） ----------------
+
+
+// ================= 统一挂钩站点（Unified Hook Site） =================
+// 对同一个 target，MinHook 只挂一次，挂到 Loader 自己 asmjit 生成的「中转 stub」。
+// 一个站点把 Detour 槽、Capture 槽与 MinHook 侧合并到同一节点：
+//   - Detour 槽：activeDetour/detourOwner —— InstallHook 的独占插件 detour；
+//   - Capture 槽：hasCapture/captureParamIndex/captureOuts —— RegisterGlobalCapture 的
+//     共享参数捕获订阅（同一 target 上 1 个 Detour + N 个 Capture 共存）；
+//   - MinHook 侧：stubCode/minhookTrampoline/hookInstalled。
+// stub 每次调用先读 hasCapture：无捕获直接尾跳 nextTarget（快路径，Detour-only 站点
+// 几乎零开销）；有捕获才保存参数、调用 CaptureDispatch，再尾跳 nextTarget。
+// nextTarget = activeDetour（有 Detour 时）或 minhookTrampoline（无 Detour 时）。
+//
+// 生命周期硬约束：日常「退役」只拔插槽（activeDetour=nullptr / hasCapture=false /
+// captureOuts.clear()），绝不调用 MH_RemoveHook、绝不 JitRuntime::release、绝不
+// g_hookSites.erase。理由：stub 先读 nextTarget 再尾跳，且没有可靠的计数能证明没有
+// 调用者仍在 stub 内；随手释放 JIT 代码 / 节点 / trampoline 都是 UAF。节点只在进程
+// 退出时随静态对象回收。
+// 唯一的例外是 GameCore teardown：趁旧映像仍映射时先用一次 MH_ApplyQueued 批量还原
+// 全部 GameCore 域入口字节（此后不再有新调用进入 stub / 插件 detour），再物理摘除
+// MinHook 记录（释放跳板）。见 DisableGameCoreDomainSites / RemoveGameCoreDomainSiteRecords。
+// 摘除失败的站点打 recordStale，下次在同一地址取站时强制重建（GetOrCreateHookSiteLocked）。
+// struct HookSite 的定义已移到 HookEngine.h（RemoveHookSiteRecordLocked 的签名要用它）。
+
+
+static std::map<void*, HookSite> g_hookSites;
+// 站点锁复用 Runtime::MinHookMutex()（不要再引第三个锁）。锁序固定 MinHook -> capture：
+// g_captureMutex 只保护派发侧数据（captureOuts / retiring / captureParamIndex）。
+static std::mutex g_captureMutex;
+static asmjit::JitRuntime g_captureRuntime;  // 统一 stub 的 JIT 分配器（永不 release）
+
+
+
+// ---------------- 跨模块常量 ----------------
+
+
+// 地址开放性门的规则说明见 PluginDomain.h（实现已迁至 PluginDomain.cpp）。
+
+
+// 字节修改仲裁：MinHook 会改写目标函数的前导字节。同一个函数既被 InstallHook 装钩、
+// 又被 Patch 打补丁时，两侧各自的"恢复原始字节"会互相覆盖，最终恢复出第三种字节状态
+// （谁先卸载谁踩谁）。这里做双向检查：
+//   - 装钩前：目标前导窗口是否与已登记补丁重叠 -> InstallHookImpl
+//   - 打补丁前：目标区间是否压住某个已装钩目标的前导窗口 -> HookPatch
+// 窗口取与"可读探测"同一口径（32 字节，保守）。
+constexpr size_t kHookPrologueWindow = PluginBoundary::kMinHookTargetSpan;
+
+
+
+// ---------------- 前置声明 ----------------
+
+
+extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr);
+static bool BuildHookHubStub(HookSite* site, void** outStub);
+static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);
+
+
+
+// ---------------- 函数实现 ----------------
+
+
+// ==== BuildHookHubStub ====
+// 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
+// 快路径（hasCapture == 0，Detour-only 站点的常态）：
+//   mov r10, imm64(site)
+//   cmp byte ptr [r10 + off(hasCapture)], 0
+//   jne slow
+//   mov rax, [r10 + off(nextTarget)]
+//   jmp rax
+// 慢路径（有 capture）：
+//   sub rsp, 0x98
+//   mov [rsp+20],rcx / [rsp+28],rdx / [rsp+30],r8 / [rsp+38],r9
+//   movaps [rsp+40],xmm0 / [rsp+50],xmm1 / [rsp+60],xmm2 / [rsp+70],xmm3
+//   lea rcx,[rsp+20] ; mov edx,[r10+off(captureParamIndex)] ; mov r8,r10
+//   mov r10, imm64(&CaptureDispatch) ; call r10
+//   恢复 rcx/rdx/r8/r9 + xmm0-3
+//   add rsp, 0x98
+//   mov r10, imm64(site)          ; C 调用会打掉 r10，必须重载
+//   mov rax, [r10 + off(nextTarget)]
+//   jmp rax
+// rax/r10/r11 在函数入口是 volatile，且都不是参数寄存器，快路径只动 rax/r10。
+// 栈对齐：入口 rsp ≡ 8 (mod 16)，sub 0x98（≡8）后 rsp ≡ 0 (mod 16)，[rsp+0..0x20)
+// 恰好是 CaptureDispatch 的 shadow space，[rsp+0x20..0x80) 保存参数（movaps 目标全部
+// 16 字节对齐）。慢路径不调用任何"进入/离开"计数（stub 与节点永不释放，计数不构成安全判据）：
+// 计数不是安全判据（见 HookSite 注释）。
+// stub 运行时从 site 字段读 nextTarget，因此 MinHook trampoline 可在 stub 生成之后由
+// MH_CreateHook 回填，无需生成后回写任何可执行字节。
+static bool BuildHookHubStub(HookSite* site, void** outStub) {
+    using namespace asmjit;
+    CodeHolder code;
+    if (code.init(g_captureRuntime.environment(), g_captureRuntime.cpu_features()) != Error::kOk) {
+        return false;
+    }
+    x86::Assembler a(&code);
+    const Label slow = a.new_label();
+    const int32_t offHasCapture = static_cast<int32_t>(offsetof(HookSite, hasCapture));
+    const int32_t offNextTarget = static_cast<int32_t>(offsetof(HookSite, nextTarget));
+    const int32_t offParamIndex = static_cast<int32_t>(offsetof(HookSite, captureParamIndex));
+
+    // 快路径：无 capture -> 直接尾跳（不保存参数、不发生 C 调用）。
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
+    a.cmp(x86::byte_ptr(x86::r10, offHasCapture), 0);
+    a.jne(slow);
+    a.mov(x86::rax, x86::ptr(x86::r10, offNextTarget));
+    a.jmp(x86::rax);
+
+    // 慢路径：保存参数 -> CaptureDispatch -> 恢复 -> 尾跳 nextTarget。
+    a.bind(slow);
+    a.sub(x86::rsp, 0x98);
+    a.mov(x86::ptr(x86::rsp, 0x20), x86::rcx);
+    a.mov(x86::ptr(x86::rsp, 0x28), x86::rdx);
+    a.mov(x86::ptr(x86::rsp, 0x30), x86::r8);
+    a.mov(x86::ptr(x86::rsp, 0x38), x86::r9);
+    a.movaps(x86::ptr(x86::rsp, 0x40), x86::xmm0);
+    a.movaps(x86::ptr(x86::rsp, 0x50), x86::xmm1);
+    a.movaps(x86::ptr(x86::rsp, 0x60), x86::xmm2);
+    a.movaps(x86::ptr(x86::rsp, 0x70), x86::xmm3);
+    a.lea(x86::rcx, x86::ptr(x86::rsp, 0x20));
+    a.mov(x86::edx, x86::dword_ptr(x86::r10, offParamIndex));
+    a.mov(x86::r8, x86::r10);
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(&CaptureDispatch));
+    a.call(x86::r10);
+    a.mov(x86::rcx, x86::ptr(x86::rsp, 0x20));
+    a.mov(x86::rdx, x86::ptr(x86::rsp, 0x28));
+    a.mov(x86::r8, x86::ptr(x86::rsp, 0x30));
+    a.mov(x86::r9, x86::ptr(x86::rsp, 0x38));
+    a.movaps(x86::xmm0, x86::ptr(x86::rsp, 0x40));
+    a.movaps(x86::xmm1, x86::ptr(x86::rsp, 0x50));
+    a.movaps(x86::xmm2, x86::ptr(x86::rsp, 0x60));
+    a.movaps(x86::xmm3, x86::ptr(x86::rsp, 0x70));
+    a.add(x86::rsp, 0x98);
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
+    a.mov(x86::rax, x86::ptr(x86::r10, offNextTarget));
+    a.jmp(x86::rax);
+
+    void* stub = nullptr;
+    if (g_captureRuntime.add(&stub, &code) != Error::kOk || !stub) {
+        return false;
+    }
+    *outStub = stub;
+    return true;
+}
+
+// ==== GetOrCreateHookSiteLocked ====
+// 取/建 target 上的统一站点。调用方必须持有 Runtime::MinHookMutex()（站点锁）。
+// 首次建站（或 recordStale 强制重建）才 MH_CreateHook + MH_EnableHook。
+// 失败不抛异常：记日志并返回 nullptr；只有确认"这个节点刚建、还没被任何调用者看到"
+// （created）时才 erase 它；erase 之后绝不再使用 site 引用。
+static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
+    if (!target) return nullptr;
+
+    auto it = g_hookSites.find(target);
+    const bool created = (it == g_hookSites.end());
+    if (created) {
+        it = g_hookSites.emplace(target, HookSite{}).first;
+    }
+    HookSite* site = &it->second;
+
+    if (!created && site->poisoned) {
+        Logger::Log("HookSite: target %p is poisoned (stale MinHook record from an unmapped image); "
+                    "refusing (%s)", target, why ? why : "");
+        return nullptr;
+    }
+
+    if (!created && !site->recordStale && site->hookInstalled) {
+        return site;   // 既有、可用
+    }
+
+    if (!created && site->recordStale) {
+        // recordStale：上一次 GameCore teardown 没能摘掉这条 MinHook 记录（目标映像当时
+        // 已卸载 -> Disable/Remove 都失败）。此刻 target 是调用方刚解析出来的地址，可读。
+        // 前置判据：当前字节必须与建记录时的副本一致（= 同一个函数），否则 MinHook 的
+        // Disable/Remove 会把**旧映像备份的字节**写进当前映射的代码。
+        bool samePrologue = false;
+        if (site->prologueValid) {
+            uint8_t current[HookSite::kGuardBytes] = {};
+            if (PluginBoundary::TryReadRaw(target, current, HookSite::kGuardBytes,
+                    HookSite::kGuardBytes)) {
+                samePrologue = std::memcmp(current, site->prologueBackup,
+                    HookSite::kGuardBytes) == 0;
+            }
+        }
+        if (!samePrologue) {
+            site->poisoned = true;
+            Logger::Log("HookSite: recordStale target=%p 前导字节与建记录时不一致（旧映像已卸载/地址被复用）；"
+                        "拒绝触碰它的 MinHook 记录 (fail-closed) (%s)", target, why ? why : "");
+            return nullptr;
+        }
+        Logger::Log("HookSite: recordStale rebuild target=%p (%s)", target, why ? why : "");
+        if (site->hookInstalled && Runtime::IsReadableSpan(target, 1)) {
+            MH_DisableHook(target);
+            const MH_STATUS st = MH_RemoveHook(target);
+            if (st != MH_OK && st != MH_ERROR_NOT_CREATED) {
+                Logger::Log("HookSite: stale hook remove failed target=%p status=%s",
+                    target, MH_StatusToString(st));
+            }
+        }
+        site->hookInstalled = false;
+        site->minhookTrampoline = nullptr;
+        site->activeDetour = nullptr;
+        site->detourOwner.clear();
+        // 绝不可置 nullptr：recordStale 只证明"入口字节已还原"，不能证明"没有调用者停在 stub 里"。
+        // 指向 target = 让在途调用者直接执行原函数（与 RemoveHookSiteRecordLocked 的 b 步同理）。
+        site->nextTarget = target;
+        std::lock_guard<std::mutex> captureLock(g_captureMutex);
+        site->hasCapture = false;
+        site->retiring = false;
+        site->captureOuts.clear();
+        site->recordStale = false;
+    }
+
+    if (!site->stubCode && !BuildHookHubStub(site, &site->stubCode)) {
+        Logger::Log("HookSite: stub build failed target=%p (%s)", target, why ? why : "");
+        if (created) g_hookSites.erase(it);
+        return nullptr;
+    }
+
+    MH_STATUS status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
+    if (status == MH_ERROR_ALREADY_CREATED) {
+        // 只有「本站节点已存在（!created）」**且当前字节与建记录时的副本一致**才可能是本站
+        // 自己的残留记录（例如上一次 teardown 的 MH_RemoveHook 失败）。对全新站点、
+        // 或字节对不上的地址，ALREADY_CREATED 只可能是别人的钩子；无条件摘除会释放对方的
+        // trampoline（跳板指针悬垂、静默顶掉 Lua 脚本全局注册），并把旧字节写进当前映像。
+        bool ownLeftover = false;
+        if (!created && site->prologueValid) {
+            uint8_t current[HookSite::kGuardBytes] = {};
+            ownLeftover = PluginBoundary::TryReadRaw(target, current, HookSite::kGuardBytes,
+                HookSite::kGuardBytes) &&
+                std::memcmp(current, site->prologueBackup, HookSite::kGuardBytes) == 0;
+        }
+        if (ownLeftover) {
+            MH_RemoveHook(target);
+            status = MH_CreateHook(target, site->stubCode, &site->minhookTrampoline);
+        } else {
+            Logger::Log("HookSite: target %p already hooked by another owner; refusing to replace (%s)",
+                target, why ? why : "");
+            if (created) g_hookSites.erase(it);
+            else site->poisoned = true;   // 不是我们的记录：别再碰这个地址
+            return nullptr;
+        }
+    }
+    if (status != MH_OK) {
+        Logger::Log("HookSite: MH_CreateHook failed target=%p status=%s (%s)",
+            target, MH_StatusToString(status), why ? why : "");
+        if (created) g_hookSites.erase(it);
+        return nullptr;
+    }
+    // 保存前导字节副本（供将来 recordStale 判断"同一函数"）。MH_CreateHook 不改入口字节，
+    // 所以此刻读到的就是 MinHook 备份下来的那几字节。
+    site->prologueValid = PluginBoundary::TryReadRaw(target, site->prologueBackup,
+        HookSite::kGuardBytes, HookSite::kGuardBytes);
+    if (!site->prologueValid) {
+        Logger::Log("HookSite: target %p 前导字节不可读；本次仍建站，但 recordStale 只能 fail-closed (%s)",
+            target, why ? why : "");
+    }
+    // 先把 stub 的尾跳目标置为新 trampoline，再 Enable：否则 Enable 之后、赋值之前进入
+    // stub 的调用会 jmp 到 nullptr。
+    site->nextTarget = site->minhookTrampoline;
+    if ((status = MH_EnableHook(target)) != MH_OK) {
+        Logger::Log("HookSite: MH_EnableHook failed target=%p status=%s (%s)",
+            target, MH_StatusToString(status), why ? why : "");
+        MH_RemoveHook(target);
+        if (created) g_hookSites.erase(it);
+        return nullptr;
+    }
+    site->hookInstalled = true;
+    Logger::Log("HookSite: installed hub stub target=%p stub=%p trampoline=%p (%s)",
+        target, site->stubCode, site->minhookTrampoline, why ? why : "");
+    return site;
+}
+
+// ==== InstallLoaderDetourOnSite ====
+// 把 Loader 共享钩（ScriptData / ForUI / PushMethods）挂到 target 的统一站点上。
+// 共享钩在站点里的表现：activeDetour = detour、detourOwner 恒为空、nextTarget = detour。
+// 调用方不得持 Runtime::MinHookMutex()：内部自取（站点取/建要求持锁）。
+// 幂等：同一 detour 已在站点上时直接返回当前跳板。
+// 独占：站点已有别的 detour（插件或另一个共享钩）时拒绝，构成双向互斥。
+//
+// 【顺序约束】屏障是「nextTarget = detour 之前必须备好 origSlot」，不是 MH_EnableHook
+// 之前——站点首次建立后 MinHook 侧已经 Enable，但此刻 nextTarget 只是 trampoline
+// （纯透传）；detour 只有靠把 nextTarget 置为 detour 才被真正激活。因此必须先把
+// origSlot 写成 trampoline，再发布 activeDetour/nextTarget，否则并发的首次调用会从
+// stub 跳到 nullptr（只可能发生在站点刚建好、还没赋 nextTarget 的窗口，见
+// GetOrCreateHookSiteLocked 里同一条约束）。
+bool HookEngine::InstallLoaderDetourOnSite(void* target, void* detour, void** origSlot, const char* why) {
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    HookSite* site = GetOrCreateHookSiteLocked(target, why);
+    if (!site) {
+        Logger::Log("InstallLoaderDetourOnSite: hook site unavailable target=%p (%s)",
+            target, why ? why : "");
+        return false;
+    }
+    if (site->activeDetour == detour) {
+        if (origSlot) *origSlot = site->minhookTrampoline;
+        return true;   // 幂等
+    }
+    if (site->activeDetour) {
+        Logger::Log("InstallLoaderDetourOnSite: target %p already has detour=%p (owner=%ls) (%s)",
+            target, site->activeDetour, site->detourOwner.c_str(), why ? why : "");
+        return false;
+    }
+    if (origSlot) *origSlot = site->minhookTrampoline;
+    site->activeDetour = detour;
+    site->detourOwner.clear();
+    site->nextTarget = detour;
+    Logger::Log("InstallLoaderDetourOnSite: target=%p detour=%p trampoline=%p (%s)",
+        target, detour, site->minhookTrampoline, why ? why : "");
+    return true;
+}
+
+// ==== RetireHookSiteDetoursForOwnerLocked ====
+// 退役站点 detour 槽：只拔插槽，绝不 MH_RemoveHook / g_hookSites.erase。
+// 调用方必须持有 Runtime::MinHookMutex()。
+size_t RetireHookSiteDetoursForOwnerLocked(const std::wstring& owner) {
+    if (owner.empty()) return 0;
+    size_t retired = 0;
+    for (auto& [target, site] : g_hookSites) {
+        if (site.activeDetour && site.detourOwner == owner) {
+            site.activeDetour = nullptr;
+            site.detourOwner.clear();
+            site.nextTarget = site.minhookTrampoline;
+            ++retired;
+            Logger::Log("HookSite: retired detour slot %p (owner=%ls)", target, owner.c_str());
+        }
+    }
+    return retired;
+}
+
+// ==== OverlapsHookPrologue ====
+// 调用方不得持 Runtime::MinHookMutex()（内部自己取）。只看统一的站点表：
+// Loader 共享钩（ScriptData / ForUI / PushMethods）与插件 detour 都是站点，
+// 只有站点的 MinHook 侧（hookInstalled）才改写过目标前导字节。
+bool OverlapsHookPrologue(const void* target, size_t len) {
+    if (!target || len == 0) return false;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
+    const uintptr_t end = begin + len;
+    if (end < begin) return true;   // 地址回绕：按冲突处理
+    lock_guard<mutex> lock(Runtime::MinHookMutex());
+    for (const auto& [siteTarget, site] : g_hookSites) {
+        if (!site.hookInstalled) continue;   // 未 Enable 的站点尚未改写前导字节
+        const uintptr_t hookBegin = reinterpret_cast<uintptr_t>(siteTarget);
+        const uintptr_t hookEnd = hookBegin + kHookPrologueWindow;
+        if (begin < hookEnd && hookBegin < end) return true;
+    }
+    return false;
+}
+
+// ==== InstallHookImpl ====
+// 插件 Detour 入口：不再直接 MH_CreateHook(target, detour)，而是把 detour 挂进
+// target 的统一站点（MinHook 只挂一次，挂到站点 stub）。同一 target 已有 Detour 时
+// 明确拒绝（Detour 槽独占）；Capture 槽可与之共存，挂载顺序无关。
+bool InstallHookImpl(void* target, void* detour, void** original) {
+    // target 是插件解析出来的【游戏代码地址】，original 是插件给自己的【输出槽】：
+    // 两者都是调用方传入的指针值，有效性无法假定，必须在取锁【之前】用页属性探测拦掉坏地址。
+    // 否则 MinHook 读目标前导字节时出错，会把 LoaderCore::LifecycleMutex() 与
+    // Runtime::MinHookMutex() 一起泄漏（/EHsc 下 lock_guard 不析构 -> 永久死锁）。
+    // 注意：target 属于游戏模块，不是插件内存——判据是"这个指针值可不可信"，不是"它属于谁"。
+    if (!PluginBoundary::IsReadable(target, PluginBoundary::kMinHookTargetSpan)) {
+        Logger::Log("InstallHook rejected: target not readable %p (span=%zu)",
+            target, PluginBoundary::kMinHookTargetSpan);
+        return false;
+    }
+    if (original && !PluginBoundary::IsWritable(original, sizeof(void*))) {
+        Logger::Log("InstallHook rejected: original out-param not writable %p", original);
+        return false;
+    }
+    lock_guard<std::recursive_mutex> lifecycleLock(LoaderCore::LifecycleMutex());
+    PluginBoundary::LoaderLockScope pbLockScope;
+    if (PatchRegistry::OverlapsRegistered(target, kHookPrologueWindow)) {
+        Logger::Log("InstallHook rejected: target %p overlaps a registered patch "
+                    "(unpatch it first)", target);
+        return false;
+    }
+    if (PluginDomain::TargetInTearingDownGameCore(target)) {
+        Logger::Log("InstallHook rejected: target %p belongs to tearing-down GameCore", target);
+        return false;
+    }
+    auto owner = PluginDomain::RequirePluginOwner(detour, "InstallHook");
+    if (!owner) return false;
+    // 地址开放性门：调用方类别 × 目标地址域。此门取代原先那条"Global owner 必须先登记
+    // GameCore teardown 回调"的门槛——域门之后 Global 已不可能指向当前 GameCore，那段判断
+    // 永远不可达，相关登记机制随之整体删除。
+    if (!PluginDomain::IsTargetOpenToCaller(owner->category, target, "InstallHook")) return false;
+
+    // 锁序 lifecycle -> MinHook -> capture：站点在 MinHook 站点锁下取/建。
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    HookSite* site = GetOrCreateHookSiteLocked(target, "InstallHook");
+    if (!site) {
+        Logger::Log("InstallHook: hook site unavailable target=%p", target);
+        return false;
+    }
+    if (site->activeDetour) {
+        Logger::Log("InstallHook rejected: target %p already has a detour (owner=%ls detour=%p)",
+            target, site->detourOwner.c_str(), site->activeDetour);
+        return false;
+    }
+    // 顺序不可交换（与 InstallLoaderDetourOnSite 同一理由，见 docs/ARCHITECTURE.md §5.5）：
+    // 站点首建时 MinHook 侧已 enable，但那一刻 nextTarget 只是跳板（纯透传）——把 nextTarget
+    // 置为 detour 才是"插件 detour 开始生效"的那一刻。必须先备好跳板（*original）再发布，
+    // 否则另一线程可能在这两行之间进入 detour，读到的 original 还是插件侧的未初始化值。
+    if (original) *original = site->minhookTrampoline;
+    site->activeDetour = detour;
+    site->detourOwner = owner->ownerId;
+    site->nextTarget = detour;
+    Logger::Log("InstallHook: target=%p detour=%p original=%p owner=%ls (hub stub=%p)",
+        target, detour, original ? *original : nullptr, owner->ownerId.c_str(), site->stubCode);
+    return true;
+}
+
+// ==== RemoveHookSiteRecordLocked ====
+// 物理摘除某个站点自己的 MinHook 记录（释放跳板），并把站点还原为「未挂钩」。
+// 调用方必须持有 Runtime::MinHookMutex()。
+//
+// a -> b -> c 的顺序不可交换：
+//   a) MH_DisableHook(target)：先把目标入口字节还原回原函数（幂等；MH_ERROR_DISABLED
+//      说明本来就已停用，按成功处理）。这一步失败就整体放弃：入口没还原时 b/c 都
+//      不成立；
+//   b) site.nextTarget = target：入口字节已还原，此刻仍在 stub 里的在途调用者改去
+//      执行原函数——安全且语义正确，且此后不会再有人引用这块跳板；
+//   c) MH_RemoveHook(target)：释放跳板。必须排在 b 之后，否则在途线程会从 stub 直接
+//      跳进已释放的跳板（UAF）。
+// 摘除失败时保留站点记账（hookInstalled 等不动）；teardown 路径会给该站点打
+// recordStale，交给下次在同一地址取站时强制重建。
+bool RemoveHookSiteRecordLocked(void* target, HookSite& site) {
+    if (!target) return false;
+    const MH_STATUS disable = MH_DisableHook(target);
+    if (disable != MH_OK && disable != MH_ERROR_DISABLED) {
+        // 入口字节没能还原（例如映像已卸载 → MinHook 的 VirtualProtect 失败返回
+        // MH_ERROR_MEMORY_PROTECT）：此时【绝不能】把 nextTarget 指向 target——入口
+        // 仍跳本站 stub，stub 再跳 target 就成了死循环；记录与跳板原样保留，由调用方
+        // 决定是否打 recordStale（teardown 路径）交给下次取站重建。
+        Logger::Log("RemoveHookSiteRecord: MH_DisableHook(%p) -> %s; record retained",
+            target, MH_StatusToString(disable));
+        return false;
+    }
+    site.nextTarget = target;   // 入口已还原：在途调用走原函数，不再碰跳板
+    const MH_STATUS remove = MH_RemoveHook(target);
+    if (remove != MH_OK && remove != MH_ERROR_NOT_CREATED) {
+        Logger::Log("RemoveHookSiteRecord: MH_RemoveHook(%p) -> %s", target, MH_StatusToString(remove));
+        return false;
+    }
+    site.hookInstalled = false;
+    site.minhookTrampoline = nullptr;
+    site.activeDetour = nullptr;
+    site.detourOwner.clear();
+    Logger::Log("RemoveHookSiteRecord: removed MinHook record target=%p", target);
+    return true;
+}
+
+// ==== SafeWritePointer ====
+// 叶子 shim：out 槽虽然在注册时已探过可写，但插件之后可能自行释放该地址或改页保护。
+// 只有 POD 局部变量（MSVC C2712）；异常在这里被吃掉 —— 没有发生栈展开，调用方的
+// lock_guard 照常析构，因此绝不会因这次写入失败而泄漏 g_captureMutex。
+__declspec(noinline) static bool SafeWritePointer(void* dst, void* value) {
+    __try {
+        *reinterpret_cast<void**>(dst) = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// ==== CaptureDispatch ====
+// stub 慢路径调用的分发器：regs 指向 stub 栈帧保存的 4 个整数参数槽（rcx/rdx/r8/r9）。
+// 锁序恒为 MinHook -> capture，因此这里【只】取 g_captureMutex。
+// paramIndex 由 stub 传入，但一律以锁内站点字段为准（防止 stub 裸读到的陈旧值索引错
+// 参数）；hasCapture/retiring/空 outs 任一不成立都直接返回（陈旧读到 1 的兜底）。
+extern "C" void CaptureDispatch(void* regs, uint32_t paramIndex, void* sitePtr) {
+    HookSite* site = static_cast<HookSite*>(sitePtr);
+    if (!site || !regs) return;
+    // paramIndex 只为 stub 的调用约定保留（它直接把站点字段读进 edx）；一律以锁内站点字段为准。
+    (void)paramIndex;
+    std::lock_guard<std::mutex> lock(g_captureMutex);
+    if (!site->hasCapture || site->retiring) return;
+    const uint32_t index = site->captureParamIndex;
+    if (index > 3) return;
+    if (site->captureOuts.empty()) return;
+    const void* val = static_cast<void* const*>(regs)[index];
+    for (const HookSite::CaptureOut& out : site->captureOuts) {
+        if (!out.address) continue;
+        if (!SafeWritePointer(out.address, const_cast<void*>(val))) {
+            Logger::Log("CaptureDispatch: out slot not writable %p (plugin freed it?)",
+                static_cast<const void*>(out.address));
+        }
+    }
+}
+
+// ==== IsExecutableTargetSpan ====
+// providerAddress 必须落在【可执行页】：它是函数入口，不是数据 —— 站点 stub 会尾跳进
+// MinHook trampoline 去执行原函数前导，数据地址在这里没有意义。工程里没有现成的
+// "可执行页"探测 helper（PluginBoundary::IsReadable/IsWritable 只探读/写，Runtime::
+// IsReadableSpan 同源），因此按 LoaderCore::VerifyHookApiTableProtection 的写法走一次
+// VirtualQuery：整段（kMinHookTargetSpan）逐区域要求 MEM_COMMIT、保护不含
+// PAGE_NOACCESS/PAGE_GUARD，且含执行位。VirtualQuery 对任意地址都安全、不产生访问违例，
+// 所以这个探测本身不需要 SEH，也不破坏 PluginBoundary 的"取锁前访存"不变量。
+static bool IsExecutableTargetSpan(const void* p, size_t len) {
+    if (!p || len == 0) return false;
+    constexpr DWORD kExecMask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const uint8_t* cur = static_cast<const uint8_t*>(p);
+    size_t remain = len;
+    while (remain > 0) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(cur, &mbi, sizeof(mbi)) == 0) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+        if ((mbi.Protect & kExecMask) == 0) return false;
+        const size_t regionBytes = static_cast<size_t>(mbi.RegionSize)
+            - static_cast<size_t>(cur - static_cast<const uint8_t*>(mbi.BaseAddress));
+        if (regionBytes == 0) return false;   // 防御：RegionSize 解析异常，避免死循环
+        const size_t consumed = regionBytes < remain ? regionBytes : remain;
+        cur += consumed;
+        remain -= consumed;
+    }
+    return true;
+}
+
+// ==== RegisterGlobalCaptureCore ====
+// RegisterGlobalCapture 内部核心（无插件 owner 校验）：从插件入口提取的公共核心，
+// 供 RegisterGlobalCaptureImpl 复用。ownerId 空串 = Loader 归属（GameCore 重载时随
+// CleanupAllCaptureSites 清理 GameCore 域站点；插件卸载清理按 owner 匹配，跳过空串）。
+// providerAddress 是插件给的【绝对地址】，必须是可执行的函数入口：Loader 只探页属性
+// （可读 + 落在可执行页），不做任何名字 / 符号 / 映像解析。
+bool RegisterGlobalCaptureCore(void* providerAddress, uint32_t paramIndex, void** out,
+                                      const std::wstring& ownerId) {
+    if (!providerAddress || !out || paramIndex > 3) {
+        Logger::Log("RegisterGlobalCapture rejected: bad args provider=%p param=%u out=%p",
+            providerAddress, static_cast<unsigned>(paramIndex), static_cast<void*>(out));
+        return false;
+    }
+    // 页属性探测放在取生命周期锁【之前】（PluginBoundary 不变量）；探测本身是纯
+    // VirtualQuery，不会产生访问违例。
+    if (!PluginBoundary::IsReadable(providerAddress, PluginBoundary::kMinHookTargetSpan)) {
+        Logger::Log("RegisterGlobalCapture rejected: provider not readable %p (span=%zu)",
+            providerAddress, PluginBoundary::kMinHookTargetSpan);
+        return false;
+    }
+    if (!IsExecutableTargetSpan(providerAddress, PluginBoundary::kMinHookTargetSpan)) {
+        Logger::Log("RegisterGlobalCapture rejected: provider not in an executable page %p (span=%zu)",
+            providerAddress, PluginBoundary::kMinHookTargetSpan);
+        return false;
+    }
+
+    lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
+    if (PluginDomain::TargetInTearingDownGameCore(providerAddress)) {
+        Logger::Log("RegisterGlobalCapture: target belongs to tearing-down GameCore provider=%p",
+            providerAddress);
+        return false;
+    }
+
+    // 锁序 lifecycle -> MinHook -> capture：先在站点锁下取/建站点（只有首次建站才挂
+    // MinHook），再进 capture 锁登记订阅。同一 target 上的 Detour / 既有 Capture 都被复用。
+    HookSite* site = nullptr;
+    {
+        lock_guard<std::mutex> hookLock(Runtime::MinHookMutex());
+        site = GetOrCreateHookSiteLocked(providerAddress, "RegisterGlobalCapture");
+    }
+    if (!site) {
+        Logger::Log("RegisterGlobalCapture: hook site unavailable provider=%p", providerAddress);
+        return false;
+    }
+
+    size_t slotCount = 0;
+    {
+        lock_guard<std::mutex> captureLock(g_captureMutex);
+        if (site->hasCapture && site->captureParamIndex != paramIndex) {
+            Logger::Log("RegisterGlobalCapture: paramIndex conflict provider=%p have=%u want=%u",
+                providerAddress, static_cast<unsigned>(site->captureParamIndex),
+                static_cast<unsigned>(paramIndex));
+            return false;
+        }
+        // 先追加 out 槽再置 hasCapture：stub 裸读到 hasCapture=1 时 outs 必已可见。
+        site->captureParamIndex = paramIndex;
+        site->captureOuts.push_back({ out, ownerId });
+        site->retiring = false;
+        site->hasCapture = true;
+        slotCount = site->captureOuts.size();
+    }
+    Logger::Log("RegisterGlobalCapture: installed provider=%p param=%u owner=%ls "
+                "(hub stub=%p outs=%zu)",
+        providerAddress, static_cast<unsigned>(paramIndex), ownerId.c_str(),
+        site->stubCode, slotCount);
+    return true;
+}
+
+// ==== RegisterGlobalCaptureImpl ====
+// 插件入口：owner 校验后走核心（out 槽须位于插件模块内）。
+bool RegisterGlobalCaptureImpl(void* providerAddress, uint32_t paramIndex, void** out) {
+    // out 是宿主【写】的目标（CaptureDispatch 会往它写），是插件内存 —— 处理放在取锁之前。
+    // providerAddress 只探页属性（VirtualQuery，不解引用）。CaptureDispatch 侧另有叶子
+    // SEH 兜底（防插件注册后自行释放该地址 / 改页保护）。
+    if (!PluginBoundary::IsWritable(out, sizeof(void*))) {
+        Logger::Log("RegisterGlobalCapture rejected: out slot not writable %p",
+            static_cast<const void*>(out));
+        return false;
+    }
+
+    // owner 查询与注册必须在同一生命周期锁内，防止查询后插件先被停用并完成清理。
+    // 注意：owner 探针必须用插件自己的 out 指针（RequirePluginOwner 只做模块归属
+    // 查询，不解引用），不能用 Loader 副本，否则会被判成 Loader 自身。
+    lock_guard<std::recursive_mutex> lifecycleLock(LoaderCore::LifecycleMutex());
+    PluginBoundary::LoaderLockScope pbLockScope;
+    auto owner = PluginDomain::RequirePluginOwner(reinterpret_cast<const void*>(out), "RegisterGlobalCapture");
+    if (!owner) return false;
+    // 地址开放性门：capture 现在是"取地址型"入口（providerAddress 由插件自己解析后传入），
+    // 因此统一按地址开放性口径判：GameCore 类别 -> 目标须在当前 GameCore 映像内；Global
+    // 类别 -> 目标须落在【某个已加载的非 GameCore 模块】内（正面规则，见 IsTargetOpenToCaller）。
+    // 原先"调用方类别必须是 GameCore"那道特例门随之删除：它要防的悬垂已由本门 +
+    // CleanupAllCaptureSites 的 GameCore 域过滤共同覆盖，而 Global 插件挂在常驻模块上的
+    // capture 不再被误拒。
+    if (!PluginDomain::IsTargetOpenToCaller(owner->category, providerAddress, "RegisterGlobalCapture")) return false;
+    return RegisterGlobalCaptureCore(providerAddress, paramIndex, out, owner->ownerId);
+}
+
+// ==== CleanupAllCaptureSites ====
+// 只清 GameCore 域：GameCore 映像随对局重载而换地址，它的站点订阅必须随代际重注册；
+// exe / 其它常驻模块域上的站点（例如 Global 插件挂在 user32 上的 capture）永不失效，
+// 必须保留 —— 这也正是原先「只允许 GameCore 插件注册 capture」那道特例门删除之后，
+// Global 插件的常驻域订阅赖以存活的地方。
+// ResetForReload 调用本函数时旧 GameCore 映像仍 attached（detach 更晚），因此
+// ImageAddress::Contains(LoadedGameCore(), siteTarget) 的判定成立；GameCore 未加载
+// （无效 id）时 Contains 恒 false，等于"无 GameCore 域可清"。
+void CleanupAllCaptureSites() {
+    size_t sites = 0;
+    size_t outs = 0;
+    size_t kept = 0;
+    {
+        // 站点表结构由 MinHook 站点锁保护；capture 字段是它内层的派发侧数据。
+        // 锁序恒为 MinHook -> capture，与注册路径一致，不成环。
+        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+        lock_guard<mutex> lock(g_captureMutex);
+        const HookImageId gcImage = ImageAddress::LoadedGameCore();
+        for (auto& entry : g_hookSites) {
+            HookSite& site = entry.second;
+            if (!site.hasCapture && site.captureOuts.empty()) continue;
+            if (!ImageAddress::Contains(gcImage, entry.first)) {
+                ++kept;   // 非当前 GameCore 域（exe / 常驻模块）：捕获订阅保留
+                continue;
+            }
+            site.retiring = true;
+            site.hasCapture = false;
+            outs += site.captureOuts.size();
+            site.captureOuts.clear();
+            ++sites;
+        }
+    }
+    Logger::Log("CleanupAllCaptureSites: unplugged capture on %zu site(s) / %zu out slot(s) "
+                "inside the GameCore image (kept %zu site(s) outside by domain; no physical unhook)",
+        sites, outs, kept);
+}
+
+// ==== CleanupCaptureSitesForOwner ====
+// 插件卸载：只移除该 owner 的 out 槽；还有其它 owner 订阅时保留站点与 hasCapture。
+void CleanupCaptureSitesForOwner(const std::wstring& owner) {
+    if (owner.empty()) return;
+    size_t removed = 0;
+    size_t emptied = 0;
+    {
+        // 同 CleanupAllCaptureSites：先站点锁再 capture 锁（MinHook -> capture）。
+        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+        lock_guard<mutex> lock(g_captureMutex);
+        for (auto& entry : g_hookSites) {
+            HookSite& site = entry.second;
+            if (site.captureOuts.empty()) continue;
+            const size_t oldSize = site.captureOuts.size();
+            site.captureOuts.erase(std::remove_if(site.captureOuts.begin(), site.captureOuts.end(),
+                [&owner](const HookSite::CaptureOut& out) {
+                    return out.ownerId == owner;
+                }), site.captureOuts.end());
+            removed += oldSize - site.captureOuts.size();
+            if (site.captureOuts.empty() && site.hasCapture) {
+                site.retiring = true;
+                site.hasCapture = false;
+                ++emptied;
+            }
+        }
+    }
+    Logger::Log("CleanupCaptureSitesForOwner: owner=%ls removed=%zu out(s) emptied=%zu site(s) "
+                "(no physical unhook)", owner.c_str(), removed, emptied);
+}
+
+// ==== DisableGameCoreDomainSites ====
+// 第 1 步：把「GameCore 域（当前已加载映像 或 正在拆除的区间）+ 已挂钩」的站点批量停用。
+// 用 MH_QueueDisableHook + 【一次】 MH_ApplyQueued，而不是逐个 MH_DisableHook：
+//   * QueueDisable 只置 queueEnable=FALSE、不碰目标内存，因而可以边遍历站点表边调用；
+//   * ApplyQueued 内部用一次 Freeze(ALL_HOOKS_POS) 把这批入口字节一起还原，是一个批处理
+//     事务：入口一还原，就不会再有新调用进入 stub / 插件 detour。
+// 但 ApplyQueued 的内部循环遇到第一个 EnableHookLL 失败就 break（后面的记录不会被停用），
+// 所以排队前必须把不可读的目标剔除——否则一个已卸载映像的坏目标会挡住整批。
+// 不可读候选（映像在 LoadDLL 重入兜底路径里已经卸载）无法排进本批：给它打 recordStale，
+// 下次在同一地址取站时强制重建记录（否则站点会一直以为钩还装着，永不重新挂钩）。
+// 无返回值：第 2 步自己重扫站点表（见 RemoveGameCoreDomainSiteRecords 的说明），因此本批
+// 不带地址列表，也就不会漏掉 teardown 期间才装上的钩。
+void DisableGameCoreDomainSites() {
+    lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+    const HookImageId gcId = ImageAddress::LoadedGameCore();
+    size_t candidates = 0;
+    size_t readable = 0;
+    size_t unreadable = 0;
+    size_t queued = 0;
+    for (auto& [target, site] : g_hookSites) {
+        if (!site.hookInstalled) continue;
+        if (!ImageAddress::Contains(gcId, target) && !PluginDomain::TargetInTearingDownGameCore(target)) {
+            continue;
+        }
+        ++candidates;
+        if (!Runtime::IsReadableSpan(target, 1)) {
+            // 本批不能包含不可读目标（ApplyQueued 首败即 break）；标脏，等下次取站重建。
+            ++unreadable;
+            site.recordStale = true;
+            continue;
+        }
+        ++readable;
+        const MH_STATUS status = MH_QueueDisableHook(target);
+        if (status == MH_OK) {
+            ++queued;
+        } else {
+            // 排队失败只记日志：这一步本来就不会改写目标内存，第 2 步还会按地址再尝试
+            // 物理摘除，并据结果决定是否打 recordStale。
+            Logger::Log("DisableGameCoreDomainSites: MH_QueueDisableHook(%p) -> %s",
+                target, MH_StatusToString(status));
+        }
+    }
+    // 一次 ApplyQueued = 这一批入口字节在同一个 Freeze 事务里还原。
+    const MH_STATUS applied = MH_ApplyQueued();
+    Logger::Log("DisableGameCoreDomainSites: candidates=%zu readable=%zu queued=%zu unreadable=%zu "
+                "applyQueued=%s",
+        candidates, readable, queued, unreadable, MH_StatusToString(applied));
+}
+
+// ==== RemoveGameCoreDomainSiteRecords ====
+// 第 2 步：物理摘除 GameCore 域的站点记录（释放 MinHook 跳板），并复位共享钩状态。
+// 骨架沿用被本步替换掉的共享钩复位函数（该函数已删除）：
+//   1) 进入 teardown 窗口 + ImageAddress::DetachGameCore()（此后 Contains 不再命中，
+//      域过滤只剩 teardown 窗口），释放生命周期锁排空 g_activeSharedDetours（已进入共享
+//      detour 的调用先退出），再重新持生命周期锁；
+//   2) 重扫站点表而不是沿用第 1 步的地址列表：第 1 步与本步之间还跑过 capture 清理与
+//      插件卸载，注销路径理论上仍可能往正在拆除的映像上装新钩；重扫能把它一并收掉，
+//      否则这条新记录会跨代残留。摘除失败（映像已卸载
+//      -> MH_DisableHook 的 VirtualProtect 失败）时给站点打 recordStale 并拔掉 detour 槽，
+//      避免下次误判「已装」；
+//   3) 复位 g_orig* 与全部 PushMethods 槽位（与旧实现完全一致）。
+// 本函数不做 capture 的【订阅清理】（拔插槽 + 排空）——那是 ResetForReload 里更早的
+// CleanupAllCaptureSites() 与插件卸载路径 CleanupCaptureSitesForOwner 的职责；这里只清
+// 站点复位时必须一并清掉的 capture 数据字段（hasCapture / retiring / captureOuts）。
+void RemoveGameCoreDomainSiteRecords(
+        unique_lock<std::recursive_mutex>& lifecycleLock) {
+    // 禁止新的 GameCore API 解析后释放生命周期锁，让已经进入 detour 的插件回调
+    // 能正常调用 HookAPI 并退出；不能在持 lifecycle/hook 锁时等待。
+    HookImageInfo current{ sizeof(HookImageInfo) };
+    const HookImageId currentId = ImageAddress::LoadedGameCore();
+    if (ImageAddress::GetInfo(currentId, &current)) {
+        LoaderCore::Teardown::SetWindow(current.base, static_cast<uint32_t>(current.imageSize));
+    }
+    ImageAddress::DetachGameCore();
+    lifecycleLock.unlock();
+    // 排空在途共享 detour：计数与等待原语归 ScriptBridge 私有（阶段 4）。
+    // 不能在持 lifecycle/hook 锁时等待 —— 已在此前 unlock。
+    ScriptBridge::WaitForDetourDrain();
+    lifecycleLock.lock();
+
+    // 排空后才真正摘除站点记录（释放跳板）；顺序理由见 RemoveHookSiteRecordLocked。
+    // teardown 窗口此刻仍是旧映像区间（DetachGameCore 已让 ImageAddress 的 Contains 失效），
+    // 它以唯一判据回答「这个站点属不属于本次拆除的映像」。
+    size_t reset = 0;
+    size_t stale = 0;
+    {
+        lock_guard<mutex> hookLock(Runtime::MinHookMutex());
+        for (auto it = g_hookSites.begin(); it != g_hookSites.end(); ) {
+            if (!it->second.hookInstalled || !PluginDomain::TargetInTearingDownGameCore(it->first)) {
+                ++it;
+                continue;
+            }
+            if (RemoveHookSiteRecordLocked(it->first, it->second)) {
+                // 记录已摘、入口已还原。**节点不删**：stub 的机器码里用 imm64 永久内嵌了
+                // &HookSite（见 BuildHookHubStub），而"已经没有调用者停在 stub 内"无法证明
+                // （见 HookSite 顶部的硬约束注释）——erase 会让仍在 stub 里的线程读到已释放的 map 节点。
+                // 这里把站点复位成"未挂钩、可重建"：stub 保留并复用，下次在同一地址取站时走
+                // MH_CreateHook + MH_EnableHook 的正常重建路径（还会重拍前导字节副本）。
+                HookSite& site = it->second;
+                site.hookInstalled = false;      // RemoveHookSiteRecordLocked 已置，写出来当不变量
+                site.minhookTrampoline = nullptr;
+                site.activeDetour = nullptr;
+                site.detourOwner.clear();
+                // 不能置 nullptr：RemoveHookSiteRecordLocked 的 b 步已把 nextTarget 设为 target，
+                // 好让仍停在 stub 里的在途调用者走原函数；这里覆盖成 nullptr 会让它们 jmp 0，
+                // 而"没有调用者停在 stub 内"无法证明（见 HookSite 顶部硬约束）。保持 target。
+                site.nextTarget = it->first;
+                {
+                    // 锁序恒为 MinHook -> capture（本循环外层已持 MinHook 锁）。
+                    lock_guard<mutex> captureLock(g_captureMutex);
+                    site.hasCapture = false;
+                    site.retiring = false;
+                    site.captureOuts.clear();
+                }
+                ++reset;
+                ++it;
+                continue;
+            }
+            // 摘除失败（目标不可写/不可读）：入口字节没能还原，MinHook 记录与跳板还在。
+            // 打 recordStale 让下次在同一地址取站时强制重建；同时先拔掉 detour 槽，
+            // 免得下次误判「已装」而拒绝重新挂钩。
+            ++stale;
+            it->second.recordStale = true;
+            it->second.activeDetour = nullptr;
+            it->second.detourOwner.clear();
+            it->second.nextTarget = it->second.minhookTrampoline;
+            ++it;
+        }
+    }
+
+    // 共享钩状态复位（g_orig* ×2 + 全部 PushMethods 槽位）：这些对象归 ScriptBridge，
+    // 收进门面后本文件不必看见槽位数组、槽位类型与那把锁（阶段 4）。
+    ScriptBridge::ResetForTeardown();
+    // teardown 窗口【不在这里清】：它以"旧映像区间"为唯一判据，必须活到引擎真正换掉映像
+    // 那一步 —— LoaderHooks 的两个 detour 调完原函数后调 ClearGameCoreTeardownWindow()。
+    // 提前清会让"仍映射着的旧映像"重新对 Global 插件变成可钩的已加载模块。
+    Logger::Log("RemoveGameCoreDomainSiteRecords: reset %zu site(s) in place (MinHook record + "
+                "trampoline released; node kept: stubs embed &HookSite), marked recordStale=%zu; "
+                "script/UI detour sites + push slots reset",
+        reset, stale);
+}
+
+}  // namespace HookEngine

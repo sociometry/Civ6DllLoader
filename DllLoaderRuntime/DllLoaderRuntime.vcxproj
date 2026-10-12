@@ -156,6 +156,7 @@
     <ClCompile Include="SymbolResolve.cpp" />
     <ClCompile Include="PluginDomain.cpp" />
     <ClCompile Include="ScriptBridge.cpp" />
+    <ClCompile Include="HookEngine.cpp" />
     <ClCompile Include="Civ6MessageBus.cpp" />
     <ClCompile Include="HavokScript.cpp" />
     <ClCompile Include="Localization.cpp" />
