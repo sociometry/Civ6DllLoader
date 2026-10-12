@@ -153,6 +153,7 @@
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
     <ClCompile Include="Civ6DLLHookLoaderAPI.cpp" />
+    <ClCompile Include="SymbolResolve.cpp" />
     <ClCompile Include="Civ6MessageBus.cpp" />
     <ClCompile Include="HavokScript.cpp" />
     <ClCompile Include="Localization.cpp" />
