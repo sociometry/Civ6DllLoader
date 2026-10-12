@@ -12,8 +12,10 @@ symdb.py - Civ6 符号库（sidecar）流水线唯一入口
     compress   pack.bin -> "C6XC"+LZMA1 信封 .xp（自带 SHA256 roundtrip 校验）
     validate   按运行时同款解析独立校验 .bin / .xp
     aob        从 pack.bin 的 mask 指纹生成/核对 loader 的 AOB 常量（--emit-cpp）
-    rva-map    GameCore.symdb.json -> rva_map.json（喂 rva_to_symbol.exe）
     all        一条命令跑完整条产线：module x3 -> pack -> compress -> 部署 -> validate -> 清理中间产物
+
+（原先的 rva-map 子命令已迁到 tools/gen_rva_map.py：rva_to_symbol 现在把
+ gamecore/dx11/dx12 三个映像的符号表压缩后编译期嵌入 exe，生成端要做三份 + 压缩。）
 
 帮助：python tools/symdb.py <子命令> -h
 
@@ -1700,63 +1702,12 @@ def cmd_aob(args) -> int:
 
 
 # ============================================================================
-# 八、rva-map：GameCore.symdb.json -> rva_map.json
+# 八、rva-map
 # ============================================================================
-
-def hexstr(rva: int) -> str:
-    return f"0x{rva:X}"
-
-
-def build_rva_map(input_path, output_path):
-    with open(input_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    rva_map = {}
-
-    # 第一遍：建立所有符号条目
-    for sym in data["symbols"]:
-        rva = int(sym["rva"], 16)
-        kind = sym["kind"]
-        rva_map[hexstr(rva)] = {
-            "kind": kind,
-            "demangled": sym.get("demangled", ""),
-            "mangled": sym.get("mangled", ""),
-            "vtable_xrefs": [],
-        }
-
-    # 第二遍：把 vtable 槽位引用（vtable_rva:slotOffset）加到被引用函数上
-    for sym in data["symbols"]:
-        if sym["kind"] != "vtable":
-            continue
-
-        vtable_rva = int(sym["rva"], 16)
-        for slot in sym.get("slots", []):
-            slot_offset = int(slot["offset"])
-            func_rva = int(slot["funcRva"], 16)
-
-            func_key = hexstr(func_rva)
-            if func_key in rva_map:
-                rva_map[func_key]["vtable_xrefs"].append(
-                    f"{hexstr(vtable_rva)}:{hexstr(slot_offset)}"
-                )
-
-    # 去重并按 (vtable_rva, offset) 升序排列
-    def xref_key(x: str):
-        vt, off = x.split(":")
-        return (int(vt, 16), int(off, 16))
-
-    for key, entry in rva_map.items():
-        entry["vtable_xrefs"] = sorted(set(entry["vtable_xrefs"]), key=xref_key)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(rva_map, f, ensure_ascii=False, indent=2)
-
-    print(f"wrote {output_path}: {len(rva_map)} entries")
-
-
-def cmd_rva_map(args) -> int:
-    build_rva_map(args.input, args.output)
-    return 0
+# 已迁出本文件：见 tools/gen_rva_map.py。
+# rva_to_symbol 现在把三个映像（gamecore/dx11/dx12）的符号表 zlib 压缩后编译期
+# 嵌入 exe，因此生成端要做"三份 + 压缩"，与这里原先的单份未压缩实现不同源。
+# 保留两份实现只会造成漂移，故只留 gen_rva_map.py 一处。
 
 
 # ============================================================================
@@ -1935,13 +1886,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只输出可直接粘贴进 LoaderHooks.cpp / UiInject.cpp 的 constexpr 常量块")
     p.set_defaults(func=cmd_aob)
 
-    # ---- rva-map ----
-    p = sub.add_parser("rva-map", help="GameCore.symdb.json -> rva_map.json",
-                       description="读取 symdb JSON，生成以 rva 为键的符号映射 rva_map.json"
-                                   "（喂 rva_to_symbol.exe）")
-    p.add_argument("input", nargs="?", default=DEFAULT_JSON)
-    p.add_argument("output", nargs="?", default=os.path.join(HERE, "rva_map.json"))
-    p.set_defaults(func=cmd_rva_map)
+    # ---- rva-map：已移到 tools/gen_rva_map.py ----
+    # 旧实现只处理 GameCore 且产出单文件 rva_map.json；现在 rva_to_symbol 把三个映像
+    # 的符号表压缩后**编译期嵌入** exe，生成逻辑（含 zlib 打包）统一由
+    # tools/gen_rva_map.py 承担，这里不再保留第二份实现。
+    # 重建：python tools/gen_rva_map.py 然后 tools/rva_to_symbol/build.bat
 
     # ---- all ----
     p = sub.add_parser("all", help="一条命令跑完整条产线",

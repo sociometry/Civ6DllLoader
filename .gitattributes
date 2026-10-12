@@ -1,0 +1,15 @@
+# 行尾约定
+#
+# 批处理必须用 CRLF 检出：部分 cmd.exe 对 LF-only 的 .bat 解析有分歧
+# （尤其带括号的多行 if/for 块），同一份脚本换台机器就可能报
+# "xxx 不是内部或外部命令"。这里显式钉死，不依赖各人本地的 autocrlf。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制符号表与工具产物：禁止任何行尾/编码转换
+*.z      binary
+*.exe    binary
+*.bin    binary
+*.xp     binary
+*.lib    binary
+*.pdb    binary
