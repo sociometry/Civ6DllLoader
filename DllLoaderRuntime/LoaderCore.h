@@ -38,11 +38,11 @@ void InitEarly();
 // 返回 0 表示尚未初始化（DllMain 休眠检测未通过，理论不会走到扫描）。
 HMODULE RuntimeModuleHandle();
 
-// 进程内 HookAPI 实例（实现于 Civ6DLLHookLoaderAPI.cpp）。
-// 用途只剩一个：把这张【只读表】交给插件（OnLoad）。Loader 自身的内部取址一律走下面的
-// CurrentExeImage / ResolveDataByAobCore 与 Civ6DLLHookLoaderAPI.cpp 里的 *Core，
-// 不经过插件 ABI、也不拿插件生命周期锁。
-HookAPI* RuntimeHookApi();
+// 交给插件的引导结构（实现于 HookLoaderApi.cpp）。
+// 插件在 OnLoad 里用它的 Query 按名字把本模块私有的 HookAPI 表填满，之后照旧 api->Xxx(...)。
+// Loader 自身的内部取址一律走下面的 CurrentExeImage / ResolveDataByAobCore 与
+// AddressResolve.cpp 里的 *Core / InternalToolApi()，不经过插件 ABI、也不拿插件生命周期锁。
+const HookContext* RuntimeHookContext();
 
 // 当前进程 exe 的映像 id（DX11/DX12；未识别 = kHookImageInvalid）。
 // 与 common/HookAPI.h 的 HookCurrentExeImage 同语义，但直连 ImageAddress。

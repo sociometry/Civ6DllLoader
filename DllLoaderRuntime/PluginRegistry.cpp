@@ -114,7 +114,7 @@ static thread_local HMODULE g_activePluginModule;
 // g_gameCorePhaseReady 已移到 ScriptBridge（阶段 4），经 IsGameCorePhaseReady() 读写。
 
 // 插件导出入口的类型（LoadPluginDllInternal 按名取这些导出）。
-typedef void (*OnLoadFunc)(HookAPI*);
+typedef void (*OnLoadFunc)(const HookContext*);
 typedef void (*OnUnloadFunc)();
 typedef void (*OnMessageFunc)(const char*, const void*, size_t);
 
@@ -438,7 +438,7 @@ bool AttachGameCore(HMODULE gameCore) {
 // ==== CallOnLoadSafe ====
 static bool CallOnLoadSafe(OnLoadFunc onLoad, const char* name) {
     __try {
-        onLoad(LoaderCore::RuntimeHookApi());
+        onLoad(LoaderCore::RuntimeHookContext());
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("OnLoad crashed in plugin %s code=0x%08X", name, GetExceptionCode());

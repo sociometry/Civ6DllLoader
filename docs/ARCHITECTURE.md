@@ -63,8 +63,8 @@
 
 | 文件 | 职责 |
 |---|---|
-| `common/HookAPI.h` | 插件 ABI：HookAPI 表、类型、类别门禁、`HookAPI_IsCompatible` |
-| `DllLoaderRuntime/HookLoaderApi.cpp` | **ABI 汇聚点**：`g_hookApi` 表本身 + 只读性校验；它取各模块 `*Impl` 的地址，不反向被依赖 |
+| `common/HookAPI.h` | 插件 ABI：入口清单 `HOOK_API_LIST`、`HookContext`、生成式 `HookAPI`、`HookAPI_Resolve`、类别门禁 |
+| `DllLoaderRuntime/HookLoaderApi.cpp` | **ABI 汇聚点**：`g_hookApi` 表本身 + 按名字交付的 `Query` + 只读性校验；它取各模块 `*Impl` 的地址，不反向被依赖 |
 | `DllLoaderRuntime/PluginRegistry.cpp` | 插件生命周期：`PluginEntry` 表、加载/卸载/隔离、类别判定、`ResetForReload`、排队释放 |
 | `DllLoaderRuntime/ScriptBridge.cpp` | Lua / GameEvent / 脚本注册 / PushMethods 槽位（最大的一个模块） |
 | `DllLoaderRuntime/HookEngine.cpp` | 站点表、stub 生成、capture、装钩与物理摘钩 |
@@ -84,7 +84,7 @@
 | `DllLoader/ShellBootstrap.cpp` | 薄壳侧的补装（首次安装；运行时自更新在 `LoaderUpdate.cpp`） |
 | `tools/symdb.py` | 符号库流水线（唯一入口，含 AOB 生成/核对） |
 
-> 读源码的顺序建议：`HookLoaderApi.cpp`（看 ABI 表的 78 个指针各归谁）→ `PluginRegistry.cpp`（生命周期）
+> 读源码的顺序建议：`HookLoaderApi.cpp`（看 ABI 表的 77 个指针各归谁）→ `PluginRegistry.cpp`（生命周期）
 > → `HookEngine.cpp`（挂钩）→ `ScriptBridge.cpp`（脚本面）。各模块的归属状态与门面见
 > `docs/REFACTOR_PLAN.md` §3/§5。
 
@@ -424,7 +424,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 4. **类别门禁（在 OnLoad 之前）**：读插件的 `Civ6PluginKind` 导出（低 32 = kind；高 32 = apiVersion
    只进日志，由 `common/HookAPI.h` 自动发出）。缺导出（旧头文件编出来的插件）或 kind 与"安装路径
    推出的类别"不符 → 记日志 + 释放本次自己拿到的引用（`ownsRef`）后拒载；apiVersion **不参与**这里的
-   判断，ABI 兼容性由插件侧 `HookAPI_IsCompatible`（版本 + `structSize`）决定。
+   判断，ABI 兼容性由插件侧 `HookContext_IsCompatible`（`structSize` + `apiVersion`）决定。
    **所有拒载都发生在 OnLoad 之前**：此时没有任何**经 Loader 账本**的钩子/补丁/回调需要回滚，`FreeLibrary`
    只释放本次自己拿到的引用。注意这不等于「插件一行代码都没跑过」——`LoadLibraryExW` 已经执行过它的
    `DllMain`/CRT 初始化，`Civ6PluginKind` 的调用也在 SEH 叶子里执行；那是信任边界，不是安全保证；
@@ -470,45 +470,78 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 - **GameCore 真卸载**：它的钩/补丁只允许落在当前 GameCore 映像内（§4.1），加上重载时整套 teardown，
   所以静态状态不会跨局残留。
 
-### 3.4 插件 ABI：HookAPI 表与版本规则
+### 3.4 插件 ABI：按名字交付的接口与版本规则
 
-- 表是 `const HookAPI g_hookApi`（`.rdata`，只读——插件写它会当场 AV，被 `CallOnLoadSafe` 接住）；
-- **表的形状由两条 `static_assert` + 一个计数常量钉死**：`CIV6_HOOK_API_ENTRY_COUNT`（当前 77）
-  必须与 `sizeof(HookAPI)` 和末尾成员偏移同时吻合，否则编译失败；启动时 `VerifyHookApiTableProtection`
-  再扫一遍空项（聚合初始化漏写一项只会静默零填，编译期抓不到）；
-- **当前 `CIV6_HOOK_API_VERSION = 1`，且预发布阶段删改前缀不升版本号** —— 从未对外发布过插件，
-  `1` 是它唯一出现过的值。
-  此后只在**尾部追加**过入口（`GetSymbolDbState` / `GetSymbolDbMatchRatio`）——
-  追加不破坏旧偏移，旧插件不读新字段即可继续工作，`HookAPI_IsCompatible` 的 `structSize` 比较会
-  放过这种情形。
-  **在预发布阶段，插件必须用当前头文件重新编译**；首次对外发布之后才需要递增版本号；
-- **类别走一条独立于表的通路**：`common/HookAPI.h` 为插件自动发出 `Civ6PluginKind` 导出
-  （`extern "C" __declspec(dllexport) inline`，低 32 = kind、高 32 = `CIV6_HOOK_API_VERSION`），
-  loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 32 位只进日志）。插件作者一行都不用写；
-- `HookAPI_IsCompatible(api)` 对比 `apiVersion` 与 `structSize`，**这是一个跨两边的有效比较**：
-  `api` 是 Loader 通过 `OnLoad` 传进来的 `LoaderCore::RuntimeHookApi()`（= `&g_hookApi`，
-  Loader 编译进去的那份表），`CIV6_HOOK_API_VERSION` 与 `sizeof(HookAPI)` 才是插件编译进去的值。
-  因此它能同时检出两种失配：**破坏性改动**（Loader 侧 `apiVersion` 变了而插件头没跟上，或反之）
-  与 **append-only 场景**（Loader 表更大时 `structSize` 不等式成立，正是 `common/HookAPI.h` 里
-  `HookAPI_IsCompatible` 上方注释承诺的语义；Loader 侧 `structSize` 另有 static_assert 钉死）。
-  它守不住的是"插件根本没调它"——
-  真正在 `OnLoad` 之前硬把关的仍然是上一条的 `Civ6PluginKind` 导出：
-- 两个门的分工：`Civ6PluginKind` 决定"要不要跑 `OnLoad`"（Loader 侧强制），
-  `HookAPI_IsCompatible` 是插件进入主逻辑前的自检（插件侧自愿，但比较内容有效）。
+**契约载体是"入口名"，不是字段偏移。** Loader 通过 `HookContext::Query` 按名字交付入口，
+插件在 `OnLoad` 里把本模块私有的 `HookAPI` 表填满，之后照旧 `api->Xxx(...)` 调用。
+因此入口可以删除、重排、改所属领域，都不需要拒载任何插件——只要名字还在，已有插件继续工作。
+
+三个组成部分：
+
+- **`HookContext`**（`common/HookAPI.h`）——ABI 里唯一冻结的结构，`OnLoad` 的唯一入参：
+
+  | 字段 | 偏移 | 作用 |
+  |---|---|---|
+  | `structSize` | 0 | Loader 侧 `sizeof(HookContext)`；**兼作"两边是否同一次构建"的哨兵** |
+  | `apiVersion` | 4 | 恒为 1；预发布阶段删改入口不递增 |
+  | `Query` | 8 | 名字 → 函数地址；未知名返回 `nullptr` |
+
+- **`HookAPI`**——插件侧的表，布局由 `common/HookAPI.h` 决定，与 Loader 内部怎么排无关。
+  该结构体从不跨越模块边界，每个插件只用自己那一份；两类插件的 `sizeof` 不同
+  （GameCore 多 7 个成员），这不构成问题。
+
+- **`HOOK_API_LIST`**（`common/HookAPI.h`）——77 个入口的唯一来源，X-macro 形式，
+  列 = `X(entryName, returnType, params, category)`。由它生成：结构体成员、入口计数
+  `CIV6_HOOK_API_ENTRY_COUNT`、Loader 侧的名字查找、插件侧的解析代码。加一个入口 = 清单加一行。
+
+**为什么 `structSize` 在偏移 0**：它是部署一致性的判据。若插件与 Loader 不是同一次构建
+（改了头文件却只重编一边），两边对偏移的解释就不同：新插件会把陈旧表的 `apiVersion`（=1）
+读成 `structSize`，`1 < sizeof(HookContext)` 直接判否；反向亦然。两个方向都在调用任何函数
+指针之前退出。
+
+**Loader 侧的 `g_hookApi`** 是 `const HookAPI`（`.rdata`，只读），77 项位置初始化，
+供 Loader 内部使用并作为 `Query` 的地址来源。它的形状由两条 `static_assert` 钉死
+（`sizeof(HookAPI)` 与末尾成员偏移必须与 `CIV6_HOOK_API_ENTRY_COUNT` 吻合），
+启动时 `VerifyHookApiTableProtection` 再扫一遍空项（聚合初始化漏写一项只会静默零填，
+编译期抓不到）。
+
+**当前 `CIV6_HOOK_API_VERSION = 1`，且预发布阶段删改入口不升版本号** —— 从未对外发布过插件，
+`1` 是它唯一出现过的值。**在预发布阶段，插件必须用当前头文件重新编译**；
+首次对外发布之后才需要递增版本号，规则见 §10.3。
+
+**类别走一条独立于表的通路**：`common/HookAPI.h` 为插件自动发出 `Civ6PluginKind` 导出
+（`extern "C" __declspec(dllexport) inline`，低 32 = kind、高 32 = `CIV6_HOOK_API_VERSION`），
+Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 32 位只进日志）。
+插件作者一行都不用写。
+
+**`HookContext_IsCompatible(ctx)`** 是插件进入主逻辑前的自检，比较 `structSize` 与 `apiVersion`：
+
+- `ctx` 是 Loader 编译进去的那份（`LoaderCore::RuntimeHookContext()` 返回的静态对象），
+  `CIV6_HOOK_API_VERSION` 与 `sizeof(HookContext)` 是插件编译进去的值 —— 这是一个跨两边的有效比较；
+- 它守不住的是"插件根本没调它"。真正在 `OnLoad` 之前硬把关的是上面的 `Civ6PluginKind` 导出。
+
+**`HookAPI_RequireAll(api, &HookAPI::Xxx, ...)`** 让插件声明自己真正依赖的入口。
+`HookAPI_Resolve` 总是把全部格子填满，查不到的置 `nullptr`（绝不会是野指针，最坏是空指针调用），
+因此缺项时插件在 `OnLoad` 里报名字并优雅退出，而不是在某个调用点崩溃。
+参数用成员指针而非字符串，所以名字拼错是编译错误、IDE 能补全、重命名能跟随。
 
 > **线程调用契约说明**：除明确标注“仅游戏线程调用”的接口（如 Lua 原语与部分 GameCore 专属入口）外，其余大部分入口内部均通过专用互斥锁保护。关于并发访问与锁序要求，详见 §2.5 锁表。
 
 ### 3.5 类别门禁三层
 
-1. **编译期**（`common/HookAPI.h` 底部）：插件在工程宏里定义 `CIV6_PLUGIN_GLOBAL` 或
-   `CIV6_PLUGIN_GAMECORE`。Global 下把 8 个 GameCore 专属**成员名**重命名成自带解释的符号，
-   于是"调用或取地址"都在编译期报「不是 HookAPI 的成员」；结构体字段一个没少、偏移一个没变。
-   两个宏都没定义且不是 loader → `#error`；loader 侧靠 vcxproj 里的 `CIV6_HOOKAPI_BUILD_IMPL` 逃逸。
+1. **编译期**（`common/HookAPI.h`）：插件在工程宏里定义 `CIV6_PLUGIN_GLOBAL` 或
+   `CIV6_PLUGIN_GAMECORE`。结构体成员由清单经 `CIV6_HOOKAPI_MEMBER_<类别>` 派发生成，
+   Global 下 7 个 GameCore 专属成员**不生成**，于是 `api->GetPlayer(...)` 直接报
+   `C2039: "GetPlayer": 不是 "HookAPI" 的成员`。类别声明与结构体定义同处一个头文件，
+   且检查在结构体之前 —— 成员集本身就依赖类别。
+   两个宏都没定义且不是 loader → `#error`；loader 侧靠 vcxproj 里的 `CIV6_HOOKAPI_BUILD_IMPL` 逃逸
+   （该宏下 GameCore 成员照常生成，因为 Loader 内部要用全表）。
 2. **加载期**（`LoadPluginDllInternal`，在 `OnLoad` 之前）：`GetProcAddress(plugin, "Civ6PluginKind")`
    读"插件自述 kind"，与"安装路径推出的类别"（`CategoryForPath`）对账，不符就拒载——此时插件还没跑过
    任何代码（apiVersion 也在导出里，但只记日志，不参与拒载）。
-3. **运行期**（`RequireGameCoreOwner`）：8 个 GameCore 专属入口各有一道兜底，防"不带头文件、按结构体
-   偏移硬调"的插件；探针地址优先用插件提供的函数地址，没有则用 `_ReturnAddress()`。
+3. **运行期**（`RequireGameCoreOwner`）：7 个 GameCore 专属入口各有一道兜底，防"不带头文件、直接
+   手写 `ctx->Query("GetPlayer")` 硬取"的插件；探针地址优先用插件提供的函数地址，没有则用
+   `_ReturnAddress()`。
 
 这三层只管**接口面与身份**；"目标地址是否开放"是另一层（§4.1）。
 
@@ -516,7 +549,8 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 
 ## 4. 插件接口（HookAPI 全表）
 
-表共 79 个字段 = 2 个头（`apiVersion` / `structSize`）+ 77 个入口。按"谁能用、受什么限制"分四类。
+77 个入口，按"谁能用、受什么限制"分四类。清单在 `common/HookAPI.h` 的 `HOOK_API_LIST`，
+结构体与计数都由它生成。
 
 ### 4.1 双域通用，但按"目标地址域"设门（9 个）
 
@@ -1151,21 +1185,26 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 #### 加一个 HookAPI 入口
 
-1. 在 `common/HookAPI.h` 的 `HookAPI` 结构**尾部**追加函数指针；
-2. 若它只对 GameCore 有意义：加进文件底部"类别门禁"块的对象式重命名列表（7 个之一的位置），
-   并在实现里调用 `RequireGameCoreOwner`；
-3. 若它是"换地址 / 给地址"类：实现必须过 `IsTargetOpenToCaller` / `IsRangeOpenToCaller`；
-4. 在**归属模块**里实现对应的 `*Impl`（取址类 → `AddressResolve.cpp`；脚本/Lua/GameEvent/PushMethods 类 →
+1. 在 `common/HookAPI.h` 的 `HOOK_API_LIST` **末尾**追加一行
+   `X(entryName, returnType, params, category)`。结构体成员、`CIV6_HOOK_API_ENTRY_COUNT`、
+   Loader 侧的名字查找、插件侧的解析代码都由这一行生成，不需要改别处；
+2. `entryName` 从此是契约：它同时是结构体成员名和 `Query` 的查找键（清单里经 `#entryName`
+   字符串化），改名等于删一个入口再加一个。追加时排在末尾，使 Loader 侧 `g_hookApi` 的
+   位置初始化只需在对应位置补一项；
+3. `category` 填 `kGameCore`（只对 GameCore 有意义）时，实现里要调 `RequireGameCoreOwner`
+   做运行期兜底；
+4. 若它是"换地址 / 给地址"类：实现必须过 `IsTargetOpenToCaller` / `IsRangeOpenToCaller`；
+5. 在**归属模块**里实现对应的 `*Impl`（取址类 → `AddressResolve.cpp`；脚本/Lua/GameEvent/PushMethods 类 →
    `ScriptBridge.cpp`；插件生命周期类 → `PluginRegistry.cpp`；装钩/捕获 → `HookEngine.cpp`），
-   然后在 `HookLoaderApi.cpp` 的 `g_hookApi` 位置初始化表里**按顺序**填上它的地址。
-   追加入口还必须同步 `common/HookAPI.h` 的 `CIV6_HOOK_API_ENTRY_COUNT`：`g_hookApi` 上方的两条
-   `static_assert`（`sizeof` + 末尾字段偏移）挡住「加了字段却没改计数/没补初始化」，
-   `VerifyHookApiTableProtection` 启动时还会扫描空项；
+   然后在 `HookLoaderApi.cpp` 的 `g_hookApi` 位置初始化表里**按清单顺序**填上它的地址。
+   `g_hookApi` 上方的两条 `static_assert`（`sizeof` + 末字段偏移）挡住「加了清单项却没补初始化」，
+   `VerifyHookApiTableProtection` 启动时还会扫描空项 —— 漏填一项的表现是该名字经 `Query` 返回
+   `nullptr`，插件侧被 `HookAPI_RequireAll` 抓住；
    > 表是 `const` 的且 `*Impl` 不能是 `static`（`g_hookApi` 取的是它们的地址）；
    > 反过来 `HookLoaderApi.cpp` include 全部子系统头文件，且没有任何下层模块反向 include 它——
    > 它是组装根，不参与实现。
-5. 编译 loader 侧需要 `CIV6_HOOKAPI_BUILD_IMPL`（工程里已定义）；
-6. **不要**动已有字段的顺序，也不要改 `apiVersion`（见 10.3）。
+6. 编译 loader 侧需要 `CIV6_HOOKAPI_BUILD_IMPL`（工程里已定义）；
+7. **不要**动已有行的顺序（`g_hookApi` 是位置初始化），也不要改 `apiVersion`（见 10.3）。
 
 #### 加一个内部钩（loader 自己用）
 
@@ -1183,14 +1222,23 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 ### 10.3 改 ABI 的规则
 
-- **预发布阶段（当前）不升版本号**：从未对外发布过插件，删字段 / 改顺序 / 改语义直接做，
+- **入口按名字演进，不占偏移**：加一个入口 = 清单加一行（`apiVersion` 不动）；删一个入口 =
+  删那一行（用到它的插件在 `HookAPI_RequireAll` 处得到 `nullptr` 并优雅退出）；
+  重排清单行只影响 Loader 内部 `g_hookApi` 的初始化顺序，与插件无关；
+- **签名变更 = 新增 `XxxEx`，旧入口保留**：名字查找能证明"名字存在"，不能证明"参数一致"。
+  `GetPlayer(int)` 要加参数时，新增 `GetPlayerEx(int, bool)` 并让旧入口在 Loader 内部转发过去；
+  旧入口用 `[[deprecated("use GetPlayerEx")]]` 标记，插件编译时得到 `C4996` 与替换建议。
+  先例：`CreateWindow`/`CreateWindowEx`、`VirtualAlloc`/`VirtualAllocExNuma`。
+  **不要原地改签名**——那是寄存器/栈错位，不是编译错误，表现为运行期随机崩溃；
+- **`HookContext` 只追加**：它是唯一冻结的结构，字段顺序不可动（`structSize` 必须留在偏移 0，
+  它兼作部署一致性哨兵）；
+- **预发布阶段（当前）不升版本号**：从未对外发布过插件，删改入口直接做，
   `CIV6_HOOK_API_VERSION` 停在 `1`（唯一出现过的值）；插件必须用当前头文件重新编译；
-- **对外发布之后**：只追加（新增函数追加到尾部，`apiVersion` 不动）；破坏前缀才提升版本号，
-  旧插件会被拒而不是崩；
-- **类别门在表外**：`Civ6PluginKind` 导出负责"OnLoad 之前"按类别快速拒绝（旧头文件编出来的插件没有这个
-  导出 → 在 OnLoad 之前就被拒）；ABI 版本兼容仍由表内的 `apiVersion` + `structSize`（插件侧
-  `HookAPI_IsCompatible`）判；
-- **删除枚举值不算前缀破坏**：不需要再升版本；
+- **对外发布之后破坏 `HookContext` 前缀才提升版本号**，旧插件会被拒而不是崩；
+- **类别门在 `HookContext` 之外**：`Civ6PluginKind` 导出负责"OnLoad 之前"按类别快速拒绝
+  （旧头文件编出来的插件没有这个导出 → 在 OnLoad 之前就被拒）；
+  ABI 兼容性由 `structSize` + `apiVersion`（插件侧 `HookContext_IsCompatible`）判；
+- **删除枚举值不影响 ABI**；
 - 改完必须：两个配置都重编 + 跑一遍真机测试验证。
 
 ### 10.4 文档维护约定

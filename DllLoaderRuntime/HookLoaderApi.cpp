@@ -123,13 +123,39 @@ static const HookAPI g_hookApi = {
     &AddressResolve::GetSymbolDbMatchRatioImpl,
 };
 
-// ==== RuntimeHookApi ====
-// loader 内部复用 common/HookAPI.h 的 HookInfo 取址工具时的入口（LoaderHooks/UiInject 用），
-// 也是把这张表交给插件（OnLoad）的唯一出口。
-// 契约：只读。const_cast 只是为了配合既有 HookAPI* 签名（common/HookAPI.h 里的 inline
-// 工具函数都吃 HookAPI*）；任何调用方都不得写入。
-HookAPI* LoaderCore::RuntimeHookApi() {
-    return const_cast<HookAPI*>(&g_hookApi);
+// ==== RuntimeHookContext / HookApiQuery ====
+// 插件不再拿到这张表：OnLoad 收到的是 HookContext（3 个字段，见 common/HookAPI.h），
+// 里面只有一个 Query —— 插件在 OnLoad 里按名字把自己那张 HookAPI 表填满。
+// 名字是白名单：只认 HOOK_API_LIST 里的 77 个入口，loader 的其它函数一律不暴露。
+//
+// g_hookApi 不删除，它现在的角色是【loader 内部实现地址表】：
+// Query 按名字取其中的槽，其余用途（内部 header-only 工具）也照旧可用。
+static void* HookApiQuery(const char* name) {
+    if (!name || !*name) return nullptr;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(&g_hookApi);
+    void* slot = nullptr;
+    // 按名字取 g_hookApi 里对应的那一格。名字由清单经 # 字符串化得到，不手写。
+#define CIV6_HOOKAPI_QUERY(entryName)                                      \
+    if (strcmp(name, #entryName) == 0) {                                   \
+        std::memcpy(&slot, base + offsetof(HookAPI, entryName), sizeof(slot)); \
+        return slot;                                                       \
+    }
+#define X(entryName, returnType, params, category) CIV6_HOOKAPI_QUERY(entryName)
+    HOOK_API_LIST(X)
+#undef X
+#undef CIV6_HOOKAPI_QUERY
+    return nullptr;
+}
+
+// 递给 OnLoad 的唯一出口。契约：只读，load 期间不变。
+// 字段顺序见 common/HookAPI.h 的 HookContext 注释：structSize 在偏移 0，兼作部署一致性哨兵。
+const HookContext* LoaderCore::RuntimeHookContext() {
+    static const HookContext ctx = {
+        static_cast<uint32_t>(sizeof(HookContext)),
+        CIV6_HOOK_API_VERSION,
+        &HookApiQuery,
+    };
+    return &ctx;
 }
 
 // ==== VerifyHookApiTableProtection ====
