@@ -256,8 +256,10 @@ typedef struct HookContext {
        参数由 Loader 复制。原 PushMethods 由 Loader 自动调用，本接口不再返回其 \
        trampoline；预发布插件须按当前头文件重新编译。 */ \
     X(PushLuaMethods, HookApiPushMethodsResult, (const char* name, const LuaMethodInfo* methods, uint32_t count), kGameCore) \
-    X(RegisterScriptGlobals, void, (ScriptGlobalsFn fn), kGameCore) \
-    X(RegisterScriptGlobalsForUI, void, (ScriptGlobalsFn fn), kGameCore) \
+    /* 注册 GameCore 的 gameplay 脚本环境里的全局：fn 在 GameCore 调用        GameCore::Lua::Utility::RegisterScriptData 时被顺带执行，参数 L 是那一侧的 lua_State。        每局换局后由引擎重新调用注册入口，Loader 会按当次仍存在的登记重装钩子。        只对 GameCore 类别可见（Global 插件拿不到这个成员）。 */ \
+    X(RegisterGameCoreScriptForGamePlay, void, (ScriptGlobalsFn fn), kGameCore) \
+    /* 同上，但接进 GameCore 的 UI 脚本环境（GameCore::Lua::Utility::RegisterScriptDataForUI），        lua_State 是 GameCore 侧界面脚本用的那个，与 gameplay 不是同一个。 */ \
+    X(RegisterGameCoreScriptForUI, void, (ScriptGlobalsFn fn), kGameCore) \
     X(LuaPushNamedCClosure, void, (void*, void*, int, const char*, int), kCommon) \
     X(LuaCheckInteger, int, (void*, int), kCommon) \
     X(LuaCheckNumber, double, (void*, int), kCommon) \
@@ -386,8 +388,28 @@ typedef struct HookContext {
     /* 跨版本对齐的匹配率（已匹配的 .pdata 条目数 / 总条目数），取值 [0.0, 1.0]。 \
        仅 kHookApiDbCrossVersion 状态下是"部分匹配"的度量；此时 1.0 表示全部对齐。 \
        非跨版本状态返回：Identical -> 1.0（恒等映射，无失配），其它 -> 0.0（无数据/不可用）。 \
-       用于诊断与降级决策；单点能否解析仍以 ResolveByRva/ResolveByName 的返回值为准。 */ \
-    X(GetSymbolDbMatchRatio, double, (HookImageId image), kCommon)
+       用于诊断与降级策略；单点能否解析仍以 ResolveByRva/ResolveByName 的返回值为准。 */ \
+    X(GetSymbolDbMatchRatio, double, (HookImageId image), kCommon) \
+    /* ---- 捕获订阅的反向操作 ---- \
+       撤销本插件先前在该 provider 上注册的一个捕获订阅，参数与 RegisterGlobalCapture 对称。 \
+       匹配条件是 (providerAddress, out, 调用插件 owner) 三者同时相同：别人的槽撤不掉， \
+       写错 out 只会返回 false 并记日志。成功返回 true；未注册过 / 不匹配 / provider 上没有 \
+       站点时返回 false。 \
+       **只摘订阅、不物理摘钩**：站点与 stub 永不释放（stub 内嵌了 &HookSite），最后一个订阅 \
+       移除后 hasCapture 翻回 false，下一次调用即回到无捕获的快路径。 \
+       out 槽须位于调用插件模块内；撤销不会因为"目标域正在拆除"而被拒。 \
+       插件卸载/隔离时 Loader 会按 owner 自动清掉剩余订阅，因此这是可选的提前释放手段。 */ \
+    X(UnregisterGlobalCapture, bool, (void* providerAddress, void** out), kCommon) \
+    /* ---- 全局（引擎域）脚本注册 ---- \
+       把 fn 登记到【引擎主 lua_State】——exe 的进程级 Lua VM，换局不失效（见 GetMainLuaState）。 \
+       与 RegisterGameCoreScriptForGamePlay / RegisterGameCoreScriptForUI 的区别：那两个接的是 \
+       GameCore.dll 的脚本注册（每局重建、随对局卸载而失效）；本入口面向 Global 插件，也 \
+       可以给 GameCore 插件用，注册的全局在整个进程生命周期内都活着。 \
+       fn 收到的 L 就是引擎主 state；在游戏线程上被调用，可以直接用 Lua C API 往 _G 挂东西。 \
+       执行时机：主菜单 UI 加载时统一跑一次（此时主 state 必然已存在），早于各 Mod 自己 \
+       FrontEndUI Lua 的加载；同一个 state 只跑一次，state 被重建后重跑。 \
+       回调指针须来自调用插件模块；插件卸载/隔离时按 owner 自动摘除。 */ \
+    X(RegisterGlobalScript, void, (ScriptGlobalsFn fn), kCommon)
 
 // ---------------- 插件类别声明（编译期强制） ----------------
 // 成员生成依赖类别，所以这个检查必须出现在结构体【之前】。
@@ -452,7 +474,7 @@ inline constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT =
 #undef X
     ;
 
-// 解析入口：把 ctx 里的 77 个名字逐个查回来，填满本模块私有的表，返回它。
+// 解析入口：把 ctx 里的 79 个名字逐个查回来，填满本模块私有的表，返回它。
 // 查不到的名字置 nullptr（绝不会是野指针），插件用 HookAPI_RequireAll 声明真正依赖的项。
 //
 // 【不提供全局 api 指针】本可以在这里放一个 `inline HookAPI* api` 让插件连声明都省掉，
@@ -460,7 +482,7 @@ inline constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT =
 // 表指针由插件自己声明 —— 与改造前 `static HookAPI* g_api = nullptr;` 的做法一致。
 //
 // 【为什么是立即执行 lambda】只有 static 的"初始化"受 C++ Magic Static 保护。
-// 若写成 `static HookAPI t{};` 再逐行赋值，那 77 行是普通语句，每次调用都会重跑。
+// 若写成 `static HookAPI t{};` 再逐行赋值，那 79 行是普通语句，每次调用都会重跑。
 // 放进初始化表达式里，整块受一次性守卫保护，首次之后退化为 lea/ret。
 #pragma warning(push)
 #pragma warning(disable : 4996)   // 解析器给已废弃成员赋值会自触发 C4996

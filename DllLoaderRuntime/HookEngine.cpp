@@ -110,23 +110,25 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);
 // hasCapture 读到 nextTarget 的低字节 → 永远走慢路径；captureParamIndex 读到别处
 // → 按错误的参数序号派发。这类错误不编译失败、不运行时报错，只表现为功能静默失效。
 //
-// 因此把这三个偏移 + 结构体大小钉死。实测值（x64 Release，/std:c++20，/MT）：
-//   detourOwner 0x20（std::wstring，32 字节）→ hasCapture 0x40（跨过一整个 wstring）
-//   captureOuts 0x48（std::vector，24 字节）→ recordStale 0x60 → sizeof 120 = 0x78
-// 改动 HookSite 布局时，这几条会编译失败 —— 那正是要的效果：提示同步更新
-// BuildHookHubStub 里的三个 offsetof。
-//
-// 注意这只挡住**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它保证：stub 里嵌的
-// 是本进程的 &HookSite 与本 DLL 编译期的偏移，而 version.dll 自更新会重启进程，
-// 新进程里不存在旧 stub，所以该前提在本项目成立。
-static_assert(offsetof(HookSite, hasCapture)      == 0x40,
-              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
-static_assert(offsetof(HookSite, nextTarget)      == 0x18,
-              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
-static_assert(offsetof(HookSite, captureParamIndex) == 0x44,
-              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
-static_assert(sizeof(HookSite)                     == 0x78,
-              "stub 硬编码的偏移：改了 HookSite 布局必须同步 BuildHookHubStub");
+// 断言只钉"stub 真正依赖的不变量"，不钉具体数值：偏移由本 TU 的 offsetof 现算，Release
+// 与 Debug 的 STL 布局本来就不同（iterator debug 层会撑大容器），各配置算各自的才是对的；
+// 把某个配置的实测值写死，只会让另一个配置编不过。stub 访问字段只依赖三件事：
+//   1) hasCapture 恰好一个字节（stub 用 cmp byte ptr 只读这一个字节）；
+//   2) nextTarget 是自然对齐的指针（stub 用 qword 读）；
+//   3) 三个偏移与结构体大小都落在 int32 内（asmjit 的位移宽度）。
+// 跨二进制的 stub 复用不需要额外保证：stub 里嵌的是本进程的 &HookSite 与本 DLL 编译期的
+// 偏移，而 version.dll 自更新会重启进程，新进程里不存在旧 stub。
+static_assert(std::is_same_v<std::remove_cv_t<decltype(HookSite::hasCapture)>, bool> &&
+              sizeof(HookSite::hasCapture) == 1,
+              "stub 用 cmp byte ptr 读 hasCapture：它必须恰好是一个字节");
+static_assert(alignof(HookSite) >= alignof(void*) &&
+              offsetof(HookSite, nextTarget) % alignof(void*) == 0,
+              "stub 用 qword 访问 nextTarget：它必须是自然对齐的指针");
+static_assert(offsetof(HookSite, hasCapture) <= (std::numeric_limits<int32_t>::max)() &&
+              offsetof(HookSite, nextTarget) <= (std::numeric_limits<int32_t>::max)() &&
+              offsetof(HookSite, captureParamIndex) <= (std::numeric_limits<int32_t>::max)() &&
+              sizeof(HookSite) <= (std::numeric_limits<int32_t>::max)(),
+              "stub 的字段偏移/结构体大小必须落在 int32 内（asmjit 位移宽度）");
 
 // ==== BuildHookHubStub ====
 // 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
@@ -699,6 +701,78 @@ bool RegisterGlobalCaptureImpl(void* providerAddress, uint32_t paramIndex, void*
     // capture 不再被误拒。
     if (!PluginDomain::IsTargetOpenToCaller(owner->category, providerAddress, "RegisterGlobalCapture")) return false;
     return RegisterGlobalCaptureCore(providerAddress, paramIndex, out, owner->ownerId);
+}
+
+// ==== UnregisterGlobalCaptureCore ====
+// 撤销一个捕获订阅：按 (provider, out, owner) 精确匹配后摘除，**绝不物理摘钩**。
+// 站点与 MinHook 记录保留（stub 里内嵌了 &HookSite，且"没有调用者停在 stub 内"无法证明），
+// 订阅清空时只把 hasCapture 翻回 false —— stub 下一次调用就回到快路径，捕获开销归零。
+// 只摘自己的槽：ownerId 不匹配一律拒绝，防止一个插件借地址撤销别人的订阅。
+bool UnregisterGlobalCaptureCore(void* providerAddress, void** out, const std::wstring& ownerId) {
+    if (!providerAddress || !out) {
+        Logger::Log("UnregisterGlobalCapture rejected: bad args provider=%p out=%p",
+            providerAddress, static_cast<void*>(out));
+        return false;
+    }
+
+    lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
+    // 站点表只增不删，按地址查即可；查到再进 capture 锁动订阅。
+    HookSite* site = nullptr;
+    {
+        lock_guard<std::mutex> hookLock(Runtime::MinHookMutex());
+        auto it = g_hookSites.find(providerAddress);
+        if (it == g_hookSites.end()) {
+            Logger::Log("UnregisterGlobalCapture: no hook site provider=%p owner=%ls",
+                providerAddress, ownerId.c_str());
+            return false;
+        }
+        site = &it->second;
+    }
+
+    size_t remaining = 0;
+    {
+        lock_guard<std::mutex> captureLock(g_captureMutex);
+        auto& outs = site->captureOuts;
+        const size_t before = outs.size();
+        outs.erase(std::remove_if(outs.begin(), outs.end(),
+            [out, &ownerId](const HookSite::CaptureOut& slot) {
+                return slot.address == out && slot.ownerId == ownerId;
+            }), outs.end());
+        const size_t removed = before - outs.size();
+        if (removed == 0) {
+            Logger::Log("UnregisterGlobalCapture: not subscribed provider=%p out=%p owner=%ls",
+                providerAddress, static_cast<void*>(out), ownerId.c_str());
+            return false;
+        }
+        if (outs.empty()) {
+            // 先清订阅再翻 hasCapture：反向顺序会让 stub 读到 hasCapture=1 而 outs 已空
+            // （CaptureDispatch 那边虽然是安全的空列表，但这里保持与注册路径同一次序）。
+            site->hasCapture = false;
+            site->retiring = false;
+            site->captureParamIndex = 0;
+        }
+        remaining = outs.size();
+    }
+    Logger::Log("UnregisterGlobalCapture: removed provider=%p out=%p owner=%ls (outs=%zu)",
+        providerAddress, static_cast<void*>(out), ownerId.c_str(), remaining);
+    return true;
+}
+
+// ==== UnregisterGlobalCaptureImpl ====
+// 插件入口：owner 必须拥有 out 槽（与注册同一口径），域门不参与 —— 撤销不会新增任何
+// 指向目标的引用，目标域正在拆除时也应当允许插件把自己的槽收回去。
+bool UnregisterGlobalCaptureImpl(void* providerAddress, void** out) {
+    if (!providerAddress || !out) {
+        Logger::Log("UnregisterGlobalCapture rejected: bad args provider=%p out=%p",
+            providerAddress, static_cast<void*>(out));
+        return false;
+    }
+    lock_guard<std::recursive_mutex> lifecycleLock(LoaderCore::LifecycleMutex());
+    PluginBoundary::LoaderLockScope pbLockScope;
+    auto owner = PluginDomain::RequirePluginOwner(reinterpret_cast<const void*>(out),
+        "UnregisterGlobalCapture");
+    if (!owner) return false;
+    return UnregisterGlobalCaptureCore(providerAddress, out, owner->ownerId);
 }
 
 // ---------------- 站点捕获槽退役（只拔插槽，绝不物理脱钩） ----------------

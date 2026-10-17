@@ -48,8 +48,8 @@ static const HookAPI g_hookApi = {
 
     &ScriptBridge::PushLuaMethodsImpl,
 
-    &ScriptBridge::RegisterScriptGlobalsImpl,
-    &ScriptBridge::RegisterScriptGlobalsForUIImpl,
+    &ScriptBridge::RegisterGameCoreScriptForGamePlayImpl,
+    &ScriptBridge::RegisterGameCoreScriptForUIImpl,
 
     &ScriptBridge::LuaPushNamedCClosureImpl,
     &ScriptBridge::LuaCheckIntegerImpl,
@@ -121,6 +121,8 @@ static const HookAPI g_hookApi = {
     &ScriptBridge::LuaPushNilImpl,
     &AddressResolve::GetSymbolDbStateImpl,
     &AddressResolve::GetSymbolDbMatchRatioImpl,
+    &HookEngine::UnregisterGlobalCaptureImpl,
+    &ScriptBridge::RegisterGlobalScriptImpl,
 };
 
 // ==== RuntimeHookContext / HookApiQuery ====
@@ -202,6 +204,6 @@ void LoaderCore::VerifyHookApiTableProtection() {
 // 放在表定义之后，确保断言的是【实际发布的这张表】。
 static_assert(sizeof(HookAPI) == sizeof(uint32_t) * 2 + CIV6_HOOK_API_ENTRY_COUNT * sizeof(void*),
     "HookAPI 布局与 CIV6_HOOK_API_ENTRY_COUNT 不一致：加字段后要同步这个常量");
-static_assert(offsetof(HookAPI, GetSymbolDbMatchRatio) == sizeof(uint32_t) * 2 +
+static_assert(offsetof(HookAPI, RegisterGlobalScript) == sizeof(uint32_t) * 2 +
     (CIV6_HOOK_API_ENTRY_COUNT - 1) * sizeof(void*),
     "HookAPI 末字段偏移不符：追加字段时顺序不能变（插件按偏移读）");

@@ -75,7 +75,7 @@ static vector<PluginEntry> g_plugins;
 // GameCore 插件的【待释放】句柄队列。
 // 为什么不在插件卸载处直接 FreeLibrary：那一刻 GameCore 映像还映射着，它承载的 gamecore
 // Lua 环境（gameplay / ui）要到引擎自己的 UnloadDLL 里才拆；而 Lua 表里可能仍持有指向插件
-// 映像的 C 闭包（PushLuaMethods 推入的、以及插件自己在 RegisterScriptGlobals 里注册的）。
+// 映像的 C 闭包（PushLuaMethods 推入的、以及插件自己在 RegisterGameCoreScriptForGamePlay 里注册的）。
 // 等引擎把 GameCore 连同那些 Lua 环境一起拆完（g_origUnloadDLL 返回之后）再 Free，「闭包被
 // 调用」这件事就不再可能发生。只由游戏线程（Load/UnloadPluginsOf）入队，flush 由
 // LoaderHooks 的两个 detour 在调到原函数之后调用。
@@ -114,7 +114,10 @@ static thread_local HMODULE g_activePluginModule;
 // g_gameCorePhaseReady 已移到 ScriptBridge（阶段 4），经 IsGameCorePhaseReady() 读写。
 
 // 插件导出入口的类型（LoadPluginDllInternal 按名取这些导出）。
+// OnLoad 有新旧两种协议：OnLoadEx 返回 int（非 0 = 初始化成功），OnLoad 返回 void
+// （不崩就算成功，无法回报失败）。两者都支持，OnLoadEx 优先。
 typedef void (*OnLoadFunc)(const HookContext*);
+typedef int  (*OnLoadExFunc)(const HookContext*);
 typedef void (*OnUnloadFunc)();
 typedef void (*OnMessageFunc)(const char*, const void*, size_t);
 
@@ -435,15 +438,38 @@ bool AttachGameCore(HMODULE gameCore) {
     return true;
 }
 
-// ==== CallOnLoadSafe ====
-static bool CallOnLoadSafe(OnLoadFunc onLoad, const char* name) {
+// ==== CallOnLoadSafe / CallOnLoadExSafe ====
+// 统一的 OnLoad 结果：ok = 初始化成功；crashed 区分"插件自己声明失败"与"执行中崩溃"，
+// 两者都要回滚，但日志与后续策略分开记。
+struct OnLoadOutcome {
+    bool ok = false;
+    bool crashed = false;
+};
+
+// 旧协议 void OnLoad：只有异常才算失败（返回值表达不了失败，这是它被 OnLoadEx 取代的原因）。
+__declspec(noinline) static OnLoadOutcome CallOnLoadSafe(OnLoadFunc onLoad, const char* name) {
+    OnLoadOutcome outcome;
     __try {
         onLoad(LoaderCore::RuntimeHookContext());
-        return true;
+        outcome.ok = true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("OnLoad crashed in plugin %s code=0x%08X", name, GetExceptionCode());
-        return false;
+        outcome.crashed = true;
     }
+    return outcome;
+}
+
+// 新协议 int OnLoadEx：返回 0 = 明确失败（例如 HookAPI_RequireAll 缺接口），
+// 加载器据此拒绝激活，不再"返回了就当成功"。
+__declspec(noinline) static OnLoadOutcome CallOnLoadExSafe(OnLoadExFunc onLoadEx, const char* name) {
+    OnLoadOutcome outcome;
+    __try {
+        outcome.ok = onLoadEx(LoaderCore::RuntimeHookContext()) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Logger::Log("OnLoadEx crashed in plugin %s code=0x%08X", name, GetExceptionCode());
+        outcome.crashed = true;
+    }
+    return outcome;
 }
 
 // ==== CallOnUnloadSafe ====
@@ -544,9 +570,11 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         return false;
     }
 
-    auto onLoad = (OnLoadFunc)GetProcAddress(hPlugin, "OnLoad");
-    if (!onLoad) {
-        Logger::Log("Plugin has no OnLoad export: %s", ModScan::WideToNarrow(wpath).c_str());
+    // OnLoadEx（int）优先；没有就退回旧协议 OnLoad（void）。两个都没有才拒载。
+    auto onLoadEx = (OnLoadExFunc)GetProcAddress(hPlugin, "OnLoadEx");
+    auto onLoad = onLoadEx ? nullptr : (OnLoadFunc)GetProcAddress(hPlugin, "OnLoad");
+    if (!onLoadEx && !onLoad) {
+        Logger::Log("Plugin has no OnLoadEx/OnLoad export: %s", ModScan::WideToNarrow(wpath).c_str());
         if (ownsRef) FreeLibrary(hPlugin);
         return false;
     }
@@ -588,7 +616,9 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     // 无论 OnLoad 正常返回还是崩溃，都要在返回后清空，防止污染后续插件。
     SetActivePluginContext(ownerId, hPlugin);
     lifecycleLock.unlock();
-    const bool onLoadOk = CallOnLoadSafe(onLoad, pluginFileName.c_str());
+    const OnLoadOutcome onLoadResult = onLoadEx
+        ? CallOnLoadExSafe(onLoadEx, pluginFileName.c_str())
+        : CallOnLoadSafe(onLoad, pluginFileName.c_str());
     ClearActivePluginContext();
     lifecycleLock.lock();
 
@@ -596,10 +626,16 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         [&ownerId](const PluginEntry& tracked) {
             return tracked.ownerId == ownerId;
         });
-    if (!onLoadOk) {
-        // 崩溃隔离：按 owner 回滚全部注册并标记隔离，防止半初始化状态持续生效、
-        // 以及阶段 B 全量扫描反复重试崩溃的 OnLoad（条目留在 g_plugins，按路径去重拦住重试）。
-        Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
+    if (!onLoadResult.ok) {
+        // 失败隔离：按 owner 回滚全部注册并标记隔离，防止半初始化状态持续生效、
+        // 以及阶段 B 全量扫描反复重试同一次失败（条目留在 g_plugins，按路径去重拦住重试）。
+        // 两条来源分开记日志：崩溃（执行中异常）与 OnLoadEx 明确返回失败。
+        if (onLoadResult.crashed) {
+            Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
+        } else {
+            Logger::Log("Plugin quarantined: OnLoadEx returned 0 (initialization declined): %s",
+                narrow.c_str());
+        }
         lifecycleLock.unlock();
         // 此处必然还没被隔离：隔离的唯一调用点就是这一行（OnLoad 期间没有别的路径能先把
         // 本 owner 标成 Quarantined）。
@@ -749,6 +785,12 @@ static void UnloadPluginByOwnerId(const std::wstring& ownerId, bool freeModule) 
     HookEngine::CleanupCaptureSitesForOwner(entry.ownerId);
     // 撤销该插件注册的回调类条目（见 RemovePluginOwnedRegistrations）。
     RemovePluginOwnedRegistrations(entry.ownerId);
+    // GameCore 生命周期结束的卸载：目标映像要重新映射，补丁【记录】必须摘掉（不写回字节）。
+    // 留下记录会让新一代映像在同一地址上撞"该 owner 已打过补丁"/区间重叠，从此打不上补丁。
+    // Global 插件是驻留卸载（模块仍在、只是不再被调用），记录保留以便它自己 Unpatch。
+    if (freeModule) {
+        PatchRegistry::DiscardOwned(entry.ownerId.c_str());
+    }
     ClearActivePluginContext();
     lifecycleLock.lock();
     const auto tracked = std::find_if(g_plugins.begin(), g_plugins.end(),
@@ -791,6 +833,12 @@ void LoaderCore::LoadPluginsOf(PluginCategory cat) {
     Logger::Log("LoadPluginsOf(%s): %zu candidate(s)", PluginDomain::CategoryNameForLog(cat), wpaths.size());
     for (const auto& wpath : wpaths) {
         LoadSinglePlugin(wpath);
+    }
+    // 全局脚本的补跑点：GameCore 插件是在对局加载时（游戏线程）才 OnLoad 的，
+    // 它们的 RegisterGlobalScript 赶不上启动期那次主菜单 UI 触发，这里补一次。
+    // 同一个 state 上已跑过的项不会重复执行（ScriptGlobalsEntry::appliedFor）。
+    if (cat == PluginCategory::GameCore) {
+        ScriptBridge::RunGlobalScripts();
     }
 }
 
@@ -903,11 +951,15 @@ void LoaderCore::ResetForReload() {
     UnloadPluginsOf(PluginCategory::GameCore);
 
     lifecycleLock.lock();
-    // 这里【不做】补丁清账 —— 是设计决定而非"不可能有记录"：Loader 已删除补丁自动回滚
-    // （见【不回滚补丁】与 ARCHITECTURE §5.8），补丁记录只在插件自己调 Unpatch 时才从
-    // PatchRegistry 摘除。副作用是【未撤销的补丁记录会跨代存活】：GameCore 插件若没调
-    // Unpatch，它那条落在旧映像区间里的记录会留到进程退出；新一代 GameCore 映射到同一基址
-    // 时，这条陈旧记录仍会参与 OverlapsRegistered / OverlapsHookPrologue 的区间仲裁。
+    // 补丁记录在这里清账：旧映像即将被重新映射，记录不摘会让新一代映像在同一地址上撞
+    // "该 owner 已打过补丁"/区间重叠，从此打不上补丁。清账只摘记录、不写回字节
+    // （PatchRegistry::DiscardOwned）——写回旧映像的字节既无意义，又有落到新映像上的风险。
+    // 覆盖全部 GameCore 类别插件，包括隔离/驻留的那些（它们不走 UnloadPluginByOwnerId）。
+    for (const auto& entry : g_plugins) {
+        if (entry.category == LoaderCore::PluginCategory::GameCore) {
+            PatchRegistry::DiscardOwned(entry.ownerId.c_str());
+        }
+    }
     // 第 2 步：重扫站点表物理摘除 GameCore 域的 MinHook 记录（释放跳板），并复位共享钩状态
     // （ScriptData/ForUI + PushMethods 槽位）。顺序理由见函数头注释。
     HookEngine::RemoveGameCoreDomainSiteRecords(lifecycleLock);

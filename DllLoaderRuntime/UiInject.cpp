@@ -7,9 +7,9 @@
 //     context 就绪后：
 //       a) 注入根容器 context（Civ6DllLoader/Civ6DllLoader_FrontEndUI，lua 留空），
 //          挂到 FrontEnd 下（其 xml 的 Name = AdditionalFrontEndUI）；
-//       b) 遍历启用 Mod 的 .modinfo，从 ImportFiles 声明里收集 FrontEndUI_*.xml 的
-//          base name（减少磁盘路径搜索），逐个用 AllocateControl<LuaContext> +
-//          ChangeParent + Initialize（虚表 +0x200）加载，挂到根容器 context 下。
+//       b) 遍历已启用 Mod 的目录树，按文件名收集 FrontEndUI_*.xml（不读 .modinfo），
+//          逐个用 AllocateControl<LuaContext> + ChangeParent + Initialize（虚表 +0x200）
+//          加载，挂到根容器 context 下。
 //
 // 地址来源：CivilizationVI.exe（IDA base 0x140000000）逆向，全部特征码运行时校验，
 // 错位则静默降级（不崩溃、不影响游戏）。
@@ -21,19 +21,16 @@
 #include "Runtime.h"
 #include "LoaderCore.h"
 #include "../common/Logger.h"
-#include "../common/ModScan.h"
 #include "../common/EnabledMods.h"
+#include "ScriptBridge.h"
 #include "MinHook.h"
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <cwchar>
 #include <cwctype>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <string>
 #include <string.h>
 #include <string_view>
@@ -55,10 +52,6 @@ constexpr const wchar_t* kXmlFileName = L"Civ6DllLoader_FrontEndUI.xml";
 constexpr const wchar_t* kExtractDir = L"Civ6DllLoader";
 // 传给 LuaContext::Initialize 的根容器 base name（不带 .xml；LoadXML 自动补 .xml + 同目录 .lua）
 constexpr const wchar_t* kUiBaseName = L"Civ6DllLoader/Civ6DllLoader_FrontEndUI";
-
-// Mod 内 UI 文件的约定前缀：loader 从 ImportFiles 声明里发现并加载所有 FrontEndUI_*.xml
-constexpr const char* kModUiPrefix = "FrontEndUI_";
-constexpr size_t kMaxModinfoBytes = 256 * 1024;
 
 // ---- exe 域取址表（双版本）----
 // 生成命令：python tools/symdb.py aob --emit-cpp（重建符号库/游戏更新后重新生成）。
@@ -203,289 +196,17 @@ uintptr_t ResolveChecked(const HookInfoExe& info, const uint8_t* sig, size_t sig
     return reinterpret_cast<uintptr_t>(p);
 }
 
-// 去首尾空白（isspace 判定）。
-std::string TrimAscii(const std::string& s) {
-    size_t a = 0;
-    const size_t n = s.size();
-    while (a < n && isspace(static_cast<unsigned char>(s[a]))) ++a;
-    size_t b = n;
-    while (b > a && isspace(static_cast<unsigned char>(s[b - 1]))) --b;
-    return s.substr(a, b - a);
+// Mod UI 文件名约定：FrontEndUI_*.xml（大小写不敏感）。
+bool IsModUiFileName(const std::wstring& name) {
+    constexpr size_t kPrefixLen = 11;  // "FrontEndUI_"
+    if (name.size() <= kPrefixLen + 4) return false;
+    if (_wcsnicmp(name.c_str(), L"FrontEndUI_", kPrefixLen) != 0) return false;
+    return _wcsicmp(name.c_str() + name.size() - 4, L".xml") == 0;
 }
 
-// 读 mod 目录里的唯一 .modinfo 文件内容（UTF-8，去 BOM）。
-// 多个描述文件会使 Mod 身份和文件清单产生歧义，直接拒绝；同时限制大小，
-// 避免启用 Mod 通过超大描述文件消耗 UI 线程内存和解析时间。
-std::string ReadModinfo(const std::filesystem::path& modDir) {
-    std::vector<std::filesystem::path> candidates;
-    std::error_code ec;
-    for (std::filesystem::directory_iterator it(modDir, ec), end; !ec && it != end; it.increment(ec)) {
-        std::error_code fec;
-        if (!it->is_regular_file(fec)) continue;
-        if (_wcsicmp(it->path().extension().wstring().c_str(), L".modinfo") != 0) continue;
-        candidates.push_back(it->path());
-    }
-    if (candidates.size() != 1) {
-        if (candidates.size() > 1) {
-            Logger::Log("UiInject: Mod 目录含多个 .modinfo，跳过（%ls）", modDir.wstring().c_str());
-        }
-        return {};
-    }
-
-    std::error_code sizeEc;
-    const uintmax_t size = std::filesystem::file_size(candidates.front(), sizeEc);
-    if (sizeEc || size > kMaxModinfoBytes) {
-        Logger::Log("UiInject: .modinfo 不可读或过大，跳过（%ls）", candidates.front().wstring().c_str());
-        return {};
-    }
-
-    std::ifstream f(candidates.front(), std::ios::binary);
-    if (!f) return {};
-    std::string content;
-    content.resize(static_cast<size_t>(size));
-    if (size != 0 && !f.read(content.data(), static_cast<std::streamsize>(size))) return {};
-    if (content.size() >= 2 &&
-        static_cast<unsigned char>(content[0]) == 0xFF &&
-        static_cast<unsigned char>(content[1]) == 0xFE) {
-        Logger::Log("UiInject: .modinfo 使用 UTF-16LE，跳过（%ls）", candidates.front().wstring().c_str());
-        return {};
-    }
-    if (content.size() >= 2 &&
-        static_cast<unsigned char>(content[0]) == 0xFE &&
-        static_cast<unsigned char>(content[1]) == 0xFF) {
-        Logger::Log("UiInject: .modinfo 使用 UTF-16BE，跳过（%ls）", candidates.front().wstring().c_str());
-        return {};
-    }
-    if (content.size() >= 3 &&
-        static_cast<unsigned char>(content[0]) == 0xEF &&
-        static_cast<unsigned char>(content[1]) == 0xBB &&
-        static_cast<unsigned char>(content[2]) == 0xBF) {
-        content.erase(0, 3);
-    }
-    return content;
-}
-
-// XML 的最小词法辅助：只识别这里需要的元素，避免把注释、<FileName> 等相似文本
-// 当成真实节点。modinfo 是游戏自己的 XML，完整 DOM 解析没有必要，但必须先去注释。
-size_t FindTagEnd(std::string_view text, size_t start) {
-    bool quoted = false;
-    char quote = 0;
-    for (size_t i = start; i < text.size(); ++i) {
-        const char ch = text[i];
-        if (quoted) {
-            if (ch == quote) quoted = false;
-        } else if (ch == '\"' || ch == '\'') {
-            quoted = true;
-            quote = ch;
-        } else if (ch == '>') {
-            return i;
-        }
-    }
-    return std::string_view::npos;
-}
-
-bool EqualsAsciiIgnoreCase(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) !=
-            std::tolower(static_cast<unsigned char>(b[i]))) return false;
-    }
-    return true;
-}
-
-struct ParsedXmlTag {
-    std::string_view name;
-    bool closing = false;
-    bool selfClosing = false;
-    bool hasCriteria = false;
-};
-
-bool ParseXmlTag(std::string_view text, size_t begin, size_t end, ParsedXmlTag& out) {
-    if (begin >= text.size() || end >= text.size() || text[begin] != '<' || text[end] != '>') {
-        return false;
-    }
-    size_t pos = begin + 1;
-    if (pos < end && text[pos] == '/') {
-        out.closing = true;
-        ++pos;
-    }
-    while (pos < end && std::isspace(static_cast<unsigned char>(text[pos])) != 0) ++pos;
-    const size_t nameBegin = pos;
-    while (pos < end && std::isspace(static_cast<unsigned char>(text[pos])) == 0 &&
-           text[pos] != '/') ++pos;
-    if (pos == nameBegin) return false;
-    out.name = text.substr(nameBegin, pos - nameBegin);
-    if (out.closing) {
-        while (pos < end && std::isspace(static_cast<unsigned char>(text[pos])) != 0) ++pos;
-        return pos == end;
-    }
-
-    size_t attrPos = pos;
-    while (attrPos < end) {
-        while (attrPos < end && (std::isspace(static_cast<unsigned char>(text[attrPos])) != 0 ||
-                                 text[attrPos] == '/')) ++attrPos;
-        if (attrPos >= end) break;
-        const size_t attrBegin = attrPos;
-        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) == 0 &&
-               text[attrPos] != '=' && text[attrPos] != '/') ++attrPos;
-        if (attrPos == attrBegin) return false;
-        const std::string_view attr = text.substr(attrBegin, attrPos - attrBegin);
-        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) != 0) ++attrPos;
-        if (attrPos >= end || text[attrPos] != '=') return false;
-        ++attrPos;
-        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) != 0) ++attrPos;
-        if (attrPos >= end || (text[attrPos] != '\"' && text[attrPos] != '\'')) return false;
-        const char quote = text[attrPos++];
-        while (attrPos < end && text[attrPos] != quote) ++attrPos;
-        if (attrPos >= end) return false;
-        if (EqualsAsciiIgnoreCase(attr, "criteria")) out.hasCriteria = true;
-        ++attrPos;
-        while (attrPos < end && std::isspace(static_cast<unsigned char>(text[attrPos])) != 0) ++attrPos;
-    }
-    size_t tail = end;
-    while (tail > begin && std::isspace(static_cast<unsigned char>(text[tail - 1])) != 0) --tail;
-    out.selfClosing = tail > begin && text[tail - 1] == '/';
-    return true;
-}
-
-bool DecodeXmlEntities(const std::string& input, std::string& output) {
-    output.clear();
-    output.reserve(input.size());
-    for (size_t i = 0; i < input.size(); ++i) {
-        if (input[i] != '&') {
-            if (static_cast<unsigned char>(input[i]) < 0x20 && input[i] != '\t' &&
-                input[i] != '\n' && input[i] != '\r') return false;
-            output.push_back(input[i]);
-            continue;
-        }
-        const size_t semi = input.find(';', i + 1);
-        if (semi == std::string::npos || semi - i > 16) return false;
-        const std::string_view entity(input.data() + i + 1, semi - i - 1);
-        if (entity == "amp") output.push_back('&');
-        else if (entity == "lt") output.push_back('<');
-        else if (entity == "gt") output.push_back('>');
-        else if (entity == "quot") output.push_back('\"');
-        else if (entity == "apos") output.push_back('\'');
-        else return false;
-        i = semi;
-    }
-    return true;
-}
-
-bool IsSafeUiFilePath(const std::string& file, std::string& baseName) {
-    if (file.empty() || file.front() == '/' || file.front() == '\\' || file.find(':') != std::string::npos) {
-        return false;
-    }
-    size_t slash = file.find_last_of("/\\");
-    const std::string fname = slash == std::string::npos ? file : file.substr(slash + 1);
-    // 下面的 size() <= 11 先挡掉短于 kModUiPrefix + ".xml" 的名字（|| 短路保证后面
-    // fname.size() - 4 不下溢），所以末尾 4 字节必在范围内。
-    if (fname.size() <= 11 || _strnicmp(fname.c_str(), kModUiPrefix, 11) != 0 ||
-        _stricmp(fname.c_str() + fname.size() - 4, ".xml") != 0) {
-        return false;
-    }
-    size_t begin = 0;
-    while (begin <= file.size()) {
-        const size_t end = file.find_first_of("/\\", begin);
-        const std::string_view component(file.data() + begin,
-                                         (end == std::string::npos ? file.size() : end) - begin);
-        if (component.empty() || component == "." || component == "..") return false;
-        if (end == std::string::npos) break;
-        begin = end + 1;
-    }
-    baseName = file.substr(0, file.size() - 4);
-    return true;
-}
-
-struct XmlFrame {
-    std::string_view name;
-    bool importScope = false;
-    bool conditional = false;
-    bool captureFile = false;
-    std::string fileText;
-};
-
-// 只接受结构正确、无 Criteria 的 FrontEndActions/ImportFiles。
-// 文件路径必须是相对路径，且不能通过 . 或 .. 离开 Mod 的 VFS 范围。
-std::vector<std::wstring> ParseModinfoUiFiles(const std::string& text) {
-    std::vector<std::wstring> out;
-    std::vector<XmlFrame> stack;
-    size_t pos = 0;
-    while (pos < text.size()) {
-        if (text[pos] != '<') {
-            const size_t next = text.find('<', pos);
-            const size_t end = next == std::string::npos ? text.size() : next;
-            if (!stack.empty() && stack.back().captureFile) {
-                stack.back().fileText.append(text, pos, end - pos);
-            }
-            pos = end;
-            continue;
-        }
-        if (text.compare(pos, 4, "<!--") == 0) {
-            const size_t end = text.find("-->", pos + 4);
-            if (end == std::string::npos) return {};
-            pos = end + 3;
-            continue;
-        }
-        if (text.compare(pos, 9, "<![CDATA[") == 0) {
-            const size_t end = text.find("]]>", pos + 9);
-            if (end == std::string::npos) return {};
-            if (!stack.empty() && stack.back().captureFile) {
-                stack.back().fileText.append(text, pos + 9, end - pos - 9);
-            }
-            pos = end + 3;
-            continue;
-        }
-        if (text.compare(pos, 2, "<?") == 0 || text.compare(pos, 2, "<!") == 0) {
-            const size_t end = FindTagEnd(text, pos);
-            if (end == std::string_view::npos) return {};
-            pos = end + 1;
-            continue;
-        }
-
-        const size_t end = FindTagEnd(text, pos);
-        if (end == std::string_view::npos) return {};
-        ParsedXmlTag tag;
-        if (!ParseXmlTag(text, pos, end, tag)) return {};
-        if (tag.closing) {
-            if (stack.empty() || stack.back().name != tag.name) return {};
-            XmlFrame frame = std::move(stack.back());
-            stack.pop_back();
-            if (frame.captureFile && !stack.empty() && stack.back().importScope &&
-                !stack.back().conditional) {
-                std::string decoded;
-                const std::string trimmed = TrimAscii(frame.fileText);
-                if (!DecodeXmlEntities(trimmed, decoded)) return {};
-                std::string baseName;
-                if (IsSafeUiFilePath(decoded, baseName)) {
-                    const std::wstring wide = ModScan::NarrowToWide(baseName);
-                    if (wide.empty()) return {};
-                    out.push_back(wide);
-                }
-            }
-        } else {
-            const bool parentIsFrontEndActions = !stack.empty() &&
-                stack.back().name == "FrontEndActions";
-            const bool parentIsImport = !stack.empty() && stack.back().importScope;
-            XmlFrame frame;
-            frame.name = tag.name;
-            frame.importScope = tag.name == "ImportFiles" && parentIsFrontEndActions;
-            frame.conditional = frame.importScope && tag.hasCriteria;
-            frame.captureFile = tag.name == "File" && parentIsImport && !stack.back().conditional;
-            if (tag.name == "Criteria") {
-                for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
-                    if (it->importScope) { it->conditional = true; break; }
-                }
-            }
-            if (!tag.selfClosing) stack.push_back(std::move(frame));
-        }
-        pos = end + 1;
-    }
-    if (!stack.empty()) return {};
-    return out;
-}
-
-// 遍历启用 Mod，解析各 .modinfo 的 FrontEndActions/ImportFiles，收集 FrontEndUI_*.xml base name。
+// 遍历启用 Mod 的目录树，按文件名收集 FrontEndUI_*.xml 的 base name。
+// base name 是相对 mod 根的 VFS 路径（去掉 .xml、分隔符统一成 '/'），正是
+// LuaContext::Initialize 需要的形参；loader 不再读取 .modinfo。
 std::vector<std::wstring> FindModUiFiles() {
     std::vector<std::wstring> out;
     const EnabledMods::Snapshot snap = EnabledMods::Load();
@@ -495,16 +216,34 @@ std::vector<std::wstring> FindModUiFiles() {
         return out;
     }
 
-    // Mods.sqlite 已经给出实际启用的 modinfo 所在目录。直接遍历这些精确 root，
-    // 不再把扫描根下所有相似目录交给路径相交规则判断，避免多副本/嵌套目录混入。
+    // Mods.sqlite 已经给出实际启用的 mod 目录，只在这些根下按文件名找 UI 文件。
+    // 递归遍历默认不跟随目录符号链接/junction，环不会无限展开；深度再兜一道上限，
+    // 避免异常深的资源目录拖慢主菜单线程。
+    constexpr int kMaxDepth = 8;
     for (const auto& enabledRoot : snap.enabledModRoots) {
         std::error_code ec;
         const std::filesystem::path modDir(enabledRoot);
         if (!std::filesystem::is_directory(modDir, ec)) continue;
-        const std::string modinfo = ReadModinfo(modDir);
-        if (modinfo.empty()) continue;
-        const auto files = ParseModinfoUiFiles(modinfo);
-        out.insert(out.end(), files.begin(), files.end());
+
+        std::filesystem::recursive_directory_iterator it(
+            modDir, std::filesystem::directory_options::skip_permission_denied, ec);
+        const std::filesystem::recursive_directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (it->is_regular_file(fec) && IsModUiFileName(it->path().filename().wstring())) {
+                std::error_code relEc;
+                const std::filesystem::path rel = std::filesystem::relative(it->path(), modDir, relEc);
+                if (!relEc && !rel.empty()) {
+                    std::wstring base = rel.wstring();
+                    if (base.size() > 4) {
+                        base.resize(base.size() - 4);  // 去掉 ".xml"
+                        std::replace(base.begin(), base.end(), L'\\', L'/');
+                        out.push_back(std::move(base));
+                    }
+                }
+            }
+            if (it.depth() >= kMaxDepth) it.disable_recursion_pending();
+        }
     }
 
     // 去重 + 大小写不敏感排序（稳定加载顺序）
@@ -730,7 +469,11 @@ void InjectFrontEndUi(void* state) {
     }
     g_rootContext = rootCtx;
 
-    // 4) 遍历启用 Mod 的 ImportFiles 声明，加载 FrontEndUI_*.xml，挂到根容器下
+    // 4) 先把插件登记的全局脚本跑在引擎主 lua_State 上：主菜单 UI 已经建好（主 state 必然
+    //    存在），而各 Mod 的 FrontEndUI lua 还没加载——插件挂的全局因此能被它们直接用。
+    ScriptBridge::RunGlobalScripts();
+
+    // 5) 遍历启用 Mod 的目录树，加载 FrontEndUI_*.xml，挂到根容器下
     const std::vector<std::wstring> modUis = FindModUiFiles();
     Logger::Log("UiInject: 发现 %zu 个 Mod UI", modUis.size());
     for (const auto& base : modUis) {

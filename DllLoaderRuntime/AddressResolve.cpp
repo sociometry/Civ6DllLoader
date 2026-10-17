@@ -4,6 +4,7 @@
 #include <Windows.h>
 #include <vector>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 
 #include "ImageAddress.h"
@@ -415,6 +416,22 @@ void* ResolveByRvaExImpl(HookImageId image, uintptr_t rva, size_t span, HookImag
     if (!AddressResolve::ResolveSectionRva(image, sectionName, &sectionRva, &sectionSize)) {
         Logger::Log("ResolveByRvaEx: section %s not found image=%u",
             sectionName, static_cast<unsigned>(image));
+        return nullptr;
+    }
+    // 段内越界与加法溢出必须在【段坐标】里挡掉：ImageAddress::ResolveByRva 只校验整个
+    // 映像，管不到"这段是否真的落在该 section 内"。零长度与 ResolveByRva 的约定一致（拒绝）。
+    // 用减法比较 span > sectionSize - rva，等价且不会在 sectionSize - rva 处下溢。
+    if (span == 0 || rva >= sectionSize || span > sectionSize - rva) {
+        Logger::Log("ResolveByRvaEx: out of section %s image=%u rva=0x%llX span=%zu size=%zu",
+            sectionName, static_cast<unsigned>(image),
+            static_cast<unsigned long long>(rva), span, sectionSize);
+        return nullptr;
+    }
+    if (sectionRva > (std::numeric_limits<uintptr_t>::max)() - rva) {
+        Logger::Log("ResolveByRvaEx: section base overflow %s image=%u base=0x%llX rva=0x%llX",
+            sectionName, static_cast<unsigned>(image),
+            static_cast<unsigned long long>(sectionRva),
+            static_cast<unsigned long long>(rva));
         return nullptr;
     }
     return ImageAddress::ResolveByRva(image, sectionRva + rva, span);

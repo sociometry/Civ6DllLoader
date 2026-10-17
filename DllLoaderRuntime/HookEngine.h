@@ -104,10 +104,17 @@ bool InstallHookImpl(void* target, void* detour, void** original);
 // HookAPI.RegisterGlobalCapture 的实现：注册参数捕获。
 bool RegisterGlobalCaptureImpl(void* providerAddress, uint32_t paramIndex, void** out);
 
+// HookAPI.UnregisterGlobalCapture 的实现：撤销本插件在该 provider 上的一个捕获订阅。
+bool UnregisterGlobalCaptureImpl(void* providerAddress, void** out);
+
 // ---------------- capture 订阅 ----------------
 // 注册全局参数捕获（Loader 内部入口，不做插件域门）。
 bool RegisterGlobalCaptureCore(void* providerAddress, uint32_t paramIndex, void** out,
     const std::wstring& ownerId);
+
+// 撤销一个捕获订阅（Loader 内部入口，不做插件域门）：按 (provider, out, owner) 精确匹配。
+// 只摘订阅、绝不物理摘钩；最后一个订阅移除后站点回到快路径。
+bool UnregisterGlobalCaptureCore(void* providerAddress, void** out, const std::wstring& ownerId);
 
 // 清理全部 capture 订阅（拔插槽 + 排空），保留站点与 detour。
 void CleanupAllCaptureSites();

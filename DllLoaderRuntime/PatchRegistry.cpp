@@ -214,6 +214,11 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
 
     CsGuard csGuard;
     auto it = Registry().find(target);
+    // 需要与其它 target 仲裁的区间 = 本次写入里"本 target 尚未覆盖"的那部分。
+    // 新 target 是全长；已存在的 target 只可能是扩长出来的尾部（缩回或等长的部分是
+    // 它自己本来就占着的范围）。越过现有 extent 去压别的 target，撤销顺序会把对方的
+    // 字节写坏 —— 所以扩长同样要过区间仲裁。
+    uintptr_t claimBegin = targetBegin;
     if (it != Registry().end()) {
         // 同一 owner 重复 Apply 同一 target：拒绝。补丁已生效，再打一层只会让"哪层是谁的"
         // 彻底不可追踪；要改字节请先 Unpatch 再 Patch。
@@ -225,16 +230,23 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
                 return false;
             }
         }
-    } else {
-        // 只有【新 target】需要与其它 target 做区间仲裁：已存在的 target 允许不同 owner 叠加，
-        // 它们的区间本来就重合。
+        uintptr_t coveredEnd = 0;
+        if (RangeEnd(targetBegin, it->second.Extent(), coveredEnd) && coveredEnd < targetEnd) {
+            claimBegin = coveredEnd;
+        } else {
+            claimBegin = targetEnd;   // 未越界：本次没有新增区间，不需要仲裁
+        }
+    }
+    if (claimBegin < targetEnd) {
         for (const auto& kv : Registry()) {
+            if (kv.first == target) continue;
             const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(kv.first);
             uintptr_t otherEnd = 0;
             if (RangeEnd(otherBegin, kv.second.Extent(), otherEnd) &&
-                    RangesOverlap(targetBegin, targetEnd, otherBegin, otherEnd)) {
-                Logger::Log("PatchRegistry::Apply: range overlap target=%p len=%zu existing=%p extent=%zu",
-                    target, len, kv.first, kv.second.Extent());
+                    RangesOverlap(claimBegin, targetEnd, otherBegin, otherEnd)) {
+                Logger::Log("PatchRegistry::Apply: range overlap target=%p len=%zu claimed=[%p,%p) existing=%p extent=%zu",
+                    target, len, reinterpret_cast<void*>(claimBegin),
+                    reinterpret_cast<void*>(targetEnd), kv.first, kv.second.Extent());
                 return false;
             }
         }
@@ -273,6 +285,29 @@ bool OverlapsRegistered(const void* target, size_t len) {
         }
     }
     return false;
+}
+
+size_t DiscardOwned(const wchar_t* owner) {
+    if (!owner || !*owner) return 0;
+    CsGuard csGuard;
+    size_t removed = 0;
+    for (auto it = Registry().begin(); it != Registry().end(); ) {
+        auto& levels = it->second.levels;
+        const size_t before = levels.size();
+        levels.erase(std::remove_if(levels.begin(), levels.end(),
+            [owner](const Level& lv) { return lv.owner == owner; }), levels.end());
+        removed += before - levels.size();
+        if (levels.empty()) {
+            it = Registry().erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (removed != 0) {
+        Logger::Log("PatchRegistry::DiscardOwned: owner=%ls dropped=%zu (no bytes written)",
+                    owner, removed);
+    }
+    return removed;
 }
 
 bool RevertOwned(void* target, const wchar_t* owner) {

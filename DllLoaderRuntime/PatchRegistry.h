@@ -35,4 +35,12 @@ bool OverlapsRegistered(const void* target, size_t len);
 // 只由 HookAPI::Unpatch 调用（即插件主动撤销），Loader 自身不调用。
 bool RevertOwned(void* target, const wchar_t* owner);
 
+// DiscardOwned：摘掉某 owner 的全部补丁层次，**不写回任何字节**，返回摘掉的层数。
+// 用于 GameCore 生命周期结束（插件卸载 / 换局）：目标映像已经或即将被重新映射，往旧地址
+// 写回字节既无意义、又可能落到新映像上；但记录必须摘掉 —— 否则地址被复用后，残余记录会让
+// 后来者撞上"该 owner 已打过补丁"或区间重叠，从此再也打不上补丁。
+// 摘掉栈中间某一层时，上层存档原样保留（它记录的本来就是"含该层"的字节）；本路径不还原，
+// 因此不需要重排存档。若上层之后自己 Unpatch，写回的是它当时记下的字节。
+size_t DiscardOwned(const wchar_t* owner);
+
 }  // namespace PatchRegistry

@@ -1735,6 +1735,33 @@ def all_module_jobs(game_dir):
     ]
 
 
+def publish_atomic(src: str, dst: str) -> None:
+    """把【已验证】的候选原子替换到交付路径。
+
+    顺序固定为：复制到目标目录下的临时文件 -> 校验副本 -> os.replace 原子换名。
+    任一步失败时 dst 保持原内容（要么旧文件、要么完整新文件，绝不会出现半截文件）；
+    也没有"先覆盖再验证"的窗口 —— 候选不通过时交付物根本没被碰过。
+    """
+    dst_dir = os.path.dirname(dst)
+    os.makedirs(dst_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".publish-", suffix=".tmp", dir=dst_dir)
+    os.close(fd)
+    try:
+        shutil.copyfile(src, tmp)
+        h_src = hashlib.sha256(open(src, "rb").read()).hexdigest()
+        h_tmp = hashlib.sha256(open(tmp, "rb").read()).hexdigest()
+        if h_src != h_tmp:
+            raise RuntimeError("发布前内容不一致：%s != %s" % (h_src, h_tmp))
+        os.replace(tmp, dst)
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def cmd_all(args) -> int:
     jobs = all_module_jobs(args.game_dir)
     pack_out = DEFAULT_PACK
@@ -1768,22 +1795,19 @@ def cmd_all(args) -> int:
             raise RuntimeError("compress 失败（exit %d）" % rc)
         print("[3/5] compress -> %s (%d B)" % (xp_out, os.path.getsize(xp_out)))
 
-        # ---- 4) 部署到运行时 ----
-        print("== [4/5] deploy -> %s" % RUNTIME_XP)
-        os.makedirs(os.path.dirname(RUNTIME_XP), exist_ok=True)
-        shutil.copyfile(xp_out, RUNTIME_XP)
-        h1 = hashlib.sha256(open(xp_out, "rb").read()).hexdigest()
-        h2 = hashlib.sha256(open(RUNTIME_XP, "rb").read()).hexdigest()
-        if h1 != h2:
-            raise RuntimeError("部署后内容不一致：%s != %s" % (h1, h2))
-        print("[4/5] deploy -> %s (%d B, sha256=%s)"
-              % (RUNTIME_XP, os.path.getsize(RUNTIME_XP), h1[:16]))
-
-        # ---- 5) validate ----
-        print("== [5/5] validate（pack.bin + .xp）")
+        # ---- 4) validate（先验证候选，再去动交付物）----
+        print("== [4/5] validate（pack.bin + .xp）")
         if not validate_files([pack_out, xp_out]):
-            raise RuntimeError("validate 失败")
-        print("[5/5] validate OK")
+            raise RuntimeError("validate 失败；候选保留在 %s 与 %s，交付物未改动"
+                               % (pack_out, xp_out))
+        print("[4/5] validate OK")
+
+        # ---- 5) deploy（临时文件 + 原子替换，失败不留半截文件）----
+        print("== [5/5] deploy -> %s" % RUNTIME_XP)
+        publish_atomic(xp_out, RUNTIME_XP)
+        h1 = hashlib.sha256(open(RUNTIME_XP, "rb").read()).hexdigest()
+        print("[5/5] deploy -> %s (%d B, sha256=%s)"
+              % (RUNTIME_XP, os.path.getsize(RUNTIME_XP), h1[:16]))
 
         # ---- 6) 清理中间产物（校验通过之后再删）----
         print("== 清理中间产物（tools/ 下的 .bin/.xp；交付物是 %s）" % RUNTIME_XP)

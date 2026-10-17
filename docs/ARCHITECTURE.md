@@ -319,10 +319,11 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 - **第 5 步必须在第 7 步之前**：入口字节还原之后才谈得上"Free 插件不会留下入口跳向已释放代码的窗口"；
 - **第 9 步重扫而不是沿用第 5 步的地址列表**：第 5～9 步之间还跑过插件卸载，而 `PushLuaMethods` 这类
   注册入口按设计不过域门，理论上仍可能往正在拆除的映像上装钩——重扫能一并收掉；
-- **这里【不做】补丁区间清账，是设计决定**：Loader 不替插件回滚补丁（§5.8），补丁记录只在插件
-  自己调 `Unpatch` 时才从 `PatchRegistry` 摘除。副作用是**未撤销的补丁记录会跨代存活** —— GameCore
-  插件若没调 `Unpatch`，它那条落在旧映像区间里的记录会留到进程退出；新一代 GameCore 映射到同一基址时，
-  这条陈旧记录仍会参与 `OverlapsRegistered` / `OverlapsHookPrologue` 的区间仲裁（见 §5.8）。
+- **这里要清补丁记录，但不写回字节**：旧映像即将被重新映射，把字节写回旧地址既无意义、又可能落到
+  新映像上；而记录留着更糟——新一代 GameCore 映射到同一基址时，陈旧记录会让后来者撞上"该 owner 已
+  打过补丁"或区间重叠，从此**再也打不上补丁**。所以 teardown 对全部 GameCore 类别插件调
+  `PatchRegistry::DiscardOwned`：只摘层次、不动内存。隔离/驻留的插件也一并清（它们不走
+  `UnloadPluginByOwnerId`）。Global 插件驻留不卸，记录保留，仍可自己 `Unpatch`（见 §5.8）。
 
 ### 2.4 插件模块的释放时机
 
@@ -428,13 +429,19 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
    **所有拒载都发生在 OnLoad 之前**：此时没有任何**经 Loader 账本**的钩子/补丁/回调需要回滚，`FreeLibrary`
    只释放本次自己拿到的引用。注意这不等于「插件一行代码都没跑过」——`LoadLibraryExW` 已经执行过它的
    `DllMain`/CRT 初始化，`Civ6PluginKind` 的调用也在 SEH 叶子里执行；那是信任边界，不是安全保证；
-5. 找 `OnLoad` 导出；缺失 → 拒载（释放引用）；
+5. 找初始化导出：**`OnLoadEx`（推荐）优先，其次旧协议 `OnLoad`**，两个都没有 → 拒载（释放引用）。
+   - `OnLoadEx(const HookContext*) -> int`：返回 0 = 初始化失败（例如 `HookAPI_RequireAll` 缺接口）；
+   - `OnLoad(const HookContext*) -> void`：返回值表达不了失败，只能靠"没崩"算成功——这是它被
+     `OnLoadEx` 取代的原因，旧插件仍照常加载；
 6. 组装 `PluginEntry`（handle / path / stem 名 / `ownerId` = 规范化全路径 / category /
    `inFlight` = **本次加载代**的 `PluginInFlight::Owner*`），
    `SetPluginState(Loading)`（同步放行镜像）并 push 进 `g_plugins`。
    **顺序不能反**：`SetPluginState` 要写 `entry.inFlight` 的放行镜像，先置状态会让它作用在 `nullptr` 上
-   而静默失效；`inFlight` 必须由 `BeginLifetime` 新建（不是 `Resolve`），否则代际隔离失效（§6.1）；7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadSafe(onLoad)`（SEH 包住）→ 清上下文 → 重新拿锁；
-8. `OnLoad` 崩溃 → `QuarantinePluginByOwner`（§3.3）+ **模块释放策略**（§3.3 末），返回 false；
+   而静默失效；`inFlight` 必须由 `BeginLifetime` 新建（不是 `Resolve`），否则代际隔离失效（§6.1）；7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadExSafe` / `CallOnLoadSafe`（SEH 包住）→ 清上下文 → 重新拿锁；
+8. 初始化失败 → `QuarantinePluginByOwner`（§3.3）+ **模块释放策略**（§3.3 末），返回 false。
+   两条来源走同一条回滚链，只是日志分开：**崩溃**（执行中异常）与 **`OnLoadEx` 返回 0**（插件
+   明确拒绝）。失败时**不注册 `OnMessage`、不进 `Active`**，条目以 `Quarantined` 留在 `g_plugins`
+   里拦住重试；
 9. 有 `OnMessage` 导出 → 自动注册消息处理器；
 10. `SetPluginState(Active)`，加载完成。
 
@@ -490,7 +497,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   该结构体从不跨越模块边界，每个插件只用自己那一份；两类插件的 `sizeof` 不同
   （GameCore 多 7 个成员），这不构成问题。
 
-- **`HOOK_API_LIST`**（`common/HookAPI.h`）——77 个入口的唯一来源，X-macro 形式，
+- **`HOOK_API_LIST`**（`common/HookAPI.h`）——79 个入口的唯一来源，X-macro 形式，
   列 = `X(entryName, returnType, params, category)`。由它生成：结构体成员、入口计数
   `CIV6_HOOK_API_ENTRY_COUNT`、Loader 侧的名字查找、插件侧的解析代码。加一个入口 = 清单加一行。
 
@@ -549,7 +556,7 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 
 ## 4. 插件接口（HookAPI 全表）
 
-77 个入口，按"谁能用、受什么限制"分四类。清单在 `common/HookAPI.h` 的 `HOOK_API_LIST`，
+79 个入口，按"谁能用、受什么限制"分四类。清单在 `common/HookAPI.h` 的 `HOOK_API_LIST`，
 结构体与计数都由它生成。
 
 ### 4.1 双域通用，但按"目标地址域"设门（9 个）
@@ -583,8 +590,8 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 
 ### 4.2 GameCore 专属（7 个，编译期 + 加载期 + 运行期三层限制）
 
-`GetPlayer`、`RegisterGameEvent`、`TriggerGameEvent`、`RegisterScriptGlobals`、
-`RegisterScriptGlobalsForUI`、`PushLuaMethods`、`RegisterPushMethodsTarget`。
+`GetPlayer`、`RegisterGameEvent`、`TriggerGameEvent`、`RegisterGameCoreScriptForGamePlay`、
+`RegisterGameCoreScriptForUI`、`PushLuaMethods`、`RegisterPushMethodsTarget`。
 
 为什么专属：`GetPlayer` 解析 `GameCore::Context::Globals::EditPlayer` 符号（引擎侧的函数名就是
 `EditPlayer`，接口名只表达"取玩家对象"）；其余六个操作
@@ -598,7 +605,7 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 `lua_State*`，所以两类插件都开放。导入在**阶段 A** 解析一次（该 DLL 是 exe 静态导入、常驻）；
 缺失时逐个入口降级为安全默认值 + 限次日志，**不影响插件加载**。
 
-### 4.4 其它（17 个）
+### 4.4 其它（19 个）
 
 - 消息：`BroadcastMessage` / `RegisterMessageHandler` / `SendMessageTo`（§6.2）；
 - `Log`、映像元数据 `IsImageLoaded` / `GetImageInfo`；
@@ -608,6 +615,9 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
   `LocPushArgument` / `LocToUtf8`——走独立模块 `Localization_FinalRelease.dll` 的导出；
 - `MakeHash`：**已内化**为 loader 自己的原生 CRC32（raw，无最终异或，与官方 `GameCore::Utilities::MakeHash`
   逐位一致，并有编译期自检向量）；不再解析任何 GameCore 符号，任何时刻可算；
+- 脚本注册：`RegisterGlobalScript`（登记到引擎主 state，§6.3）与 `UnregisterGlobalCapture`
+  （撤销自己的一个参数捕获订阅，§5.3）——两个都不按目标地址域设门：前者只登记回调，
+  后者只能摘掉自己名下的槽；
 - `GetMainLuaState`：读 exe 全局 `LuaSystem::LuaScriptSystem::ms_apSingletonInstance`（DX11 实测 RVA
   `0x2D08F88`）解引用后的 `+0x10` → **引擎主 Lua VM**（`m_pkMainLuaState`）。★ 这是**进程级** state：
   `lua_newstate()` 在 `Civ6App::GUIInit` 建一次，只在 `Civ6App::GUIShutdown` `lua_close`
@@ -667,9 +677,11 @@ volatile 集合。栈上对齐同样是约束：入口 `rsp ≡ 8 (mod 16)`，�
 `nextTarget` / `captureParamIndex` 三处 `offsetof`），而 stub 永不重建——改 `HookSite` 布局后，
 同进程里可能同时存在按旧布局生成的旧 stub 与按新布局生成的新 stub。偏移错了不编译失败、
 不运行时报错，只表现为 capture 静默失效或跳到垃圾地址。`HookEngine.cpp` 在
-`BuildHookHubStub` 之前有四条 `static_assert` 钉住这三个偏移与 `sizeof(HookSite)`
-（实测 x64 Release：`hasCapture` 0x40 / `nextTarget` 0x18 / `captureParamIndex` 0x44 /
-`sizeof` 0x78），改布局会在编译期失败并提示同步 `BuildHookHubStub`。
+`BuildHookHubStub` 之前用 `static_assert` 钉住的是**stub 真正依赖的不变量**，不是某个配置的
+实测数值：`hasCapture` 恰好一个字节（stub 用 `cmp byte ptr` 只读这一格）、`nextTarget` 自然对齐
+（stub 用 qword 读）、三个偏移与 `sizeof(HookSite)` 都落在 `int32` 内（asmjit 位移宽度）。
+偏移本身由本 TU 的 `offsetof` 现算，Release 与 Debug 的 STL 布局不同（iterator debug 层会撑大
+容器）也各自成立——把 Release 的数值写死只会让 Debug 编不过（曾经的 Debug 构建失败就是这个原因）。
 
 这四条只挡**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它们保证——但该前提在本项目成立：
 stub 里嵌的是本进程的 `&HookSite`，而 `version.dll` 自更新会重启进程，新进程里不存在旧 stub。
@@ -789,11 +801,17 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 
 - `Unpatch(target)` 保留（底层 `PatchRegistry::RevertOwned`），供插件在**自己还活着的时候**
   主动撤销。这时插件知道自己的状态，也知道自己的补丁是否还被调用；
-- **Loader 不替插件自动撤销补丁**。隔离/卸载后的补丁留在游戏里，直到进程退出。
+- **Loader 不替插件自动撤销补丁**。隔离/卸载后的补丁留在游戏里，直到进程退出；
+- `DiscardOwned(owner)` 是唯一由 Loader 调用的"清账"入口：**只摘记录、不写回字节**，用于
+  GameCore 生命周期结束（换局 / GameCore 类别插件卸载）。判据是"目标映像即将重新映射，写回旧
+  字节既无意义又可能落到新地址上"，但记录必须摘掉，否则地址复用后残余记录会挡住后续的
+  `Apply` 与 `OverlapsRegistered`。摘掉栈中间的层时，上层存档原样保留（它记的本来就是"含该层"
+  的字节），不做重排。
 
-> 副作用（已知且接受）：未 `Unpatch` 的层会留到进程退出；GameCore 插件若未撤销，其落在旧映像
-> 区间里的记录会跨代存活，并继续参与 `OverlapsRegistered` / `OverlapsHookPrologue` 的区间仲裁
-> （见 §2.3 第 9 步）。
+**区间的加入与扩长都要仲裁**：新 target 按全长与其它 target 比对；已存在的 target 追加更长的层时，
+只把**越过它现有 `Extent()` 的那一段**拿去比对（缩回或等长的部分是它本来占着的范围，不需要再比）。
+不这样做的话，先用 4 字节、再用 12 字节打同一个 target 就能悄悄压住中间 8 字节处的另一个 target，
+撤销时把对方的字节写乱。
 
 ---
 
@@ -806,7 +824,7 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 `ReleaseCount`；卸载/隔离用 `WaitAll(owner, name)`：谓词是「本 owner 的在途计数 ≤ 本线程自己的深度」，
 5 秒未满足就限次记日志但**继续等**（不放弃）。
 
-被它守卫的入口：消息 handler、`RegisterScriptGlobals`（含 UI）、`GameEvent` 触发、`PushLuaMethods` 推送。
+被它守卫的入口：消息 handler、`RegisterGameCoreScriptForGamePlay` / `RegisterGameCoreScriptForUI`、`GameEvent` 触发、`PushLuaMethods` 推送。
 **不**被它守卫的：插件 detour（靠 teardown 顺序保证）、以及已经交给引擎的 Lua 函数指针。
 
 #### 按加载代隔离（`BeginLifetime`）
@@ -850,11 +868,36 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 （`UnloadPluginByOwnerId` / `QuarantinePluginByOwner`）在 `OnUnload` 与 `FreeLibrary` 之前也会各等一次，
 但那时等的是同一个 `Owner`、计数已归零，重复等待的成本是零。
 
-### 6.3 ScriptGlobals（+ ForUI）
+### 6.3 脚本全局注册（三个入口）
 
-`RegisterScriptGlobals(fn)`（GameCore 专属）：登记进 `g_scriptGlobals`（UI 版本进 `g_scriptGlobalsUI`）→
-`EnsureScriptHooksInstalled()` 在 `GameCore::Lua::Utility::RegisterScriptData(ForUI)` 上装共享钩 →
-游戏初始化脚本时，detour 依次调用每个 `fn(L)`（SEH 隔离 + `PluginInFlight` 守卫），最后调原函数（跳板）。
+**GameCore 域（GameCore 专属）**：`RegisterGameCoreScriptForGamePlay(fn)` / `RegisterGameCoreScriptForUI(fn)`
+→ 登记进 `g_scriptGlobals` / `g_scriptGlobalsUI` → `EnsureScriptHooksInstalled()` 在
+`GameCore::Lua::Utility::RegisterScriptData(ForUI)` 上装共享钩 → 游戏初始化脚本时，detour 依次调用每个
+`fn(L)`（SEH 隔离 + `PluginInFlight` 守卫），最后调原函数（跳板）。两个 state 是不同的：gameplay 每局重建，
+UI 是 GameCore 侧界面脚本用的那个。
+
+**进程级（两类插件都可用）**：`RegisterGlobalScript(fn)` → 登记进 `g_globalScriptGlobals`，回调跑到
+exe 的**引擎主 lua_State**（`GetMainLuaState` 解析出的那个，`GUIInit` 建、`GUIShutdown` 关，换局不失效）。
+
+主执行点是对 `AppLuaModdingLibrary::pRegister(lua_State*)` 装共享钩（`EnsureGlobalScriptHooksInstalled`）：
+
+- 这个函数就是引擎把 "Modding" 脚本库注册进某个 Lua 环境的地方——`lua_createtable` 造表、57 个
+  `hks_pushnamedcclosure` + `hksi_lua_setfield` 填进去、`return 1`（表留在栈上），由
+  `AppLuaUtils::ExposeLibraryToThread(L, thread, "Modding", pRegister)` 挂成全局；
+- 取址：`HookInfoExe` 双版本（DX11 RVA `0x4D0D70` / DX12 `0x4D15F0`，两版函数大小都是 `0xA9E`），
+  AOB 兜底取同批注册函数里的第 10 个命中（两版顺序一致）；
+- detour 在**原函数之前**跑插件回调：原函数返回时栈顶留着刚建好的表，那时再跑插件代码容易破坏
+  调用方对栈的预期。回调拿到的 L 仍是主 state（`GetMainLuaState`），不依赖钩子的入参形状。
+
+两个补跑点覆盖钩子装晚 / 没命中的情况：
+
+- `UiInject` 的 `MainMenuState::LoadUI` detour：主菜单 UI 建好后、各 Mod 的 `FrontEndUI_*.lua` 加载前
+  再跑一次——插件挂的全局因此能被 Mod 自己的主菜单脚本直接用；
+- `LoadPluginsOf(GameCore)` 末尾补跑一次：GameCore 插件是在对局加载时才 `OnLoad` 的，赶不上启动期
+  那次触发。
+
+每个登记项用 `appliedFor` 记住"已经跑到哪个 state 上"：同一个 state 只跑一次，state 被重建（指针变化）
+后重跑。回调同样走 `PluginInFlight` 守卫，插件卸载/隔离时登记随 owner 一并摘除。
 
 ### 6.4 PushLuaMethods
 
@@ -889,7 +932,7 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
   **GameCore.dll 不含 VM**：它从同一个 DLL 导入 49 个 lua 符号，但**没有** `lua_newstate` /
   `lua_close` / `lua_newthread`——它只能**消费** state，不能创建或销毁；
 - 谁把"插件的东西"放进 Lua：只有两条——`PushLuaMethods`（loader 把插件闭包塞进游戏的方法表）、插件自己
-  在 `RegisterScriptGlobals` 回调里注册的全局/闭包。`GameEvent` 的 `pushFn` 不在 Lua 表里（loader 每次现调）；
+  在 `RegisterGlobalScript` / `RegisterGameCoreScriptForGamePlay` 回调里注册的全局/闭包。`GameEvent` 的 `pushFn` 不在 Lua 表里（loader 每次现调）；
 - 因此"插件地址留在 Lua 表里"这件事，在 GameCore 专属 + §2.4 的释放顺序下不成问题：插件模块被释放时，
   那些 state 已经随 GameCore 一起没了；
 - **未支持**：frontend 侧的 PushMethods（`kind=3` 现在被显式拒绝）。将来要做，需要"loader 派发器"式的 adapter，
@@ -956,10 +999,12 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
    context → `AllocateControl<LuaContext>(mgr)` 造根 context → `ChangeParent` 挂到 FrontEnd 下 →
    取虚表 `+0x200` 调 `Initialize(baseName)`（虚拟槽位，不硬编码地址）加载
    `Civ6DllLoader/Civ6DllLoader_FrontEndUI`（xml 的 `Name = AdditionalFrontEndUI`）；
-4. **Mod UI**：遍历启用 Mod 的 `.modinfo`，从 `<FrontEndActions><ImportFiles>` 收集
-   `FrontEndUI_*.xml` 的 base name，逐个同样注入到根 context 下。文件名有路径安全校验（相对路径、
-   无盘符、逐段非空/非 `.`/`..`、前缀必须是 `FrontEndUI_`、扩展名 `.xml`）；带条件的声明不加载，
-   但**条件是按 XML 出现顺序记的**：`<Criteria>` 必须排在 `<File>` 之前才生效；
+4. **Mod UI**：遍历**已启用 Mod 的目录树**、按文件名找 `FrontEndUI_*.xml`（前缀与 `.xml`
+   扩展名都大小写不敏感），**不读 `.modinfo`**——所以 Mod 作者不需要在 `ImportFiles` 里登记，
+   把文件命名成 `FrontEndUI_<任意>.xml` 放进 Mod 目录任意层级即可。base name 取该文件相对
+   Mod 根的 VFS 路径（分隔符统一 `/`、去掉 `.xml`），正是 `Initialize` 要的形参。递归遍历默认
+   不跟随目录符号链接，另加 8 层深度上限，避免异常目录拖慢主菜单线程；启用与否只认
+   `Mods.sqlite` 返回的精确 mod root（§4.6），未启用的 Mod 不会被扫到；
 5. **刷新与回收**：`g_frontEndContext` 变化（换了 FrontEnd）时重建；同一个 FrontEnd 收到
    `g_refreshRequested`（上次注入失败）时先用 exe 导出的 `DestroyChild` 销毁 loader 自己的根
    context 再重建。销毁失败或子 context 注入失败时，指针登记在 `g_rootContext` / `outAllocated`
@@ -1045,6 +1090,11 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 - **符号库状态查询**（不过域门、不取插件锁）：`GetSymbolDbState(image)` /
   `GetSymbolDbMatchRatio(image)`——参数是 `image` 标量，没有跨模块指针，因此只需读
   `PdataMatch` 自己的快照；
+- **段相对 RVA（`ResolveByRvaEx` + 非 `kSectionImage`）**：查到的 section 坐标必须先过三道
+  校验才允许换算成地址——零长度拒绝（与 `ResolveByRva` 同约定）、`rva < sectionSize`、
+  `span <= sectionSize - rva`（减法比较，避免 `sectionSize - rva` 下溢），最后再判
+  `sectionRva + rva` 的加法溢出。只靠 `ImageAddress::ResolveByRva` 的整映像范围检查**不能替代**
+  段范围检查：段尾之外的地址仍在映像内，会静默解析出有效指针；
 - **Loader 内部**（不经过插件 ABI，也不拿插件锁）：`LoaderCore::ResolveExeTarget(HookInfoExe)` 与
   `ResolveDataByAobCore(image, aob, index)`；
 - **exe 域双版本**：`HookInfoExe` = 每个变体（DX11/DX12）各一组「RVA + 唯一 AOB」，运行时按当前 exe
@@ -1075,7 +1125,11 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 | `compress` | `pack.bin` → `C6XC` + LZMA1 信封 `.xp`（带 SHA256 roundtrip 校验） |
 | `validate` | 按运行时同款解析独立校验 `.bin` / `.xp` |
 | `aob` | 从容器里的 mask 指纹生成/核对 loader 的 AOB 常量（`--emit-cpp` 直接出可粘贴的常量块） |
-| `all` | 一条命令跑完产线：`module` ×3 → `pack` → `compress` → 部署到 `DllLoaderRuntime/` → `validate` → 清理中间产物 |
+| `all` | 一条命令跑完产线：`module` ×3 → `pack` → `compress` → `validate` → 部署到 `DllLoaderRuntime/` → 清理中间产物 |
+
+**部署顺序是产线的一部分**：先 `validate` 候选（`.pack.bin` 与 `.xp`），通过后才发布；发布走
+「目标目录内临时文件 → 校验副本 → `os.replace` 原子换名」，任何一步失败交付物保持原样（既不会
+被半截文件覆盖，也不会在验证失败时被换成坏候选）。验证不过时候选保留在 `tools/` 供诊断。
 
 `rva_to_symbol`（RVA → 符号）覆盖 **gamecore / dx11 / dx12 三个映像**：每个映像的符号表各压成一份
 zlib 数据，由 Rust 侧 `include_bytes!` 在**编译期嵌入** exe —— 交付物仍是单个文件，查询时只解压选中的

@@ -101,6 +101,22 @@ constexpr char kGameEventCurrentGamePattern[] =
 // GameSignals::Subscribe 内 "mov rdi, cs:ms_pkCurrentGame" 指令地址（按代缓存，重扫兜底）。
 static void* g_gameEventContainerHit = nullptr;
 
+// ---- 引擎侧"Modding"脚本库注册入口 ----
+// AppLuaModdingLibrary::pRegister(lua_State*)：建一张新表 -> 57 个 hks 闭包逐个 setfield ->
+// return 1（表留在栈上）。调用方 AppLuaUtils::ExposeLibraryToThread(L, thread, "Modding", pRegister)
+// 负责把它挂成全局 "Modding"。IDA 实测：DX11 RVA 0x4D0D70、DX12 RVA 0x4D15F0，两版函数大小
+// 都是 0xA9E；下面这条函数头签名在同批 Lua 库注册函数里各命中 12 处，pRegister 是第 10 个
+// （两版顺序一致，已用两个 exe 的实际字节逐一核对）。
+constexpr char kAob_ModdingRegister[] =
+    "48 89 5C 24 08 57 48 83 EC 30 45 33 C0 33 D2 48 8B D9 E8 ?? ?? ?? ?? 33 FF 4C 8D 0D";
+constexpr HookInfoExe kExeModdingRegister = {
+    HookRva(0x4D0D70, kAob_ModdingRegister, 10),
+    HookRva(0x4D15F0, kAob_ModdingRegister, 10)
+};
+
+typedef int64_t(__fastcall* ModdingRegisterFn)(void* L);
+static ModdingRegisterFn g_origModdingRegister = nullptr;
+
 constexpr int kMaxRegisteredGameEvents = 32;
 
 // 每个注册的 GameEvent 一条记录：名字 + owner + Lua 参数打包回调。槽位判空用 name[0]。
@@ -121,10 +137,15 @@ struct ScriptGlobalsEntry {
     ScriptGlobalsFn fn;
     // 登记时解析一次并常驻：运行时守卫不再做宽字符串哈希。
     PluginInFlight::Owner* inFlight = nullptr;
+    // 全局脚本专用：该项已经跑到过哪个主 lua_State 上。同一个 state 只跑一次，
+    // state 被重建（指针变化）后重新跑。GameCore 侧两个列表不使用这个字段。
+    void* appliedFor = nullptr;
 };
 
 std::vector<ScriptGlobalsEntry> g_scriptGlobals;
 std::vector<ScriptGlobalsEntry> g_scriptGlobalsUI;
+// 引擎主 state（进程级）上的全局脚本登记。与上面两个列表的区别见 RegisterGlobalScriptImpl。
+std::vector<ScriptGlobalsEntry> g_globalScriptGlobals;
 ProxyTypes::RegisterScriptData g_origRegisterScriptData = nullptr;
 ProxyTypes::RegisterScriptDataForUI g_origRegisterScriptDataForUI = nullptr;
 // 上述两个跳板由统一站点的 MH_CreateHook 回填（尾跳原函数），detour 用它们调原实现；
@@ -858,7 +879,7 @@ void __cdecl Hook_RegisterScriptDataForUI(hks::lua_State* unused, hks::lua_State
 
 // ==== EnsureScriptHooksInstalled ====
 // 确保已注册回调对应的共享钩子已装上。两条调用路径：
-//  1) 插件 RegisterScriptGlobals / RegisterScriptGlobalsForUI 注册时；
+//  1) 插件 RegisterGameCoreScriptForGamePlay / RegisterGameCoreScriptForUI 注册时；
 //  2) GameCore 重载后 InitializeGameCorePhase 再调。
 // 共享钩的 MinHook 记录随旧 GameCore 映像在 ResetForReload 里被物理摘除，因此重载后
 // 必须按【当次】仍存在的注册项重新装钩；不存在跨代保留的注册列表。
@@ -896,8 +917,11 @@ void EnsureScriptHooksInstalled() {
     }
 }
 
-// ==== RegisterScriptGlobalsImpl ====
-void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
+// ==== RegisterGameCoreScriptForGamePlayImpl ====
+// 把插件的注册回调接进 GameCore 的 gameplay 脚本环境：由 Loader 挂住
+// GameCore::Lua::Utility::RegisterScriptData，引擎每次调用它时顺带把已登记的插件回调
+// 也跑一遍（原函数的语义保持不变）。
+void RegisterGameCoreScriptForGamePlayImpl(ScriptGlobalsFn fn) {
     if (!fn) return;
     // owner 校验与登记必须在同一把生命周期锁内完成。原实现先 RequirePluginOwner（内部取锁
     // 后释放）、再单独取锁 push_back：这中间若插件被停用并跑完 RemovePluginOwnedRegistrations，
@@ -906,9 +930,10 @@ void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
     {
         lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
         auto owner = PluginDomain::RequirePluginOwner(reinterpret_cast<const void*>(fn),
-                                        "RegisterScriptGlobals");
+                                        "RegisterGameCoreScriptForGamePlay");
         if (!owner) return;
-        if (!PluginDomain::RequireGameCoreOwner(reinterpret_cast<const void*>(fn), "RegisterScriptGlobals")) return;
+        if (!PluginDomain::RequireGameCoreOwner(reinterpret_cast<const void*>(fn),
+                                  "RegisterGameCoreScriptForGamePlay")) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobals.push_back(
             ScriptGlobalsEntry{ owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
@@ -916,22 +941,129 @@ void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn) {
     EnsureScriptHooksInstalled();  // 内部自带生命周期锁（含并发首装与重载后重装）
 }
 
-// ==== RegisterScriptGlobalsForUIImpl ====
-void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn) {
+// ==== RegisterGameCoreScriptForUIImpl ====
+// 同上，但接进 GameCore 的 UI 脚本环境（GameCore::Lua::Utility::RegisterScriptDataForUI）。
+// 两者的 lua_State 不同：gameplay 是每局那个，UI 是 GameCore 侧界面脚本用的那个。
+void RegisterGameCoreScriptForUIImpl(ScriptGlobalsFn fn) {
     if (!fn) return;
-    // 同 RegisterScriptGlobalsImpl：校验与登记同锁，避免"校验后、登记前"被卸载插入。
+    // 同 RegisterGameCoreScriptForGamePlayImpl：校验与登记同锁，避免"校验后、登记前"被卸载插入。
     {
         lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
         auto owner = PluginDomain::RequirePluginOwner(reinterpret_cast<const void*>(fn),
-                                        "RegisterScriptGlobalsForUI");
+                                        "RegisterGameCoreScriptForUI");
         if (!owner) return;
         if (!PluginDomain::RequireGameCoreOwner(reinterpret_cast<const void*>(fn),
-                                  "RegisterScriptGlobalsForUI")) return;
+                                  "RegisterGameCoreScriptForUI")) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_scriptGlobalsUI.push_back(
             ScriptGlobalsEntry{ owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
     }
     EnsureScriptHooksInstalled();
+}
+
+static void EnsureGlobalScriptHooksInstalled();
+
+// ==== RegisterGlobalScriptImpl ====
+// 全局脚本注册：回调跑到【引擎主 lua_State】（进程级，见 GetMainLuaState）上。
+// 与 GameCore 两个入口的区别：那两个挂的是 GameCore.dll 的 RegisterScriptData，state 每局
+// 重建、注册跟着重建；这里挂的是 exe 的主 state，换局不失效，因此两类插件都能用。
+// 登记本身不执行回调：主 state 要在 GUIInit 之后才存在，执行点见 RunGlobalScripts。
+void RegisterGlobalScriptImpl(ScriptGlobalsFn fn) {
+    if (!fn) return;
+    {
+        lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
+        auto owner = PluginDomain::RequirePluginOwner(reinterpret_cast<const void*>(fn),
+            "RegisterGlobalScript");
+        if (!owner) return;
+        lock_guard<mutex> stateLock(g_scriptStateMutex);
+        g_globalScriptGlobals.push_back(ScriptGlobalsEntry{
+            owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
+    }
+    Logger::Log("RegisterGlobalScript: queued for the engine main lua_State");
+    // 尽早把引擎侧的 "Modding" 注册入口挂上：Global 插件在阶段 A 就注册，通常早于 GUIInit。
+    EnsureGlobalScriptHooksInstalled();
+}
+
+// ==== Hook_ModdingRegister ====
+// pRegister 的 detour：先跑插件登记的全局脚本，再走原函数。
+// 放在原函数之前是有意的——原函数返回时栈顶留着刚建好的 "Modding" 表（返回 1），
+// 那之后再调插件代码容易破坏调用方对栈的预期。
+int64_t __fastcall Hook_ModdingRegister(void* L) {
+    SharedDetourActivity activity;
+    // 插件回调跑完把栈削回原高度：原函数接下来会在栈上建表（-2 索引指它），
+    // 回调若留下多余的值，会让它填到错误的位置上。
+    const int topBefore = L ? LuaGetTopImpl(L) : 0;
+    RunGlobalScripts();
+    if (L) {
+        const int now = LuaGetTopImpl(L);
+        if (now > topBefore) {
+            LuaPopImpl(L, now - topBefore);
+        }
+    }
+    if (g_origModdingRegister) {
+        return g_origModdingRegister(L);
+    }
+    return 0;
+}
+
+// ==== EnsureGlobalScriptHooksInstalled ====
+// 把 pRegister 挂进统一站点表（与 GameCore 的两个脚本钩同构，但目标是 exe 域）。
+// 幂等：站点表本身就是账本，重复调用只是复用同一站点、刷新跳板。
+static void EnsureGlobalScriptHooksInstalled() {
+    {
+        lock_guard<mutex> stateLock(g_scriptStateMutex);
+        if (g_globalScriptGlobals.empty()) return;
+    }
+    void* target = LoaderCore::ResolveExeTarget(kExeModdingRegister, 1);
+    if (!target) {
+        Logger::Log("EnsureGlobalScriptHooksInstalled: AppLuaModdingLibrary::pRegister not found");
+        return;
+    }
+    if (HookEngine::InstallLoaderDetourOnSite(target,
+            reinterpret_cast<void*>(&Hook_ModdingRegister),
+            reinterpret_cast<void**>(&g_origModdingRegister), "GlobalScript")) {
+        Logger::Log("EnsureGlobalScriptHooksInstalled: hooked Modding register at %p", target);
+    } else {
+        Logger::Log("EnsureGlobalScriptHooksInstalled: install failed at %p "
+                    "(target held by another detour?)", target);
+    }
+}
+
+// ==== RunGlobalScripts ====
+// 把所有已登记的回调跑在引擎主 Lua state 上。调用点有两个约束：
+//   1) 游戏线程（Lua 状态非线程安全）；
+//   2) 主 state 已就绪（GUIInit 之后）。
+// 当前由 UiInject 的 MainMenuState::LoadUI detour 触发——那时主菜单 UI 刚建好、主 state
+// 必然存在，而且还没开始加载各 Mod 的 FrontEndUI Lua，插件注册的全局正好赶在前头。
+// 每个登记项对同一个 state 只跑一次；state 被重建（指针变化）后再跑。
+void RunGlobalScripts() {
+    void* L = GetMainLuaStateImpl();
+    if (!L) {
+        Logger::Log("RunGlobalScripts: engine main lua_State not ready, skipped");
+        return;
+    }
+    std::vector<ScriptGlobalsEntry> pending;
+    {
+        lock_guard<mutex> stateLock(g_scriptStateMutex);
+        for (auto& entry : g_globalScriptGlobals) {
+            if (entry.appliedFor == L) continue;
+            entry.appliedFor = L;
+            pending.push_back(entry);
+        }
+    }
+    if (pending.empty()) return;
+    Logger::Log("RunGlobalScripts: running %zu registrar(s) on main lua_State %p",
+        pending.size(), L);
+    for (const auto& entry : pending) {
+        PluginInFlight::Owner* owner = entry.inFlight;
+        if (!owner) owner = PluginInFlight::Resolve(entry.owner);
+        auto callbackGuard = PluginInFlight::Enter(owner, PluginInFlight::Kind::ScriptGlobals);
+        if (callbackGuard) {
+            CallScriptGlobalsSafe(entry.fn, L);
+        } else {
+            Logger::Log("RunGlobalScripts: skipped for inactive owner=%ls", entry.owner.c_str());
+        }
+    }
 }
 
 // ==== RebuildSlotOwners ====
@@ -1748,6 +1880,7 @@ RemovedCounts RemovePluginRegistrations(const std::wstring& owner) {
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         n.globals = removeOwnedBy(g_scriptGlobals);
         n.globalsUI = removeOwnedBy(g_scriptGlobalsUI);
+        removeOwnedBy(g_globalScriptGlobals);   // 全局脚本随 owner 一起摘，计数并进 globals
     }
     // PushMethods 槽位：逐槽摘掉该 owner 的方法。
     {

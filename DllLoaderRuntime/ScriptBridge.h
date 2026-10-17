@@ -130,8 +130,15 @@ uint32_t MakeHashImpl(const char* str);
 HookApiPushMethodsResult PushLuaMethodsImpl( const char* name, const LuaMethodInfo* methods, uint32_t count);
 bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn);
 int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pushMethodsSymbol);
-void RegisterScriptGlobalsForUIImpl(ScriptGlobalsFn fn);
-void RegisterScriptGlobalsImpl(ScriptGlobalsFn fn);
+void RegisterGameCoreScriptForUIImpl(ScriptGlobalsFn fn);
+void RegisterGameCoreScriptForGamePlayImpl(ScriptGlobalsFn fn);
+
+// HookAPI.RegisterGlobalScript 的实现：登记到引擎主 lua_State（进程级）。
+void RegisterGlobalScriptImpl(ScriptGlobalsFn fn);
+
+// 把已登记的全局脚本回调跑在引擎主 lua_State 上。必须由游戏线程调用，
+// 且主 state 已就绪（当前触发点是 MainMenuState::LoadUI detour）。
+void RunGlobalScripts();
 
 // TriggerGameEventImpl 的 __declspec(noinline) 是【行为的一部分】，不是装饰：
 // 它用 _ReturnAddress() 反查调用方是不是插件。被内联后取到的是 Loader 自身的栈帧，
