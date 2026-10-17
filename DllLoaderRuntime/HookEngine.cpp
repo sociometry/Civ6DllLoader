@@ -114,7 +114,7 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);
 //   detourOwner 0x20（std::wstring，32 字节）→ hasCapture 0x40（跨过一整个 wstring）
 //   captureOuts 0x48（std::vector，24 字节）→ recordStale 0x60 → sizeof 120 = 0x78
 // 改动 HookSite 布局时，这几条会编译失败 —— 那正是要的效果：提示同步更新
-// BuildHookHubStub 里的三个 offsetof（以及慢路径 movaps 的栈槽假设）。
+// BuildHookHubStub 里的三个 offsetof。
 //
 // 注意这只挡住**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它保证：stub 里嵌的
 // 是本进程的 &HookSite 与本 DLL 编译期的偏移，而 version.dll 自更新会重启进程，
@@ -131,26 +131,39 @@ static_assert(sizeof(HookSite)                     == 0x78,
 // ==== BuildHookHubStub ====
 // 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
 // 快路径（hasCapture == 0，Detour-only 站点的常态）：
-//   mov r10, imm64(site)
-//   cmp byte ptr [r10 + off(hasCapture)], 0
-//   jne slow
-//   mov rax, [r10 + off(nextTarget)]
-//   jmp rax
+//   push r10
+//   mov  r10, imm64(site)
+//   cmp  byte ptr [r10 + off(hasCapture)], 0
+//   jne  slow
+//   mov  r10, [r10 + off(nextTarget)]
+//   xchg r10, [rsp]        ; r10 还原，栈顶那格换成 nextTarget
+//   ret                    ; 弹 nextTarget 跳过去，栈 = [RA]
+// 退出时 r10 与入口逐位相同、栈也回到入口时的样子；rax/r11 全程不碰。
+//
+// 为什么 r11 也必须保（慢路径）：stub 的 hook 点可以落在函数中部，此时 r11 可能是调用方
+// 正在用的活跃值（例如被当作帧指针，尾声 mov rsp,r11 直接还原栈）。rax/r10/r11 在函数入口
+// 确实是 volatile，但"hook 点可以落在函数中部"这一事实让它们必须按活跃值对待。快路径本来
+// 就不碰 r11，只有慢路径拿它做临时寄存器，所以只有慢路径保存它。
 // 慢路径（有 capture）：
-//   sub rsp, 0x98
+//   push rax ; push r11           ; 连同快路径压下的 r10，共三格原值
+//   sub rsp, 0xA0
 //   mov [rsp+20],rcx / [rsp+28],rdx / [rsp+30],r8 / [rsp+38],r9
-//   movaps [rsp+40],xmm0 / [rsp+50],xmm1 / [rsp+60],xmm2 / [rsp+70],xmm3
 //   lea rcx,[rsp+20] ; mov edx,[r10+off(captureParamIndex)] ; mov r8,r10
 //   mov r10, imm64(&CaptureDispatch) ; call r10
-//   恢复 rcx/rdx/r8/r9 + xmm0-3
-//   add rsp, 0x98
-//   mov r10, imm64(site)          ; C 调用会打掉 r10，必须重载
-//   mov rax, [r10 + off(nextTarget)]
-//   jmp rax
-// rax/r10/r11 在函数入口是 volatile，且都不是参数寄存器，快路径只动 rax/r10。
-// 栈对齐：入口 rsp ≡ 8 (mod 16)，sub 0x98（≡8）后 rsp ≡ 0 (mod 16)，[rsp+0..0x20)
-// 恰好是 CaptureDispatch 的 shadow space，[rsp+0x20..0x80) 保存参数（movaps 目标全部
-// 16 字节对齐）。慢路径不调用任何"进入/离开"计数（stub 与节点永不释放，计数不构成安全判据）：
+//   恢复 rcx/rdx/r8/r9
+//   mov r10, imm64(site) ; mov r11,[r10+off(nextTarget)]
+//   mov r10,[rsp+0xB0] ; mov [rsp+0xB0],r11     ; 复原 r10，借它的槽放 nextTarget
+//   mov r11,[rsp+0xA0] ; mov rax,[rsp+0xA8]     ; 复原 r11 / rax
+//   add rsp, 0xB0 ; ret                         ; 弹 nextTarget，栈 = [RA]
+// 两条路径退出时 rax/r10/r11 都与入口逐位相同，栈也回到入口时的样子。
+// 慢路径不保存 xmm：CaptureDispatch 只读整数参数槽，本就用不到向量寄存器。而按 Win64
+// 约定 xmm0-5 都是 volatile、由 C 函数随意打掉（xmm6-15 非 volatile，CaptureDispatch
+// 自己会保）：只手工存 xmm0-3 反而漏下 xmm4/xmm5，凑不齐一个完整的 volatile 集合 ——
+// 它保不住调用方的向量状态，却凭空多出一组"必须 16 字节对齐"的栈槽约束。
+// 栈对齐：入口 rsp ≡ 8 (mod 16)；慢路径压三格（24 字节 ≡ 8）后 rsp ≡ 0，再 sub 0xA0
+// （≡ 0）后仍 ≡ 0 —— call 时满足"rsp 16 字节对齐"。[rsp+0..0x20) 恰好是 CaptureDispatch
+// 的 shadow space，[rsp+0x20..0x40) 保存四个整数参数。快路径没有 call，不受此约束。
+// 慢路径不调用任何"进入/离开"计数（stub 与节点永不释放，计数不构成安全判据）：
 // 计数不是安全判据（见 HookSite 注释）。
 // stub 运行时从 site 字段读 nextTarget，因此 MinHook trampoline 可在 stub 生成之后由
 // MH_CreateHook 回填，无需生成后回写任何可执行字节。
@@ -166,24 +179,29 @@ static bool BuildHookHubStub(HookSite* site, void** outStub) {
     const int32_t offNextTarget = static_cast<int32_t>(offsetof(HookSite, nextTarget));
     const int32_t offParamIndex = static_cast<int32_t>(offsetof(HookSite, captureParamIndex));
 
-    // 快路径：无 capture -> 直接尾跳（不保存参数、不发生 C 调用）。
+    // 快路径：无 capture -> 直接尾跳（不发生 C 调用、不碰 rax/r11）。
+    // 只压 r10 一格：nextTarget 先读进 r10，再用 xchg 把它换到栈顶、同时取回 r10 原值，
+    // 于是 ret 直接弹到 nextTarget。热路径共 6 条指令。
+    a.push(x86::r10);                       // [r10_orig][RA]
     a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
     a.cmp(x86::byte_ptr(x86::r10, offHasCapture), 0);
     a.jne(slow);
-    a.mov(x86::rax, x86::ptr(x86::r10, offNextTarget));
-    a.jmp(x86::rax);
+    a.mov(x86::r10, x86::ptr(x86::r10, offNextTarget));  // r10 = nextTarget
+    a.xchg(x86::r10, x86::ptr(x86::rsp));   // 栈 = [nextTarget][RA]，r10 = r10_orig
+    a.ret();                                // 弹 nextTarget -> 跳过去，栈 = [RA]
 
     // 慢路径：保存参数 -> CaptureDispatch -> 恢复 -> 尾跳 nextTarget。
+    // 从 jne 进来时栈上只有快路径压的 r10 一格，rax/r11 还是入口原值 —— 由本路径自己压栈保护。
     a.bind(slow);
-    a.sub(x86::rsp, 0x98);
+    a.push(x86::rax);                       // [rax][r10][RA]
+    a.push(x86::r11);                       // [r11][rax][r10][RA]
+    // 三格后 rsp ≡ 0 (mod 16)，故帧取 0xA0（≡ 0）让 call 时 rsp 仍 16 字节对齐；
+    // 帧取 0x98 会让 call 时 rsp ≡ 8，违反 Win64 调用约定。
+    a.sub(x86::rsp, 0xA0);                  // 三格原值位于 +0xA0(r11) / +0xA8(rax) / +0xB0(r10)
     a.mov(x86::ptr(x86::rsp, 0x20), x86::rcx);
     a.mov(x86::ptr(x86::rsp, 0x28), x86::rdx);
     a.mov(x86::ptr(x86::rsp, 0x30), x86::r8);
     a.mov(x86::ptr(x86::rsp, 0x38), x86::r9);
-    a.movaps(x86::ptr(x86::rsp, 0x40), x86::xmm0);
-    a.movaps(x86::ptr(x86::rsp, 0x50), x86::xmm1);
-    a.movaps(x86::ptr(x86::rsp, 0x60), x86::xmm2);
-    a.movaps(x86::ptr(x86::rsp, 0x70), x86::xmm3);
     a.lea(x86::rcx, x86::ptr(x86::rsp, 0x20));
     a.mov(x86::edx, x86::dword_ptr(x86::r10, offParamIndex));
     a.mov(x86::r8, x86::r10);
@@ -193,14 +211,16 @@ static bool BuildHookHubStub(HookSite* site, void** outStub) {
     a.mov(x86::rdx, x86::ptr(x86::rsp, 0x28));
     a.mov(x86::r8, x86::ptr(x86::rsp, 0x30));
     a.mov(x86::r9, x86::ptr(x86::rsp, 0x38));
-    a.movaps(x86::xmm0, x86::ptr(x86::rsp, 0x40));
-    a.movaps(x86::xmm1, x86::ptr(x86::rsp, 0x50));
-    a.movaps(x86::xmm2, x86::ptr(x86::rsp, 0x60));
-    a.movaps(x86::xmm3, x86::ptr(x86::rsp, 0x70));
-    a.add(x86::rsp, 0x98);
+    // 出口：三个寄存器逐一复原，nextTarget 借 r10 那格落栈，最后 ret 取目标。
+    // 栈此刻是 [0xA0帧][r11_orig@+0xA0][rax_orig@+0xA8][r10_orig@+0xB0][RA]。
     a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
-    a.mov(x86::rax, x86::ptr(x86::r10, offNextTarget));
-    a.jmp(x86::rax);
+    a.mov(x86::r11, x86::ptr(x86::r10, offNextTarget));  // r11 = nextTarget（临时）
+    a.mov(x86::r10, x86::ptr(x86::rsp, 0xB0));           // r10 = r10_orig
+    a.mov(x86::ptr(x86::rsp, 0xB0), x86::r11);           // r10 那格改放 nextTarget
+    a.mov(x86::r11, x86::ptr(x86::rsp, 0xA0));           // r11 = r11_orig
+    a.mov(x86::rax, x86::ptr(x86::rsp, 0xA8));           // rax = rax_orig
+    a.add(x86::rsp, 0xB0);                  // rsp 指向 nextTarget 槽，栈 = [nextTarget][RA]
+    a.ret();                                // 弹 nextTarget -> 跳过去，栈 = [RA]
 
     void* stub = nullptr;
     if (g_captureRuntime.add(&stub, &code) != Error::kOk || !stub) {

@@ -643,9 +643,22 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 
 `BuildHookHubStub`（asmjit 生成裸 x64 机器码）：
 
-- 快路径：`mov r10, site` → `cmp [r10+hasCapture], 0` → `jne slow` → `mov rax, [r10+nextTarget]` → `jmp rax`；
-- 慢路径（有 capture）：保存 rcx/rdx/r8/r9 与 xmm0-3 → `CaptureDispatch(regs, paramIndex, site)` → 恢复
-  → 重新加载 site → 尾跳 `nextTarget`（栈对齐到调用约定）。
+- 快路径：`push r10` → `mov r10, site` → `cmp [r10+hasCapture], 0` → `jne slow` →
+  `mov r10, [r10+nextTarget]` → `xchg r10, [rsp]` → `ret`；
+- 慢路径（有 capture）：`push rax` / `push r11` → `sub rsp, 0xA0` → 保存 rcx/rdx/r8/r9 →
+  `CaptureDispatch(regs, paramIndex, site)` → 恢复参数 → 复原三格 → `ret` 到 `nextTarget`。
+
+快路径不写任何"原值"到栈上：`xchg` 把 r10 的原值换回来、同时把 `nextTarget` 换到栈顶，`ret` 直接
+弹过去——这是**尾跳**而非 `call`，调用方的返回地址本就在栈上。热路径全程只碰 r10，rax/r11 一行都
+没动。慢路径之所以还要保 r11：stub 的 hook 点可以落在函数中部，此时 r11 可能是调用方正在用的
+活跃值（例如被当作帧指针，尾声 `mov rsp,r11` 直接还原栈）。rax/r10/r11 在函数入口确实是 volatile，
+但"hook 点可在函数中部"这一事实让它们必须按活跃值对待。
+
+慢路径不保存 xmm：`CaptureDispatch` 只读整数参数槽，本就用不到向量寄存器；而按 Win64 约定
+xmm0-5 都是 volatile、由 C 函数随意打掉，只手工存 xmm0-3 反而漏下 xmm4/xmm5，凑不齐一个完整的
+volatile 集合。栈上对齐同样是约束：入口 `rsp ≡ 8 (mod 16)`，压满三格后 ≡ 0，因此慢路径帧取
+`0xA0`（而不是 0x98）——这样 `call` 时 rsp 仍 16 字节对齐，[rsp+0..0x20) 是 shadow space、
+[rsp+0x20..0x40) 放四个整数参数，出口 `add rsp, 0xB0` 把帧与三格一并弹出。
 
 两个设计点：`nextTarget` **运行时**从站点字段读，所以跳板可以在 stub 生成之后由 `MH_CreateHook` 回填、
 拔槽也不需要改写任何可执行字节；stub 一经生成**永不释放**。
