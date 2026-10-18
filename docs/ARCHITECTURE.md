@@ -429,17 +429,16 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
    **所有拒载都发生在 OnLoad 之前**：此时没有任何**经 Loader 账本**的钩子/补丁/回调需要回滚，`FreeLibrary`
    只释放本次自己拿到的引用。注意这不等于「插件一行代码都没跑过」——`LoadLibraryExW` 已经执行过它的
    `DllMain`/CRT 初始化，`Civ6PluginKind` 的调用也在 SEH 叶子里执行；那是信任边界，不是安全保证；
-5. 找初始化导出：**`OnLoadEx`（推荐）优先，其次旧协议 `OnLoad`**，两个都没有 → 拒载（释放引用）。
-   - `OnLoadEx(const HookContext*) -> int`：返回 0 = 初始化失败（例如 `HookAPI_RequireAll` 缺接口）；
-   - `OnLoad(const HookContext*) -> void`：返回值表达不了失败，只能靠"没崩"算成功——这是它被
-     `OnLoadEx` 取代的原因，旧插件仍照常加载；
+5. 找初始化导出 `OnLoad`；缺失 → 拒载（释放引用）。签名是
+   `int OnLoad(const HookContext*)`：**返回 0 = 初始化失败**（例如 `HookAPI_RequireAll` 缺接口），
+   非 0 = 成功。返回值是唯一的失败通道，加载器不再把"没崩"当成成功；
 6. 组装 `PluginEntry`（handle / path / stem 名 / `ownerId` = 规范化全路径 / category /
    `inFlight` = **本次加载代**的 `PluginInFlight::Owner*`），
    `SetPluginState(Loading)`（同步放行镜像）并 push 进 `g_plugins`。
    **顺序不能反**：`SetPluginState` 要写 `entry.inFlight` 的放行镜像，先置状态会让它作用在 `nullptr` 上
-   而静默失效；`inFlight` 必须由 `BeginLifetime` 新建（不是 `Resolve`），否则代际隔离失效（§6.1）；7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadExSafe` / `CallOnLoadSafe`（SEH 包住）→ 清上下文 → 重新拿锁；
+   而静默失效；`inFlight` 必须由 `BeginLifetime` 新建（不是 `Resolve`），否则代际隔离失效（§6.1）；7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadSafe`（SEH 包住）→ 清上下文 → 重新拿锁；
 8. 初始化失败 → `QuarantinePluginByOwner`（§3.3）+ **模块释放策略**（§3.3 末），返回 false。
-   两条来源走同一条回滚链，只是日志分开：**崩溃**（执行中异常）与 **`OnLoadEx` 返回 0**（插件
+   两条来源走同一条回滚链，只是日志分开：**崩溃**（执行中异常）与 **`OnLoad` 返回 0**（插件
    明确拒绝）。失败时**不注册 `OnMessage`、不进 `Active`**，条目以 `Quarantined` 留在 `g_plugins`
    里拦住重试；
 9. 有 `OnMessage` 导出 → 自动注册消息处理器；

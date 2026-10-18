@@ -446,7 +446,7 @@ typedef struct HookAPI {
 #undef X
 } HookAPI;
 
-// 本 runtime 能否服务用当前头文件编译出来的插件。OnLoad 开头调一次，返回 0 就中止。
+// 本 runtime 能否服务用当前头文件编译出来的插件。OnLoad 开头调一次，返回 0 就 return 0 中止。
 // 这是跨两侧的有效比较：ctx 由 loader 填，structSize / apiVersion 是插件编译进去的值。
 // structSize 在偏移 0，因此"两边不是同一次构建"时它读到的是对方的 apiVersion(=1) 或
 // 别的值，必然小于 sizeof(HookContext)，当场拒绝——不会把函数指针当 Query 用。
@@ -513,7 +513,7 @@ inline HookAPI* HookAPI_Resolve(const HookContext* ctx) {
 }
 #pragma warning(pop)
 
-// 依赖声明：只列自己真正用到的入口，缺一个就返回 false（配合 OnLoad 里优雅退出）。
+// 依赖声明：只列自己真正用到的入口，缺一个就返回 false（配合 OnLoad 里 return 0 优雅退出）。
 // 用成员指针而不是字符串，因此名字拼错是编译错误、IDE 能补全、重命名能跟随。
 //   if (!HookAPI_RequireAll(api, &HookAPI::ResolveByName, &HookAPI::InstallHook)) return;
 template <typename... M>
@@ -731,14 +731,15 @@ static inline void* ResolveDataByAob(HookAPI* apiTable, HookImageId image, const
 #endif
 
 // Recommended plugin exports (not required beyond OnLoad).
-// extern "C" __declspec(dllexport) void OnLoad(HookContext* ctx);
+// extern "C" __declspec(dllexport) int  OnLoad(HookContext* ctx);   // return 0 = init failed
 // extern "C" __declspec(dllexport) void OnUnload();
 // extern "C" __declspec(dllexport) void OnMessage(const char* topic, const void* data, size_t len);
 //
-// ABI guard (do this first thing in OnLoad):
-//   if (!HookContext_IsCompatible(ctx)) return;
+// ABI guard (do this first thing in OnLoad; every early return means "load failed"):
+//   if (!HookContext_IsCompatible(ctx)) return 0;
 //   api = HookAPI_Resolve(ctx);
-//   if (!HookAPI_RequireAll(api, &HookAPI::Log, &HookAPI::InstallHook)) return;
+//   if (!HookAPI_RequireAll(api, &HookAPI::Log, &HookAPI::InstallHook)) return 0;
+//   return 1;   // initialization succeeded
 // This is how a plugin built from a newer header detects an older runtime instead of
 // reading past the end of the table. The table itself is read-only - writing to it faults.
 

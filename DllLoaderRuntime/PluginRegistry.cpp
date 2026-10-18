@@ -114,10 +114,8 @@ static thread_local HMODULE g_activePluginModule;
 // g_gameCorePhaseReady 已移到 ScriptBridge（阶段 4），经 IsGameCorePhaseReady() 读写。
 
 // 插件导出入口的类型（LoadPluginDllInternal 按名取这些导出）。
-// OnLoad 有新旧两种协议：OnLoadEx 返回 int（非 0 = 初始化成功），OnLoad 返回 void
-// （不崩就算成功，无法回报失败）。两者都支持，OnLoadEx 优先。
-typedef void (*OnLoadFunc)(const HookContext*);
-typedef int  (*OnLoadExFunc)(const HookContext*);
+// OnLoad 返回 int：0 = 初始化失败（插件据此干净退出，Loader 拒绝激活），非 0 = 成功。
+typedef int (*OnLoadFunc)(const HookContext*);
 typedef void (*OnUnloadFunc)();
 typedef void (*OnMessageFunc)(const char*, const void*, size_t);
 
@@ -438,35 +436,22 @@ bool AttachGameCore(HMODULE gameCore) {
     return true;
 }
 
-// ==== CallOnLoadSafe / CallOnLoadExSafe ====
-// 统一的 OnLoad 结果：ok = 初始化成功；crashed 区分"插件自己声明失败"与"执行中崩溃"，
+// ==== CallOnLoadSafe ====
+// OnLoad 的结果：ok = 初始化成功；crashed 区分"插件自己返回 0"与"执行中崩溃"，
 // 两者都要回滚，但日志与后续策略分开记。
 struct OnLoadOutcome {
     bool ok = false;
     bool crashed = false;
 };
 
-// 旧协议 void OnLoad：只有异常才算失败（返回值表达不了失败，这是它被 OnLoadEx 取代的原因）。
+// 插件靠返回值表达失败（例如 HookAPI_RequireAll 缺接口时直接 return 0）：
+// 返回 0 就拒绝激活，不再把"没崩"当成功。
 __declspec(noinline) static OnLoadOutcome CallOnLoadSafe(OnLoadFunc onLoad, const char* name) {
     OnLoadOutcome outcome;
     __try {
-        onLoad(LoaderCore::RuntimeHookContext());
-        outcome.ok = true;
+        outcome.ok = onLoad(LoaderCore::RuntimeHookContext()) != 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Logger::Log("OnLoad crashed in plugin %s code=0x%08X", name, GetExceptionCode());
-        outcome.crashed = true;
-    }
-    return outcome;
-}
-
-// 新协议 int OnLoadEx：返回 0 = 明确失败（例如 HookAPI_RequireAll 缺接口），
-// 加载器据此拒绝激活，不再"返回了就当成功"。
-__declspec(noinline) static OnLoadOutcome CallOnLoadExSafe(OnLoadExFunc onLoadEx, const char* name) {
-    OnLoadOutcome outcome;
-    __try {
-        outcome.ok = onLoadEx(LoaderCore::RuntimeHookContext()) != 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Logger::Log("OnLoadEx crashed in plugin %s code=0x%08X", name, GetExceptionCode());
         outcome.crashed = true;
     }
     return outcome;
@@ -570,11 +555,9 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
         return false;
     }
 
-    // OnLoadEx（int）优先；没有就退回旧协议 OnLoad（void）。两个都没有才拒载。
-    auto onLoadEx = (OnLoadExFunc)GetProcAddress(hPlugin, "OnLoadEx");
-    auto onLoad = onLoadEx ? nullptr : (OnLoadFunc)GetProcAddress(hPlugin, "OnLoad");
-    if (!onLoadEx && !onLoad) {
-        Logger::Log("Plugin has no OnLoadEx/OnLoad export: %s", ModScan::WideToNarrow(wpath).c_str());
+    auto onLoad = (OnLoadFunc)GetProcAddress(hPlugin, "OnLoad");
+    if (!onLoad) {
+        Logger::Log("Plugin has no OnLoad export: %s", ModScan::WideToNarrow(wpath).c_str());
         if (ownsRef) FreeLibrary(hPlugin);
         return false;
     }
@@ -616,9 +599,7 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     // 无论 OnLoad 正常返回还是崩溃，都要在返回后清空，防止污染后续插件。
     SetActivePluginContext(ownerId, hPlugin);
     lifecycleLock.unlock();
-    const OnLoadOutcome onLoadResult = onLoadEx
-        ? CallOnLoadExSafe(onLoadEx, pluginFileName.c_str())
-        : CallOnLoadSafe(onLoad, pluginFileName.c_str());
+    const OnLoadOutcome onLoadResult = CallOnLoadSafe(onLoad, pluginFileName.c_str());
     ClearActivePluginContext();
     lifecycleLock.lock();
 
@@ -629,11 +610,11 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     if (!onLoadResult.ok) {
         // 失败隔离：按 owner 回滚全部注册并标记隔离，防止半初始化状态持续生效、
         // 以及阶段 B 全量扫描反复重试同一次失败（条目留在 g_plugins，按路径去重拦住重试）。
-        // 两条来源分开记日志：崩溃（执行中异常）与 OnLoadEx 明确返回失败。
+        // 两条来源分开记日志：崩溃（执行中异常）与 OnLoad 明确返回 0。
         if (onLoadResult.crashed) {
             Logger::Log("Plugin quarantined after OnLoad failure: %s", narrow.c_str());
         } else {
-            Logger::Log("Plugin quarantined: OnLoadEx returned 0 (initialization declined): %s",
+            Logger::Log("Plugin quarantined: OnLoad returned 0 (initialization declined): %s",
                 narrow.c_str());
         }
         lifecycleLock.unlock();
