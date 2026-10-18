@@ -401,16 +401,26 @@ typedef struct HookContext {
        插件卸载/隔离时 Loader 会按 owner 自动清掉剩余订阅，因此这是可选的提前释放手段。 */ \
     X(UnregisterGlobalCapture, bool, (void* providerAddress, void** out), kCommon) \
     /* ---- 全局（引擎域）脚本注册 ---- \
-       把 fn 登记到 exe 的脚本环境。与 GameCore 那两个入口的区别：它们接的是 GameCore.dll \
-       的脚本注册（gameplay / UI 各一个 state，每局重建）；本入口面向引擎侧，Global 与 \
-       GameCore 两类插件都能用。 \
-       **主菜单与对局两代环境都会各跑一次**：Loader 钩的是 AppLuaLocaleLibrary::pRegister \
-       （本地化查询库，每个脚本环境都要注册它），所以 FrontEnd 建环境时触发一次、进对局后 \
-       GameCore 建环境时再触发一次。fn 收到的 L 是【当次那个环境】的 lua_State，直接往它挂 \
-       全局即可；在游戏线程上被调用，可以直接用 Lua C API。 \
-       每个 state 只跑一次（同一代里的多个触发点不会重复执行），state 重建后重跑。 \
+       把 fn 登记到 exe 的每个 Lua 环境。与 GameCore 那两个入口的区别：它们接的是 \
+       GameCore.dll 的脚本注册（gameplay / UI 各一个 state，每局重建）；本入口面向引擎侧， \
+       Global 与 GameCore 两类插件都能用。 \
+       **每个环境各跑一次**：引擎给每个脚本环境单独建 lua_State（FrontEnd / MainMenu / \
+       Options / 对局 gameplay …），各自持有独立的环境表——挂在一个环境上的接口别的环境 \
+       访问不到。Loader 因此对每个新环境都调一次 fn，L 就是那一个环境的 lua_State。 \
+       所以回调里应当每次往传入的 L 挂，不要缓存第一次的 L 反复使用。 \
+       每个 state 只跑一次（同一环境重复触发不会重复执行），state 重建后重跑。 \
        回调指针须来自调用插件模块；插件卸载/隔离时按 owner 自动摘除。 */ \
-    X(RegisterGlobalScript, void, (ScriptGlobalsFn fn), kCommon)
+    X(RegisterGlobalScript, void, (ScriptGlobalsFn fn), kCommon) \
+    /* ---- Lua 表遍历 ---- \
+       Lua 5.1 lua_next 的直接封装，用于遍历【哈希表】（LuaObjLen 只给序列长度，遍历不了）。 \
+       栈契约照搬 Lua 5.1：调用前栈顶必须是 key（首轮压 nil），index 是表在栈上的位置； \
+       返回 1 时 key 已被弹出、下一组 key/value 已压栈（value 在栈顶，key 在其下）； \
+       返回 0 时 key 已被弹出、遍历结束。典型写法： \
+         LuaPushNil(L); while (LuaNext(L, tblIndex)) { /* value at -1, key at -2 *\/ \
+             ... LuaPop(L, 1); } \
+       注意 value 必须由调用方弹出，next 自己不会弹它（否则遍历会跳项）。 \
+       导入缺失时恒返回 0（表现为空表），不崩溃。 */ \
+    X(LuaNext, int, (void* L, int index), kCommon)
 
 // ---------------- 插件类别声明（编译期强制） ----------------
 // 成员生成依赖类别，所以这个检查必须出现在结构体【之前】。
@@ -475,7 +485,7 @@ inline constexpr uint32_t CIV6_HOOK_API_ENTRY_COUNT =
 #undef X
     ;
 
-// 解析入口：把 ctx 里的 79 个名字逐个查回来，填满本模块私有的表，返回它。
+// 解析入口：把 ctx 里的 80 个名字逐个查回来，填满本模块私有的表，返回它。
 // 查不到的名字置 nullptr（绝不会是野指针），插件用 HookAPI_RequireAll 声明真正依赖的项。
 //
 // 【不提供全局 api 指针】本可以在这里放一个 `inline HookAPI* api` 让插件连声明都省掉，

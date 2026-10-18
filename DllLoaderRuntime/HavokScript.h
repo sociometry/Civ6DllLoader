@@ -61,6 +61,11 @@ namespace hks {
 	extern hks_lua_objlenType objlen;
 	typedef void(__cdecl* hks_lua_gettableType)(lua_State*, int);
 	extern hks_lua_gettableType gettable;
+	// ?hksi_lua_next@@YAHPEAUlua_State@@H@Z
+	// int __cdecl hksi_lua_next(lua_State*, int)  —— Lua 5.1 语义：弹出 key，
+	// 压入下一组 key/value 并返回 1；遍历结束返回 0（key 已被弹出）。
+	typedef int(__cdecl* hks_lua_nextType)(lua_State*, int);
+	extern hks_lua_nextType next;
 	// ?hksi_lua_cpcall@@YAHPEAUlua_State@@P6AH0@ZPEAX@Z
 	// int __cdecl hksi_lua_cpcall(lua_State*, luaFunc, void*)
 	typedef int(__cdecl* hksi_lua_cpcallType)(lua_State*, luaFunc, void*);

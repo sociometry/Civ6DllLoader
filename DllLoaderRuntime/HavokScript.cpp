@@ -28,6 +28,7 @@ namespace hks {
 	hksL_checktableType checktable;
 	hks_lua_objlenType objlen;
 	hks_lua_gettableType gettable;
+hks_lua_nextType next;
 	hksi_lua_cpcallType cpcall;
 	hski_lua_pushvalueType pushvalue;
 	RefType ref;
@@ -98,6 +99,7 @@ namespace hks {
 		RESOLVE_IMPORT(checktable, "?hksL_checktable@@YAXPEAUlua_State@@H@Z");
 		RESOLVE_IMPORT(objlen, "?hksi_lua_objlen@@YA_KPEAUlua_State@@H@Z");
 		RESOLVE_IMPORT(gettable, "?hksi_lua_gettable@@YAXPEAUlua_State@@H@Z");
+		RESOLVE_IMPORT(next, "?hksi_lua_next@@YAHPEAUlua_State@@H@Z");
 		RESOLVE_IMPORT(cpcall, "?hksi_lua_cpcall@@YAHPEAUlua_State@@P6AH0@ZPEAX@Z");
 		RESOLVE_IMPORT(ref, "?luaL_ref@@YAHPEAUlua_State@@H@Z");
 		RESOLVE_IMPORT(pcall, "?hksi_lua_pcall@@YAHPEAUlua_State@@HHH@Z");

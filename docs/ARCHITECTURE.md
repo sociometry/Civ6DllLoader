@@ -496,7 +496,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
   该结构体从不跨越模块边界，每个插件只用自己那一份；两类插件的 `sizeof` 不同
   （GameCore 多 7 个成员），这不构成问题。
 
-- **`HOOK_API_LIST`**（`common/HookAPI.h`）——79 个入口的唯一来源，X-macro 形式，
+- **`HOOK_API_LIST`**（`common/HookAPI.h`）——80 个入口的唯一来源，X-macro 形式，
   列 = `X(entryName, returnType, params, category)`。由它生成：结构体成员、入口计数
   `CIV6_HOOK_API_ENTRY_COUNT`、Loader 侧的名字查找、插件侧的解析代码。加一个入口 = 清单加一行。
 
@@ -555,7 +555,7 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 
 ## 4. 插件接口（HookAPI 全表）
 
-79 个入口，按"谁能用、受什么限制"分四类。清单在 `common/HookAPI.h` 的 `HOOK_API_LIST`，
+80 个入口，按"谁能用、受什么限制"分四类。清单在 `common/HookAPI.h` 的 `HOOK_API_LIST`，
 结构体与计数都由它生成。
 
 ### 4.1 双域通用，但按"目标地址域"设门（9 个）
@@ -597,12 +597,16 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 **gamecore 的脚本环境**（往 Lua 表里放闭包、注册脚本全局、事件）。Global 插件用它们没有意义：
 对局前拿不到对象，对局中也不该持有 GameCore 域的引用。
 
-### 4.3 Lua 原语（44 个）——不是 GameCore 专属
+### 4.3 Lua 原语（45 个）——不是 GameCore 专属
 
 全部是 `HavokScript_FinalRelease.dll` 导出的薄封装（`HavokScript.cpp` 里由一张导入表 + 宏批量登记，
 加 `checkplayerid` + 极端情况下的原始栈兜底）。入口本身**与 GameCore 无关**：作用对象是**调用方传进来的**
 `lua_State*`，所以两类插件都开放。导入在**阶段 A** 解析一次（该 DLL 是 exe 静态导入、常驻）；
 缺失时逐个入口降级为安全默认值 + 限次日志，**不影响插件加载**。
+
+表遍历靠 `LuaNext`（`hksi_lua_next`）：`LuaObjLen` 只给序列长度，拿不到字符串键，而
+`LuaNext` 完整实现了 Lua 5.1 `lua_next` 的栈契约（首轮压 nil、每轮自己弹 value、遍历完 key 被弹走）。
+它让插件侧的 C++ 能直接遍历哈希表，不必再借一段 Lua 代码往返。
 
 ### 4.4 其它（19 个）
 
@@ -878,32 +882,38 @@ UI 是 GameCore 侧界面脚本用的那个。
 **进程级（两类插件都可用）**：`RegisterGlobalScript(fn)` → 登记进 `g_globalScriptGlobals`，
 回调跑在**引擎给某个脚本环境建好的 lua_State** 上。重点是这个 state **不只有一个**。
 
-主执行点是对 `AppLuaLocaleLibrary::pRegister(lua_State*)` 装共享钩（`EnsureGlobalScriptHooksInstalled`）：
+主执行点是对 `LuaSystem::LuaExposureLibrary::Register(lua_State*)` 装共享钩
+（`EnsureGlobalScriptHooksInstalled`），回调跑在**钩子入参那个 thread 的 L** 上。
 
-- 这批 `AppLua*Library::pRegister(lua_State*)` 形态一致：`lua_createtable` 造表 → N 个
-  `hks_pushnamedcclosure` + `hksi_lua_setfield` 填进去 → `return 1`（表留在栈上），由
-  `AppLuaUtils::ExposeLibraryToThread(L, thread, "<库名>", pRegister)` 挂成同名全局；
-- **为什么选 Locale 而不是 Modding**：Modding 只在主菜单（FrontEnd）那一代脚本环境里注册一次，
-  GameCore 阶段不会再来；Locale 是每个脚本环境都要用的（本地化查询），**FrontEnd 与 GameCore
-  两代各注册一次**。钩 Locale 才能让插件登记的全局在两个阶段都跑到；
-- 取址：`HookInfoExe` 双版本（DX11 RVA `0x4CB5B0` / DX12 RVA `0x4CBE00`），AOB 兜底取同批
-  注册函数里的第 9 个命中（Modding 是第 10 个，两版顺序一致）；
-- detour 在**原函数之前**跑插件回调：原函数返回时栈顶留着刚建好的表，那时再跑插件代码容易破坏
-  调用方对栈的预期。回调跑完还会把 Lua 栈削回原高度——原函数随后要用 `-2` 索引指向自己建的
-  那张表，残留值会让它填错位置；
-- 回调拿到的 `L` 就是**钩子入参那个 state**，不再强行取主 state：这样每个脚本环境都往自己
-  的 `_G` 里注册，GameCore 阶段拿到的自然是 GameCore 那一代的 state。
+**为什么是"每个 thread 各注册一份"**：
 
-两个补跑点覆盖"钩子装晚 / 插件注册更晚"：
+HavokScript 给每个 `LuaThread` 维护**独立的环境表**（`LuaSystem::LuaUtils::PushThreadAndEnvironment`
+会遍历 `_G.Threads` 逐个匹配 thread 对象），实测结果是：挂在主 VM 上的接口，别的 state
+**访问不到**。所以 `RegisterGlobalScript` 不能只往主 VM 写一份，必须每遇到一个新的
+`lua_State*` 就注册一次；`ScriptGlobalsEntry::appliedStates` 记的是"已经跑过哪些 L"，
+只用来挡住同一个 L 被重复触发。
 
-- `UiInject` 的 `MainMenuState::LoadUI` detour：主菜单 UI 建好后、各 Mod 的 `FrontEndUI_*.lua`
-  加载前再跑一次；
-- `LoadPluginsOf(GameCore)` 末尾补跑一次：GameCore 插件是在对局加载时才 `OnLoad` 的，赶不上
-  本代 Locale 注册那一刻。
+**为什么钩 `LuaExposureLibrary::Register`**：
 
-每个登记项用 `appliedStates`（已跑过的 state 列表）记账：**同一个 state 只跑一次**，不同 state
-（FrontEnd / GameCore，或换局后重建的那一代）各自跑一次。回调同样走 `PluginInFlight` 守卫，
-插件卸载/隔离时登记随 owner 一并摘除。
+- 它是**每个 thread 都会经过**的极少数函数之一：`LuaScriptSystem::RegisterThreadLibraries`
+  （UI / ForgeUI context 链路）与 `GameCore::ScriptSystem::CreateLuaThread`（GamePlay 链路）
+  都直接调它，因此两条链路都覆盖，而不是只有 UI；
+- 它只有 5 条指令（`48 8B 0D …` 读单例 → `E9` 尾跳 `CCallWithErrorHandling`），入参就是
+  该 thread 的 `lua_State*`；
+- 取址：`HookInfoExe` 双版本（DX11 RVA `0x974CC0` / DX12 RVA `0x982AE0`，两版函数大小都是
+  `0x1A`），AOB 兜底取同批目标里的第 3 个命中（两版顺序一致）。
+
+**踩过的两个坑（结论留档）**：
+
+- 钩 `AppLuaLocaleLibrary::pRegister` 不行：`ExposeLibraryToThread` 的 trampoline 会先
+  `hksi_lua_getglobal(L, "Locale")`，**只有结果为 nil 时**才 `lua_call` 进 `pRegister`。
+  主菜单那代已经把 `Locale` 建好了，后续 thread 直接跳过，`pRegister` 根本不执行；
+- 钩 `AppLuaLocaleLibrary::Register` 也不行：它的第一个参数是 **`mainState`**（
+  `RegisterThreadLibraries` 与 `CreateLuaThread` 传的都是主 VM），拿不到 thread 的 L，
+  于是一直往同一个 state 上跑，被 `appliedStates` 挡掉。
+
+detour 在**原函数之前**跑插件回调，跑完把该 thread 的 Lua 栈削回原高度：注册流程随后要在栈上
+`getglobal` / `pushclosure` / `setfield`，残留值会让它填错位置。
 
 ### 6.4 PushLuaMethods
 

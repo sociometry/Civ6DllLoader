@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -101,26 +102,33 @@ constexpr char kGameEventCurrentGamePattern[] =
 // GameSignals::Subscribe 内 "mov rdi, cs:ms_pkCurrentGame" 指令地址（按代缓存，重扫兜底）。
 static void* g_gameEventContainerHit = nullptr;
 
-// ---- 引擎侧脚本库注册入口（选 Locale，不选 Modding）----
-// 这批 AppLua*Library::pRegister(lua_State*) 的形态都一样：建一张新表 -> N 个 hks 闭包逐个
-// setfield -> return 1（表留在栈上），由 AppLuaUtils::ExposeLibraryToThread 挂成同名全局。
+// ---- 引擎侧脚本贡献点：LuaSystem::LuaExposureLibrary::Register(lua_State*) ----
 //
-// 为什么钩 Locale 而不是 Modding：Modding 只在主菜单（FrontEnd）那一代脚本环境里注册一次，
-// GameCore 阶段不会再来；Locale 是每个脚本环境都要用的（本地化查询），**FrontEnd 与 GameCore
-// 两代各注册一次**。插件登记的全局因此能在两个阶段都被跑到，而不是只赶上主菜单那一次。
+// 为什么选它：
+//   * 它是【每个 thread 都会走】的极少数函数之一 —— LuaScriptSystem::RegisterThreadLibraries
+//     （UI/context 链路）与 GameCore::ScriptSystem::CreateLuaThread（GamePlay 链路）都直接调它，
+//     因此两条链路都能覆盖，而不是只有 UI；
+//   * 它只有 5 条指令、入参就是该 thread 的 lua_State*，AOB 命中仅 3 处（同批 Lua 库注册
+//     thunk 是 19 处），定位最稳；
+//   * 它不碰任何业务表，detour 里只借用触发时机，不会与注册流程本身互相干扰。
 //
-// IDA 实测：DX11 RVA 0x4CB5B0、DX12 RVA 0x4CBE00（AppLuaLocaleLibrary::pRegister）。
-// 下面这条函数头签名在同批 Lua 库注册函数里各命中 12 处，Locale 是第 9 个、Modding 是第 10 个
-// （两版顺序一致，已用两个 exe 的实际字节逐一核对）。
-constexpr char kAob_LuaLibraryRegister[] =
-    "48 89 5C 24 08 57 48 83 EC 30 45 33 C0 33 D2 48 8B D9 E8 ?? ?? ?? ?? 33 FF 4C 8D 0D";
-constexpr HookInfoExe kExeLocaleRegister = {
-    HookRva(0x4CB5B0, kAob_LuaLibraryRegister, 9),
-    HookRva(0x4CBE00, kAob_LuaLibraryRegister, 9)
+// 写入目标：**每个 thread 自己的 L**（本函数的入参）。
+// 实测结论：别的 state 访问不到主 VM 上挂的接口——HavokScript 给每个 LuaThread 维护了
+// 独立的环境表（LuaUtils::PushThreadAndEnvironment 会遍历 _G.Threads 逐个匹配），
+// 所以"只往主 VM 挂一份"是不够的，必须每个 thread 各挂一份。
+//
+// IDA 实测：DX11 0x974CC0（size 0x1A）、DX12 0x982AE0（size 0x1A）。
+// 下面这条 AOB 在两版各命中 3 处，按地址升序第 3 个即目标（前两处是同形态的其它
+// Register 包装，头部 5 条指令完全一致，只能靠序号区分）。
+constexpr char kAob_LuaExposureRegister[] =
+    "4C 8B C1 48 8D 15 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? 48 8B 49 10 E9";
+constexpr HookInfoExe kExeLuaExposureRegister = {
+    HookRva(0x974CC0, kAob_LuaExposureRegister, 3),
+    HookRva(0x982AE0, kAob_LuaExposureRegister, 3)
 };
 
-typedef int64_t(__fastcall* LuaLibraryRegisterFn)(void* L);
-static LuaLibraryRegisterFn g_origLocaleRegister = nullptr;
+typedef int64_t(__fastcall* LuaExposureRegisterFn)(void* threadL);
+static LuaExposureRegisterFn g_origLuaExposureRegister = nullptr;
 
 constexpr int kMaxRegisteredGameEvents = 32;
 
@@ -143,7 +151,7 @@ struct ScriptGlobalsEntry {
     // 登记时解析一次并常驻：运行时守卫不再做宽字符串哈希。
     PluginInFlight::Owner* inFlight = nullptr;
     // 全局脚本专用：已经跑过哪些 lua_State。同一个 state 只跑一次；FrontEnd 与 GameCore
-    // 是两个不同的 state，因此各自跑一次（Locale 注册在每一代都会来一次）。
+    // 是两个不同的 state，因此各自跑一次。
     // GameCore 侧两个列表不使用这个字段。
     std::vector<void*> appliedStates;
 };
@@ -968,14 +976,13 @@ void RegisterGameCoreScriptForUIImpl(ScriptGlobalsFn fn) {
 }
 
 static void EnsureGlobalScriptHooksInstalled();
-void RunGlobalScriptsFor(void* L);
 
 // ==== RegisterGlobalScriptImpl ====
 // 全局脚本注册：回调跑到 exe 的脚本环境上，**每一代环境各跑一次**（主菜单一代 + 对局一代）。
 // 与 GameCore 两个入口的区别：那两个挂的是 GameCore.dll 的 RegisterScriptData，只能覆盖
-// gameplay / UI 那两个 state；这里挂的是引擎侧的 Locale 库注册，每个脚本环境都会经过，
+// gameplay / UI 那两个 state；这里挂的是主 VM 的 globals，所有 thread 共享同一张表，
 // 因此主菜单与对局两个阶段都能跑到，两类插件也都能用。
-// 登记本身不执行回调：环境还没建好，执行点见 RunGlobalScriptsFor（Locale detour）与两个补跑点。
+// 登记本身不执行回调：主 VM 还没就绪，执行点是 LuaExposureLibrary::Register 的 detour 与两个补跑点。
 void RegisterGlobalScriptImpl(ScriptGlobalsFn fn) {
     if (!fn) return;
     {
@@ -988,49 +995,127 @@ void RegisterGlobalScriptImpl(ScriptGlobalsFn fn) {
             owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
     }
     Logger::Log("RegisterGlobalScript: queued for the engine main lua_State");
-    // 尽早把引擎侧的 Locale 注册入口挂上：Global 插件在阶段 A 就注册，通常早于 GUIInit。
+    // 尽早把 LuaExposureLibrary::Register 挂上：Global 插件在阶段 A 就注册，通常早于 GUIInit。
     EnsureGlobalScriptHooksInstalled();
 }
 
-// ==== Hook_LocaleRegister ====
-// AppLuaLocaleLibrary::pRegister 的 detour：先跑插件登记的全局脚本，再走原函数。
+// ==== StateNameOf ====
+// 取 lua_State 的可读名字，用于日志（代替裸指针）。
+//
+// 两个来源，按信息量从大到小：
+//   1) Lua 全局表里的 "StateName" —— LuaSystem::LuaThread::SetName 写的那一份。
+//      它用 sub_140DB1950(..., -10002) 取表再 setfield，-10002 就是 globals
+//      （= kHookApiLuaGlobal），所以这里必须用 -10002 读，用 registry(-10000) 读不到；
+//   2) lua_State::m_name（+0xA8 → InternString::m_data 在 +0x14）——HavokScript 的通用名，
+//      实测所有 thread 都是 "thread"，区分度低，只作兜底。
+// 两者都没有就返回空串，调用方只打印地址。
+constexpr int kLuaGlobalsPseudoIndex = -10002;   // = kHookApiLuaGlobal
+constexpr const char* kStateNameKey = "StateName";
+constexpr ptrdiff_t kOffStateName = 0xA8;        // lua_State::m_name
+constexpr ptrdiff_t kOffInternData = 0x14;       // InternString::m_data
+constexpr size_t    kInternDataMax = 30;         // InternString::m_data 容量
+
+// 从 m_name 读通用名（兜底用）。SEH 叶子：只碰 POD，不产生 C++ 对象展开（C2712）。
+__declspec(noinline) static bool InternNameRaw(void* L, char (&out)[kInternDataMax], size_t& len) {
+    len = 0;
+    __try {
+        const auto* base = static_cast<const uint8_t*>(L);
+        const void* intern = *reinterpret_cast<const void* const*>(base + kOffStateName);
+        if (!intern) return false;
+        const char* data = reinterpret_cast<const char*>(intern) + kOffInternData;
+        for (size_t i = 0; i < kInternDataMax; ++i) {
+            if (data[i] == '\0') {
+                len = i;
+                for (size_t k = 0; k < i; ++k) out[k] = data[k];
+                return i > 0;
+            }
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+std::string InternNameOf(void* L) {
+    if (!L) return {};
+    char buf[kInternDataMax]{};
+    size_t len = 0;
+    if (!InternNameRaw(L, buf, len)) return {};
+    return std::string(buf, len);
+}
+
+std::string StateNameOf(void* L) {
+    if (!L) return {};
+    // 先读 Lua 全局表里的 StateName。动栈要成对：记下原高度，读完削回去
+    // （调用点可能正处在注册流程中间，不能在栈上留残留）。
+    const int topBefore = LuaGetTopImpl(L);
+    std::string name;
+    LuaGetFieldImpl(L, kLuaGlobalsPseudoIndex, kStateNameKey);
+    if (LuaTypeImpl(L, -1) == 4 /* Lua 5.1 LUA_TSTRING */) {
+        unsigned __int64 len = 0;
+        const char* p = LuaCheckLStringImpl(L, -1, &len);
+        if (p && len > 0 && len < 96) name.assign(p, static_cast<size_t>(len));
+    }
+    const int now = LuaGetTopImpl(L);
+    if (now > topBefore) LuaPopImpl(L, now - topBefore);
+    if (!name.empty()) return name;
+    return InternNameOf(L);
+}
+
+// 组装日志用的 "名字 (地址)"：拿不到名字就只打印地址。
+std::string DescribeState(void* L) {
+    char buf[160]{};
+    const std::string name = StateNameOf(L);
+    if (!name.empty()) {
+        std::snprintf(buf, sizeof(buf), "%s (%p)", name.c_str(), L);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%p", L);
+    }
+    return std::string(buf);
+}
+
+// ==== Hook_LuaExposureRegister ====
+// LuaExposureLibrary::Register 的 detour：先跑插件登记的全局脚本，再走原函数。
 // 放在原函数之前是有意的——原函数返回时栈顶留着刚建好的表（返回 1），
 // 那之后再调插件代码容易破坏调用方对栈的预期。
-int64_t __fastcall Hook_LocaleRegister(void* L) {
+int64_t __fastcall Hook_LuaExposureRegister(void* threadL) {
     SharedDetourActivity activity;
-    // 插件回调跑完把栈削回原高度：原函数接下来会在栈上建表（-2 索引指它），
-    // 回调若留下多余的值，会让它填到错误的位置上。
-    const int topBefore = L ? LuaGetTopImpl(L) : 0;
-    RunGlobalScriptsFor(L);
-    if (L) {
-        const int now = LuaGetTopImpl(L);
+    // 插件全局挂到【主 VM 的 globals】上：所有 lua_newthread 派生出来的 thread 共享同一张
+    // 全局表，所以挂一次就够，GamePlay 与 UI 都看得见（官方 Locale 也是这么做的）。
+    // 每个 thread 有自己的环境表：实测别的 state 访问不到主 VM 上的接口，
+    // 所以必须【给每个 thread 的 L 各注册一份】，不能只写主 VM。
+    // threadL 就是该 thread 的 lua_State*（LuaExposureLibrary::Register 的唯一参数）。
+    if (threadL) {
+        const int topBefore = LuaGetTopImpl(threadL);
+        RunGlobalScriptsFor(threadL);
+        const int now = LuaGetTopImpl(threadL);
         if (now > topBefore) {
-            LuaPopImpl(L, now - topBefore);
+            LuaPopImpl(threadL, now - topBefore);
         }
     }
-    if (g_origLocaleRegister) {
-        return g_origLocaleRegister(L);
+    if (g_origLuaExposureRegister) {
+        return g_origLuaExposureRegister(threadL);
     }
     return 0;
 }
 
 // ==== EnsureGlobalScriptHooksInstalled ====
-// 把 Locale 的 pRegister 挂进统一站点表（与 GameCore 的两个脚本钩同构，但目标是 exe 域）。
+// 把 LuaExposureLibrary::Register 挂进统一站点表（与 GameCore 的两个脚本钩同构，目标是 exe 域）。
 // 幂等：站点表本身就是账本，重复调用只是复用同一站点、刷新跳板。
 static void EnsureGlobalScriptHooksInstalled() {
     {
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         if (g_globalScriptGlobals.empty()) return;
     }
-    void* target = LoaderCore::ResolveExeTarget(kExeLocaleRegister, 1);
+    void* target = LoaderCore::ResolveExeTarget(kExeLuaExposureRegister, 1);
     if (!target) {
-        Logger::Log("EnsureGlobalScriptHooksInstalled: AppLuaLocaleLibrary::pRegister not found");
+        Logger::Log("EnsureGlobalScriptHooksInstalled: LuaExposureLibrary::Register not found");
         return;
     }
     if (HookEngine::InstallLoaderDetourOnSite(target,
-            reinterpret_cast<void*>(&Hook_LocaleRegister),
-            reinterpret_cast<void**>(&g_origLocaleRegister), "GlobalScript")) {
-        Logger::Log("EnsureGlobalScriptHooksInstalled: hooked Locale register at %p", target);
+            reinterpret_cast<void*>(&Hook_LuaExposureRegister),
+            reinterpret_cast<void**>(&g_origLuaExposureRegister), "GlobalScript")) {
+        Logger::Log("EnsureGlobalScriptHooksInstalled: hooked LuaExposureLibrary::Register at %p", target);
     } else {
         Logger::Log("EnsureGlobalScriptHooksInstalled: install failed at %p "
                     "(target held by another detour?)", target);
@@ -1041,9 +1126,8 @@ static void EnsureGlobalScriptHooksInstalled() {
 // 把所有已登记的回调跑在【指定的】lua_State 上。约束：
 //   1) 游戏线程（Lua 状态非线程安全）；
 //   2) state 已就绪。
-// 每个登记项对同一个 state 只跑一次（appliedStates 记账），所以：
-//   - FrontEnd 一代来一次、GameCore 一代再来一次，两个 state 不同 -> 各跑一次；
-//   - 同一代里 UiInject / LoadPluginsOf 的补跑点撞上同一次，不会重复执行。
+// 每个 thread state 各自持有一份环境表（实测跨 state 看不到对方挂的接口），所以每个
+// 不同的 L 都要跑一遍；appliedStates 只负责挡住"同一个 L 被重复触发"，不是跨 state 去重。
 void RunGlobalScriptsFor(void* L) {
     if (!L) return;
     std::vector<ScriptGlobalsEntry> pending;
@@ -1057,8 +1141,8 @@ void RunGlobalScriptsFor(void* L) {
         }
     }
     if (pending.empty()) return;
-    Logger::Log("RunGlobalScripts: running %zu registrar(s) on lua_State %p",
-        pending.size(), L);
+    Logger::Log("RunGlobalScripts: running %zu registrar(s) on lua_State %s",
+        pending.size(), DescribeState(L).c_str());
     for (const auto& entry : pending) {
         PluginInFlight::Owner* owner = entry.inFlight;
         if (!owner) owner = PluginInFlight::Resolve(entry.owner);
@@ -1413,6 +1497,14 @@ unsigned long long LuaObjLenImpl(void* L, int index) {
 // ==== LuaGetTableImpl ====
 void LuaGetTableImpl(void* L, int index) {
     HKS_GUARD_VOID(hks::gettable, L, index);
+}
+
+// ==== LuaNextImpl ====
+// Lua 5.1 的 lua_next：栈顶放 key（首轮压 nil），成功时弹出 key、压入下一组 key/value
+// 并返回 1；返回 0 表示遍历结束（key 已被弹出）。
+// 导入缺失时按本模块惯例降级为 0 —— 与"遍历结束"同值，因此调用方拿到的就是"没有更多项"。
+int LuaNextImpl(void* L, int index) {
+    HKS_GUARD_RET(hks::next, 0, L, index);
 }
 
 // ==== LuaCPcallImpl ====

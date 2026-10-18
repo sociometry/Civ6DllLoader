@@ -96,6 +96,9 @@ int LuaGetHookCountImpl(void* L);
 void* LuaGetHookImpl(void* L);
 int LuaGetHookMaskImpl(void* L);
 void LuaGetTableImpl(void* L, int index);
+// Lua 5.1 next 语义：栈顶必须是 key（首次遍历用 nil），返回 1 时栈上多了下一组
+// key/value，返回 0 时 key 被弹出、遍历结束。返回 0 也可能是导入缺失。
+int LuaNextImpl(void* L, int index);
 int LuaGetTopImpl(void* L);
 int LuaIsNumberImpl(void* L, int num);
 int LuaIsUserDataImpl(void* L, int num);
