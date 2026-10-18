@@ -875,28 +875,35 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 `fn(L)`（SEH 隔离 + `PluginInFlight` 守卫），最后调原函数（跳板）。两个 state 是不同的：gameplay 每局重建，
 UI 是 GameCore 侧界面脚本用的那个。
 
-**进程级（两类插件都可用）**：`RegisterGlobalScript(fn)` → 登记进 `g_globalScriptGlobals`，回调跑到
-exe 的**引擎主 lua_State**（`GetMainLuaState` 解析出的那个，`GUIInit` 建、`GUIShutdown` 关，换局不失效）。
+**进程级（两类插件都可用）**：`RegisterGlobalScript(fn)` → 登记进 `g_globalScriptGlobals`，
+回调跑在**引擎给某个脚本环境建好的 lua_State** 上。重点是这个 state **不只有一个**。
 
-主执行点是对 `AppLuaModdingLibrary::pRegister(lua_State*)` 装共享钩（`EnsureGlobalScriptHooksInstalled`）：
+主执行点是对 `AppLuaLocaleLibrary::pRegister(lua_State*)` 装共享钩（`EnsureGlobalScriptHooksInstalled`）：
 
-- 这个函数就是引擎把 "Modding" 脚本库注册进某个 Lua 环境的地方——`lua_createtable` 造表、57 个
-  `hks_pushnamedcclosure` + `hksi_lua_setfield` 填进去、`return 1`（表留在栈上），由
-  `AppLuaUtils::ExposeLibraryToThread(L, thread, "Modding", pRegister)` 挂成全局；
-- 取址：`HookInfoExe` 双版本（DX11 RVA `0x4D0D70` / DX12 `0x4D15F0`，两版函数大小都是 `0xA9E`），
-  AOB 兜底取同批注册函数里的第 10 个命中（两版顺序一致）；
+- 这批 `AppLua*Library::pRegister(lua_State*)` 形态一致：`lua_createtable` 造表 → N 个
+  `hks_pushnamedcclosure` + `hksi_lua_setfield` 填进去 → `return 1`（表留在栈上），由
+  `AppLuaUtils::ExposeLibraryToThread(L, thread, "<库名>", pRegister)` 挂成同名全局；
+- **为什么选 Locale 而不是 Modding**：Modding 只在主菜单（FrontEnd）那一代脚本环境里注册一次，
+  GameCore 阶段不会再来；Locale 是每个脚本环境都要用的（本地化查询），**FrontEnd 与 GameCore
+  两代各注册一次**。钩 Locale 才能让插件登记的全局在两个阶段都跑到；
+- 取址：`HookInfoExe` 双版本（DX11 RVA `0x4CB5B0` / DX12 RVA `0x4CBE00`），AOB 兜底取同批
+  注册函数里的第 9 个命中（Modding 是第 10 个，两版顺序一致）；
 - detour 在**原函数之前**跑插件回调：原函数返回时栈顶留着刚建好的表，那时再跑插件代码容易破坏
-  调用方对栈的预期。回调拿到的 L 仍是主 state（`GetMainLuaState`），不依赖钩子的入参形状。
+  调用方对栈的预期。回调跑完还会把 Lua 栈削回原高度——原函数随后要用 `-2` 索引指向自己建的
+  那张表，残留值会让它填错位置；
+- 回调拿到的 `L` 就是**钩子入参那个 state**，不再强行取主 state：这样每个脚本环境都往自己
+  的 `_G` 里注册，GameCore 阶段拿到的自然是 GameCore 那一代的 state。
 
-两个补跑点覆盖钩子装晚 / 没命中的情况：
+两个补跑点覆盖"钩子装晚 / 插件注册更晚"：
 
-- `UiInject` 的 `MainMenuState::LoadUI` detour：主菜单 UI 建好后、各 Mod 的 `FrontEndUI_*.lua` 加载前
-  再跑一次——插件挂的全局因此能被 Mod 自己的主菜单脚本直接用；
-- `LoadPluginsOf(GameCore)` 末尾补跑一次：GameCore 插件是在对局加载时才 `OnLoad` 的，赶不上启动期
-  那次触发。
+- `UiInject` 的 `MainMenuState::LoadUI` detour：主菜单 UI 建好后、各 Mod 的 `FrontEndUI_*.lua`
+  加载前再跑一次；
+- `LoadPluginsOf(GameCore)` 末尾补跑一次：GameCore 插件是在对局加载时才 `OnLoad` 的，赶不上
+  本代 Locale 注册那一刻。
 
-每个登记项用 `appliedFor` 记住"已经跑到哪个 state 上"：同一个 state 只跑一次，state 被重建（指针变化）
-后重跑。回调同样走 `PluginInFlight` 守卫，插件卸载/隔离时登记随 owner 一并摘除。
+每个登记项用 `appliedStates`（已跑过的 state 列表）记账：**同一个 state 只跑一次**，不同 state
+（FrontEnd / GameCore，或换局后重建的那一代）各自跑一次。回调同样走 `PluginInFlight` 守卫，
+插件卸载/隔离时登记随 owner 一并摘除。
 
 ### 6.4 PushLuaMethods
 

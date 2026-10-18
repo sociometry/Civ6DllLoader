@@ -469,8 +469,11 @@ void InjectFrontEndUi(void* state) {
     }
     g_rootContext = rootCtx;
 
-    // 4) 先把插件登记的全局脚本跑在引擎主 lua_State 上：主菜单 UI 已经建好（主 state 必然
-    //    存在），而各 Mod 的 FrontEndUI lua 还没加载——插件挂的全局因此能被它们直接用。
+    // 4) 补跑插件登记的全局脚本：主菜单 UI 已经建好（主 state 必然存在），而各 Mod 的
+    //    FrontEndUI lua 还没加载——插件挂的全局因此能被它们直接用。
+    //    正常路径其实由 Locale 的 pRegister detour 在前一步就跑了（它每个脚本环境都会来
+    //    一次，FrontEnd 与 GameCore 各自一遍）；这里是"钩子当时没装上 / 插件注册更晚"的兜底，
+    //    已跑过的 state 会被记账挡掉，不会重复执行。
     ScriptBridge::RunGlobalScripts();
 
     // 5) 遍历启用 Mod 的目录树，加载 FrontEndUI_*.xml，挂到根容器下

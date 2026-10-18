@@ -401,13 +401,14 @@ typedef struct HookContext {
        插件卸载/隔离时 Loader 会按 owner 自动清掉剩余订阅，因此这是可选的提前释放手段。 */ \
     X(UnregisterGlobalCapture, bool, (void* providerAddress, void** out), kCommon) \
     /* ---- 全局（引擎域）脚本注册 ---- \
-       把 fn 登记到【引擎主 lua_State】——exe 的进程级 Lua VM，换局不失效（见 GetMainLuaState）。 \
-       与 RegisterGameCoreScriptForGamePlay / RegisterGameCoreScriptForUI 的区别：那两个接的是 \
-       GameCore.dll 的脚本注册（每局重建、随对局卸载而失效）；本入口面向 Global 插件，也 \
-       可以给 GameCore 插件用，注册的全局在整个进程生命周期内都活着。 \
-       fn 收到的 L 就是引擎主 state；在游戏线程上被调用，可以直接用 Lua C API 往 _G 挂东西。 \
-       执行时机：主菜单 UI 加载时统一跑一次（此时主 state 必然已存在），早于各 Mod 自己 \
-       FrontEndUI Lua 的加载；同一个 state 只跑一次，state 被重建后重跑。 \
+       把 fn 登记到 exe 的脚本环境。与 GameCore 那两个入口的区别：它们接的是 GameCore.dll \
+       的脚本注册（gameplay / UI 各一个 state，每局重建）；本入口面向引擎侧，Global 与 \
+       GameCore 两类插件都能用。 \
+       **主菜单与对局两代环境都会各跑一次**：Loader 钩的是 AppLuaLocaleLibrary::pRegister \
+       （本地化查询库，每个脚本环境都要注册它），所以 FrontEnd 建环境时触发一次、进对局后 \
+       GameCore 建环境时再触发一次。fn 收到的 L 是【当次那个环境】的 lua_State，直接往它挂 \
+       全局即可；在游戏线程上被调用，可以直接用 Lua C API。 \
+       每个 state 只跑一次（同一代里的多个触发点不会重复执行），state 重建后重跑。 \
        回调指针须来自调用插件模块；插件卸载/隔离时按 owner 自动摘除。 */ \
     X(RegisterGlobalScript, void, (ScriptGlobalsFn fn), kCommon)
 

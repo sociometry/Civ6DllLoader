@@ -101,21 +101,26 @@ constexpr char kGameEventCurrentGamePattern[] =
 // GameSignals::Subscribe 内 "mov rdi, cs:ms_pkCurrentGame" 指令地址（按代缓存，重扫兜底）。
 static void* g_gameEventContainerHit = nullptr;
 
-// ---- 引擎侧"Modding"脚本库注册入口 ----
-// AppLuaModdingLibrary::pRegister(lua_State*)：建一张新表 -> 57 个 hks 闭包逐个 setfield ->
-// return 1（表留在栈上）。调用方 AppLuaUtils::ExposeLibraryToThread(L, thread, "Modding", pRegister)
-// 负责把它挂成全局 "Modding"。IDA 实测：DX11 RVA 0x4D0D70、DX12 RVA 0x4D15F0，两版函数大小
-// 都是 0xA9E；下面这条函数头签名在同批 Lua 库注册函数里各命中 12 处，pRegister 是第 10 个
+// ---- 引擎侧脚本库注册入口（选 Locale，不选 Modding）----
+// 这批 AppLua*Library::pRegister(lua_State*) 的形态都一样：建一张新表 -> N 个 hks 闭包逐个
+// setfield -> return 1（表留在栈上），由 AppLuaUtils::ExposeLibraryToThread 挂成同名全局。
+//
+// 为什么钩 Locale 而不是 Modding：Modding 只在主菜单（FrontEnd）那一代脚本环境里注册一次，
+// GameCore 阶段不会再来；Locale 是每个脚本环境都要用的（本地化查询），**FrontEnd 与 GameCore
+// 两代各注册一次**。插件登记的全局因此能在两个阶段都被跑到，而不是只赶上主菜单那一次。
+//
+// IDA 实测：DX11 RVA 0x4CB5B0、DX12 RVA 0x4CBE00（AppLuaLocaleLibrary::pRegister）。
+// 下面这条函数头签名在同批 Lua 库注册函数里各命中 12 处，Locale 是第 9 个、Modding 是第 10 个
 // （两版顺序一致，已用两个 exe 的实际字节逐一核对）。
-constexpr char kAob_ModdingRegister[] =
+constexpr char kAob_LuaLibraryRegister[] =
     "48 89 5C 24 08 57 48 83 EC 30 45 33 C0 33 D2 48 8B D9 E8 ?? ?? ?? ?? 33 FF 4C 8D 0D";
-constexpr HookInfoExe kExeModdingRegister = {
-    HookRva(0x4D0D70, kAob_ModdingRegister, 10),
-    HookRva(0x4D15F0, kAob_ModdingRegister, 10)
+constexpr HookInfoExe kExeLocaleRegister = {
+    HookRva(0x4CB5B0, kAob_LuaLibraryRegister, 9),
+    HookRva(0x4CBE00, kAob_LuaLibraryRegister, 9)
 };
 
-typedef int64_t(__fastcall* ModdingRegisterFn)(void* L);
-static ModdingRegisterFn g_origModdingRegister = nullptr;
+typedef int64_t(__fastcall* LuaLibraryRegisterFn)(void* L);
+static LuaLibraryRegisterFn g_origLocaleRegister = nullptr;
 
 constexpr int kMaxRegisteredGameEvents = 32;
 
@@ -137,9 +142,10 @@ struct ScriptGlobalsEntry {
     ScriptGlobalsFn fn;
     // 登记时解析一次并常驻：运行时守卫不再做宽字符串哈希。
     PluginInFlight::Owner* inFlight = nullptr;
-    // 全局脚本专用：该项已经跑到过哪个主 lua_State 上。同一个 state 只跑一次，
-    // state 被重建（指针变化）后重新跑。GameCore 侧两个列表不使用这个字段。
-    void* appliedFor = nullptr;
+    // 全局脚本专用：已经跑过哪些 lua_State。同一个 state 只跑一次；FrontEnd 与 GameCore
+    // 是两个不同的 state，因此各自跑一次（Locale 注册在每一代都会来一次）。
+    // GameCore 侧两个列表不使用这个字段。
+    std::vector<void*> appliedStates;
 };
 
 std::vector<ScriptGlobalsEntry> g_scriptGlobals;
@@ -962,12 +968,14 @@ void RegisterGameCoreScriptForUIImpl(ScriptGlobalsFn fn) {
 }
 
 static void EnsureGlobalScriptHooksInstalled();
+void RunGlobalScriptsFor(void* L);
 
 // ==== RegisterGlobalScriptImpl ====
-// 全局脚本注册：回调跑到【引擎主 lua_State】（进程级，见 GetMainLuaState）上。
-// 与 GameCore 两个入口的区别：那两个挂的是 GameCore.dll 的 RegisterScriptData，state 每局
-// 重建、注册跟着重建；这里挂的是 exe 的主 state，换局不失效，因此两类插件都能用。
-// 登记本身不执行回调：主 state 要在 GUIInit 之后才存在，执行点见 RunGlobalScripts。
+// 全局脚本注册：回调跑到 exe 的脚本环境上，**每一代环境各跑一次**（主菜单一代 + 对局一代）。
+// 与 GameCore 两个入口的区别：那两个挂的是 GameCore.dll 的 RegisterScriptData，只能覆盖
+// gameplay / UI 那两个 state；这里挂的是引擎侧的 Locale 库注册，每个脚本环境都会经过，
+// 因此主菜单与对局两个阶段都能跑到，两类插件也都能用。
+// 登记本身不执行回调：环境还没建好，执行点见 RunGlobalScriptsFor（Locale detour）与两个补跑点。
 void RegisterGlobalScriptImpl(ScriptGlobalsFn fn) {
     if (!fn) return;
     {
@@ -980,79 +988,76 @@ void RegisterGlobalScriptImpl(ScriptGlobalsFn fn) {
             owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
     }
     Logger::Log("RegisterGlobalScript: queued for the engine main lua_State");
-    // 尽早把引擎侧的 "Modding" 注册入口挂上：Global 插件在阶段 A 就注册，通常早于 GUIInit。
+    // 尽早把引擎侧的 Locale 注册入口挂上：Global 插件在阶段 A 就注册，通常早于 GUIInit。
     EnsureGlobalScriptHooksInstalled();
 }
 
-// ==== Hook_ModdingRegister ====
-// pRegister 的 detour：先跑插件登记的全局脚本，再走原函数。
-// 放在原函数之前是有意的——原函数返回时栈顶留着刚建好的 "Modding" 表（返回 1），
+// ==== Hook_LocaleRegister ====
+// AppLuaLocaleLibrary::pRegister 的 detour：先跑插件登记的全局脚本，再走原函数。
+// 放在原函数之前是有意的——原函数返回时栈顶留着刚建好的表（返回 1），
 // 那之后再调插件代码容易破坏调用方对栈的预期。
-int64_t __fastcall Hook_ModdingRegister(void* L) {
+int64_t __fastcall Hook_LocaleRegister(void* L) {
     SharedDetourActivity activity;
     // 插件回调跑完把栈削回原高度：原函数接下来会在栈上建表（-2 索引指它），
     // 回调若留下多余的值，会让它填到错误的位置上。
     const int topBefore = L ? LuaGetTopImpl(L) : 0;
-    RunGlobalScripts();
+    RunGlobalScriptsFor(L);
     if (L) {
         const int now = LuaGetTopImpl(L);
         if (now > topBefore) {
             LuaPopImpl(L, now - topBefore);
         }
     }
-    if (g_origModdingRegister) {
-        return g_origModdingRegister(L);
+    if (g_origLocaleRegister) {
+        return g_origLocaleRegister(L);
     }
     return 0;
 }
 
 // ==== EnsureGlobalScriptHooksInstalled ====
-// 把 pRegister 挂进统一站点表（与 GameCore 的两个脚本钩同构，但目标是 exe 域）。
+// 把 Locale 的 pRegister 挂进统一站点表（与 GameCore 的两个脚本钩同构，但目标是 exe 域）。
 // 幂等：站点表本身就是账本，重复调用只是复用同一站点、刷新跳板。
 static void EnsureGlobalScriptHooksInstalled() {
     {
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         if (g_globalScriptGlobals.empty()) return;
     }
-    void* target = LoaderCore::ResolveExeTarget(kExeModdingRegister, 1);
+    void* target = LoaderCore::ResolveExeTarget(kExeLocaleRegister, 1);
     if (!target) {
-        Logger::Log("EnsureGlobalScriptHooksInstalled: AppLuaModdingLibrary::pRegister not found");
+        Logger::Log("EnsureGlobalScriptHooksInstalled: AppLuaLocaleLibrary::pRegister not found");
         return;
     }
     if (HookEngine::InstallLoaderDetourOnSite(target,
-            reinterpret_cast<void*>(&Hook_ModdingRegister),
-            reinterpret_cast<void**>(&g_origModdingRegister), "GlobalScript")) {
-        Logger::Log("EnsureGlobalScriptHooksInstalled: hooked Modding register at %p", target);
+            reinterpret_cast<void*>(&Hook_LocaleRegister),
+            reinterpret_cast<void**>(&g_origLocaleRegister), "GlobalScript")) {
+        Logger::Log("EnsureGlobalScriptHooksInstalled: hooked Locale register at %p", target);
     } else {
         Logger::Log("EnsureGlobalScriptHooksInstalled: install failed at %p "
                     "(target held by another detour?)", target);
     }
 }
 
-// ==== RunGlobalScripts ====
-// 把所有已登记的回调跑在引擎主 Lua state 上。调用点有两个约束：
+// ==== RunGlobalScriptsFor ====
+// 把所有已登记的回调跑在【指定的】lua_State 上。约束：
 //   1) 游戏线程（Lua 状态非线程安全）；
-//   2) 主 state 已就绪（GUIInit 之后）。
-// 当前由 UiInject 的 MainMenuState::LoadUI detour 触发——那时主菜单 UI 刚建好、主 state
-// 必然存在，而且还没开始加载各 Mod 的 FrontEndUI Lua，插件注册的全局正好赶在前头。
-// 每个登记项对同一个 state 只跑一次；state 被重建（指针变化）后再跑。
-void RunGlobalScripts() {
-    void* L = GetMainLuaStateImpl();
-    if (!L) {
-        Logger::Log("RunGlobalScripts: engine main lua_State not ready, skipped");
-        return;
-    }
+//   2) state 已就绪。
+// 每个登记项对同一个 state 只跑一次（appliedStates 记账），所以：
+//   - FrontEnd 一代来一次、GameCore 一代再来一次，两个 state 不同 -> 各跑一次；
+//   - 同一代里 UiInject / LoadPluginsOf 的补跑点撞上同一次，不会重复执行。
+void RunGlobalScriptsFor(void* L) {
+    if (!L) return;
     std::vector<ScriptGlobalsEntry> pending;
     {
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         for (auto& entry : g_globalScriptGlobals) {
-            if (entry.appliedFor == L) continue;
-            entry.appliedFor = L;
+            const auto& seen = entry.appliedStates;
+            if (std::find(seen.begin(), seen.end(), L) != seen.end()) continue;
+            entry.appliedStates.push_back(L);
             pending.push_back(entry);
         }
     }
     if (pending.empty()) return;
-    Logger::Log("RunGlobalScripts: running %zu registrar(s) on main lua_State %p",
+    Logger::Log("RunGlobalScripts: running %zu registrar(s) on lua_State %p",
         pending.size(), L);
     for (const auto& entry : pending) {
         PluginInFlight::Owner* owner = entry.inFlight;
@@ -1064,6 +1069,18 @@ void RunGlobalScripts() {
             Logger::Log("RunGlobalScripts: skipped for inactive owner=%ls", entry.owner.c_str());
         }
     }
+}
+
+// ==== RunGlobalScripts ====
+// 补跑包装：拿引擎主 lua_State 再跑一遍。钩子没装上、或插件注册晚于该代脚本环境构建时
+// 靠它兜底；已经跑过的 state 会被 appliedStates 挡掉，不会重复。
+void RunGlobalScripts() {
+    void* L = GetMainLuaStateImpl();
+    if (!L) {
+        Logger::Log("RunGlobalScripts: engine main lua_State not ready, skipped");
+        return;
+    }
+    RunGlobalScriptsFor(L);
 }
 
 // ==== RebuildSlotOwners ====

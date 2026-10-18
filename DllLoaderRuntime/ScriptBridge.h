@@ -136,9 +136,13 @@ void RegisterGameCoreScriptForGamePlayImpl(ScriptGlobalsFn fn);
 // HookAPI.RegisterGlobalScript 的实现：登记到引擎主 lua_State（进程级）。
 void RegisterGlobalScriptImpl(ScriptGlobalsFn fn);
 
-// 把已登记的全局脚本回调跑在引擎主 lua_State 上。必须由游戏线程调用，
-// 且主 state 已就绪（当前触发点是 MainMenuState::LoadUI detour）。
+// 把已登记的全局脚本回调跑在引擎主 lua_State 上（补跑用）。必须由游戏线程调用，
+// 且主 state 已就绪（触发点：MainMenuState::LoadUI detour、LoadPluginsOf(GameCore)）。
 void RunGlobalScripts();
+
+// 把已登记的全局脚本回调跑在【指定】的 lua_State 上。每个 state 只跑一次，
+// 因此 FrontEnd 与 GameCore 两代各自会跑一遍。由 Locale 的 pRegister detour 调用。
+void RunGlobalScriptsFor(void* L);
 
 // TriggerGameEventImpl 的 __declspec(noinline) 是【行为的一部分】，不是装饰：
 // 它用 _ReturnAddress() 反查调用方是不是插件。被内联后取到的是 Loader 自身的栈帧，
