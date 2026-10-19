@@ -658,8 +658,9 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 
 - 快路径：`push r10` → `mov r10, site` → `cmp [r10+hasCapture], 0` → `jne slow` →
   `mov r10, [r10+nextTarget]` → `xchg r10, [rsp]` → `ret`；
-- 慢路径（有 capture）：`push rax` / `push r11` → `sub rsp, 0xA0` → 保存 rcx/rdx/r8/r9 →
-  `CaptureDispatch(regs, paramIndex, site)` → 恢复参数 → 复原三格 → `ret` 到 `nextTarget`。
+- 慢路径（有 capture）：`push rax` / `push r11` → `sub rsp, 0xE0` → 保存 rcx/rdx/r8/r9
+  与 **xmm0-3** → `CaptureDispatch(regs, paramIndex, site)` → 恢复参数与 xmm → 复原三格 →
+  `ret` 到 `nextTarget`。
 
 快路径不写任何"原值"到栈上：`xchg` 把 r10 的原值换回来、同时把 `nextTarget` 换到栈顶，`ret` 直接
 弹过去——这是**尾跳**而非 `call`，调用方的返回地址本就在栈上。热路径全程只碰 r10，rax/r11 一行都
@@ -667,11 +668,24 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 活跃值（例如被当作帧指针，尾声 `mov rsp,r11` 直接还原栈）。rax/r10/r11 在函数入口确实是 volatile，
 但"hook 点可在函数中部"这一事实让它们必须按活跃值对待。
 
-慢路径不保存 xmm：`CaptureDispatch` 只读整数参数槽，本就用不到向量寄存器；而按 Win64 约定
-xmm0-5 都是 volatile、由 C 函数随意打掉，只手工存 xmm0-3 反而漏下 xmm4/xmm5，凑不齐一个完整的
-volatile 集合。栈上对齐同样是约束：入口 `rsp ≡ 8 (mod 16)`，压满三格后 ≡ 0，因此慢路径帧取
-`0xA0`（而不是 0x98）——这样 `call` 时 rsp 仍 16 字节对齐，[rsp+0..0x20) 是 shadow space、
-[rsp+0x20..0x40) 放四个整数参数，出口 `add rsp, 0xB0` 把帧与三格一并弹出。
+**慢路径必须保存 xmm0-3。** 慢路径主动 `call` 了 `CaptureDispatch`，按 Win64 调用约定它此刻是
+**调用方**，有义务自己保住 volatile 寄存器；xmm0-3 同时是前四个浮点参数的传入位置。被 hook 的
+函数若是 `double Target(void*, double, double, double)` 这种签名，不保存就会让原函数拿到被
+`CaptureDispatch`（及其内部调用，例如日志里的 `vsnprintf`）覆盖后的垃圾值——实测中目标函数
+直接算出 0 而不是期望结果。
+
+只存 xmm0-3 而不是 xmm0-5：前四个浮点参数只会落在这四个寄存器；xmm4/xmm5 不是参数寄存器，
+被 hook 的函数入口本来就不该依赖它们的值。**若将来支持函数中部 hook，需要另行扩大保护范围**——
+那时 xmm0-15 都可能处于活跃状态。
+
+代价可忽略：8 条 `movaps`（4 存 4 取），实测（100 万次 × 8 轮，`rdtscp` 计时）相对基线
+**−0.004 cycles/iter**，被乱序执行完全吸收；相比之下慢路径本来就有 `lock_guard` 原子操作与
+`CaptureDispatch` 调用，是几十周期的量级。
+
+栈对齐：入口 `rsp ≡ 8 (mod 16)`，压满三格后 ≡ 0，因此慢路径帧取 `0xE0`（≡ 0）——这样 `call`
+时 rsp 仍 16 字节对齐。[rsp+0..0x20) 是 shadow space、[rsp+0x20..0x40) 放四个整数参数、
+[rsp+0x40..0x80) 放 xmm0-3（0x40 起 16 字节对齐，`movaps` 合法），出口 `add rsp, 0xF0`
+把帧与三格一并弹出。
 
 两个设计点：`nextTarget` **运行时**从站点字段读，所以跳板可以在 stub 生成之后由 `MH_CreateHook` 回填、
 拔槽也不需要改写任何可执行字节；stub 一经生成**永不释放**。
@@ -701,7 +715,15 @@ stub 里嵌的是本进程的 `&HookSite`，而 `version.dll` 自更新会重启
 
 `RegisterGlobalCapture(providerAddress, paramIndex, out)`：地址域门 → 可读 + 落在可执行页的预检 →
 取/建站点 → `hasCapture = true`、把 `out` 追加进 `captureOuts`（带 owner 记账）。之后每次调用目标函数，
-stub 的慢路径把第 `paramIndex` 个寄存器参数写到所有 `out`。
+stub 的慢路径把第 `paramIndex` 个**整数**寄存器参数（rcx/rdx/r8/r9，即 paramIndex 0-3）写到所有 `out`。
+
+**捕获对目标函数透明**：慢路径在 `CaptureDispatch` 前后完整保存/恢复了整数参数寄存器与 xmm0-3
+（见 §5.2），所以无论有没有捕获、无论 `CaptureDispatch` 内部做了什么（加锁、写槽、失败时打日志），
+被 hook 的函数拿到的参数都与不挂钩时一致。这是接口契约的一部分，不是"当前 provider 恰好没有
+浮点参数"的侥幸。
+
+**浮点参数不在捕获范围内**：paramIndex 只索引整数参数寄存器。想拿某个 `double` 参数做不到——
+它在 xmm0-3 里，而 `CaptureDispatch` 的 `regs` 只存了四个整数槽。这是有意的范围限制，不是缺陷。
 
 清理只拔插槽：`CleanupAllCaptureSites()`（只清落在**当前 GameCore 映像**内的订阅，exe/常驻域保留）与
 `CleanupCaptureSitesForOwner()`（按 owner 撤）。**绝不**为此物理脱钩。

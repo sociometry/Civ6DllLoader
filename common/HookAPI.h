@@ -236,7 +236,11 @@ typedef struct HookContext {
        index 从 1 起（0 视为 1），按地址升序计数；命中数不足 index 时返回 nullptr 并记日志。 */ \
     X(ResolveByPattern, void*, (HookImageId image, const char* pattern, HookImageSection section, uint32_t index), kCommon) \
     /* 注册全局变量捕获：hook providerAddress，运行时用机器码生成 stub 捕获其第 paramIndex 个 \
-       参数（仅前 4 个寄存器参数，paramIndex 0-3），写入 out 指向的 void*。 \
+       **整数**寄存器参数（rcx/rdx/r8/r9，即 paramIndex 0-3），写入 out 指向的 void*。 \
+       浮点参数抓不到：它们在 xmm0-3 里，不在捕获范围。 \
+       **对目标函数透明**：慢路径在调用分发器前后完整保存/恢复整数参数寄存器与 xmm0-3， \
+       所以无论有无捕获、分发器内部做了什么（加锁、写槽、失败日志），被 hook 的函数拿到的 \
+       参数都与不挂钩时一致。 \
        providerAddress 是【绝对地址】（插件自行用 Resolve* 等入口取址后再传进来），且必须是 \
        可执行的函数入口：Loader 只探页属性（可读 + 落在可执行页），不做任何名字/符号/映像解析。 \
        同一 providerAddress 只 hook 一次，后续注册的 out 追加到列表，触发时统一赋值。 \
