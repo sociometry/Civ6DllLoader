@@ -206,8 +206,9 @@ typedef struct HookContext {
 //   returnType  返回类型。生成结构体时用；解析时不需要（decltype 能推出来）。
 //   params      参数表，【含外层括号】（如 (int playerId)）。整块作为一个宏实参，
 //               因此里面的逗号不会被切碎。
-//   category    kCommon = Global 与 GameCore 两类插件都可用；
-//               kGameCore = 仅 CIV6_PLUGIN_GAMECORE 生成成员，Global 编译期不可见。
+//   category    kCommon   = Global 与 GameCore 两类插件都可用；
+//               kGameCore = 仅 CIV6_PLUGIN_GAMECORE 生成成员，Global 编译期不可见；
+//               kGlobal   = 仅 CIV6_PLUGIN_GLOBAL 生成成员，GameCore 编译期不可见。
 //
 // 【顺序即布局】loader 的 g_hookApi 用位置初始化，本清单顺序必须与它一致；
 // 追加入口只可在末尾追加（docs/ARCHITECTURE.md §10.2）。
@@ -409,8 +410,10 @@ typedef struct HookContext {
        访问不到。Loader 因此对每个新环境都调一次 fn，L 就是那一个环境的 lua_State。 \
        所以回调里应当每次往传入的 L 挂，不要缓存第一次的 L 反复使用。 \
        每个 state 只跑一次（同一环境重复触发不会重复执行），state 重建后重跑。 \
-       回调指针须来自调用插件模块；插件卸载/隔离时按 owner 自动摘除。 */ \
-    X(RegisterGlobalScript, void, (ScriptGlobalsFn fn), kCommon) \
+       回调指针须来自调用插件模块；插件卸载/隔离时按 owner 自动摘除。 \
+       **Global 专属**：GameCore 插件编译期看不到这个成员（对局里的脚本注入请用 \
+       RegisterGameCoreScriptForGamePlay / ForUI）。 */ \
+    X(RegisterGlobalScript, void, (ScriptGlobalsFn fn), kGlobal) \
     /* ---- Lua 表遍历 ---- \
        Lua 5.1 lua_next 的直接封装，用于遍历【哈希表】（LuaObjLen 只给序列长度，遍历不了）。 \
        栈契约照搬 Lua 5.1：调用前栈顶必须是 key（首轮压 nil），index 是表在栈上的位置； \
@@ -442,6 +445,11 @@ typedef struct HookContext {
 #define CIV6_HOOKAPI_MEMBER_kGameCore(entryName, returnType, params) returnType (*entryName) params;
 #else
 #define CIV6_HOOKAPI_MEMBER_kGameCore(entryName, returnType, params)
+#endif
+#if defined(CIV6_PLUGIN_GLOBAL) || defined(CIV6_HOOKAPI_BUILD_IMPL)
+#define CIV6_HOOKAPI_MEMBER_kGlobal(entryName, returnType, params) returnType (*entryName) params;
+#else
+#define CIV6_HOOKAPI_MEMBER_kGlobal(entryName, returnType, params)
 #endif
 
 // ---------------- 插件侧表 ----------------
@@ -512,11 +520,18 @@ inline HookAPI* HookAPI_Resolve(const HookContext* ctx) {
 #else
 #define CIV6_HOOKAPI_RESOLVE_kGameCore(entryName, returnType, params)
 #endif
+#if defined(CIV6_PLUGIN_GLOBAL) || defined(CIV6_HOOKAPI_BUILD_IMPL)
+#define CIV6_HOOKAPI_RESOLVE_kGlobal(entryName, returnType, params) \
+        t.entryName = reinterpret_cast<decltype(t.entryName)>(ctx->Query(#entryName));
+#else
+#define CIV6_HOOKAPI_RESOLVE_kGlobal(entryName, returnType, params)
+#endif
 #define X(entryName, returnType, params, category) \
         CIV6_HOOKAPI_RESOLVE_##category(entryName, returnType, params)
         HOOK_API_LIST(X)
 #undef X
 #undef CIV6_HOOKAPI_RESOLVE_kGameCore
+#undef CIV6_HOOKAPI_RESOLVE_kGlobal
 #undef CIV6_HOOKAPI_RESOLVE_kCommon
         return t;
     }();

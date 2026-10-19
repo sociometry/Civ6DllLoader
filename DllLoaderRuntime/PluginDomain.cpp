@@ -48,6 +48,17 @@ bool RequireGameCoreOwner(const void* codeAddress, const char* apiName) {
     return true;
 }
 
+// Global 专属入口的运行期兜底门（与 RequireGameCoreOwner 对称）。
+bool RequireGlobalOwner(const void* codeAddress, const char* apiName) {
+    const auto owner = ResolvePluginOwnerForAddress(codeAddress);
+    if (!owner || owner->category != LoaderCore::PluginCategory::Global) {
+        Logger::Log("%s rejected: Global-only API called by %s", apiName,
+            owner ? CategoryNameForLog(owner->category) : "unknown");
+        return false;
+    }
+    return true;
+}
+
 // 目标整段是否落在【同一个已加载模块】的映像内。
 // 不解析 PE：两端各自的所属模块句柄相同即证明整段同属一个模块映像；堆 / VirtualAlloc 的
 // JIT 页 / 空闲地址拿不到模块句柄（或两端不同），直接判否。

@@ -608,7 +608,7 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 `LuaNext` 完整实现了 Lua 5.1 `lua_next` 的栈契约（首轮压 nil、每轮自己弹 value、遍历完 key 被弹走）。
 它让插件侧的 C++ 能直接遍历哈希表，不必再借一段 Lua 代码往返。
 
-### 4.4 其它（19 个）
+### 4.4 其它（19 个，其中 1 个仅 Global）
 
 - 消息：`BroadcastMessage` / `RegisterMessageHandler` / `SendMessageTo`（§6.2）；
 - `Log`、映像元数据 `IsImageLoaded` / `GetImageInfo`；
@@ -618,9 +618,9 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
   `LocPushArgument` / `LocToUtf8`——走独立模块 `Localization_FinalRelease.dll` 的导出；
 - `MakeHash`：**已内化**为 loader 自己的原生 CRC32（raw，无最终异或，与官方 `GameCore::Utilities::MakeHash`
   逐位一致，并有编译期自检向量）；不再解析任何 GameCore 符号，任何时刻可算；
-- 脚本注册：`RegisterGlobalScript`（登记到引擎主 state，§6.3）与 `UnregisterGlobalCapture`
-  （撤销自己的一个参数捕获订阅，§5.3）——两个都不按目标地址域设门：前者只登记回调，
-  后者只能摘掉自己名下的槽；
+- 脚本注册：`RegisterGlobalScript`（**仅 Global 类别**，登记到引擎的每个 Lua 环境，§6.3）
+  与 `UnregisterGlobalCapture`（撤销自己的一个参数捕获订阅，§5.3）——两个都不按目标地址域
+  设门：前者只登记回调，后者只能摘掉自己名下的槽；
 - `GetMainLuaState`：读 exe 全局 `LuaSystem::LuaScriptSystem::ms_apSingletonInstance`（DX11 实测 RVA
   `0x2D08F88`）解引用后的 `+0x10` → **引擎主 Lua VM**（`m_pkMainLuaState`）。★ 这是**进程级** state：
   `lua_newstate()` 在 `Civ6App::GUIInit` 建一次，只在 `Civ6App::GUIShutdown` `lua_close`
@@ -879,7 +879,7 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 `fn(L)`（SEH 隔离 + `PluginInFlight` 守卫），最后调原函数（跳板）。两个 state 是不同的：gameplay 每局重建，
 UI 是 GameCore 侧界面脚本用的那个。
 
-**进程级（两类插件都可用）**：`RegisterGlobalScript(fn)` → 登记进 `g_globalScriptGlobals`，
+**进程级（Global 专属）**：`RegisterGlobalScript(fn)` → 登记进 `g_globalScriptGlobals`，
 回调跑在**引擎给某个脚本环境建好的 lua_State** 上。重点是这个 state **不只有一个**。
 
 主执行点是对 `LuaSystem::LuaExposureLibrary::Register(lua_State*)` 装共享钩
@@ -890,8 +890,8 @@ UI 是 GameCore 侧界面脚本用的那个。
 HavokScript 给每个 `LuaThread` 维护**独立的环境表**（`LuaSystem::LuaUtils::PushThreadAndEnvironment`
 会遍历 `_G.Threads` 逐个匹配 thread 对象），实测结果是：挂在主 VM 上的接口，别的 state
 **访问不到**。所以 `RegisterGlobalScript` 不能只往主 VM 写一份，必须每遇到一个新的
-`lua_State*` 就注册一次；`ScriptGlobalsEntry::appliedStates` 记的是"已经跑过哪些 L"，
-只用来挡住同一个 L 被重复触发。
+`lua_State*` 就注册一次。**不按 state 去重**：引擎侧两个调用点都是新建 thread 后立刻调一次，
+同一个 L 本来不会来两次，多记一层只会在真重复时把回调静默吞掉；回调幂等性由插件自己负责。
 
 **为什么钩 `LuaExposureLibrary::Register`**：
 
@@ -910,10 +910,16 @@ HavokScript 给每个 `LuaThread` 维护**独立的环境表**（`LuaSystem::Lua
   主菜单那代已经把 `Locale` 建好了，后续 thread 直接跳过，`pRegister` 根本不执行；
 - 钩 `AppLuaLocaleLibrary::Register` 也不行：它的第一个参数是 **`mainState`**（
   `RegisterThreadLibraries` 与 `CreateLuaThread` 传的都是主 VM），拿不到 thread 的 L，
-  于是一直往同一个 state 上跑，被 `appliedStates` 挡掉。
+  于是一直往同一个 state 上跑，看起来"进对局后就不再生效"。
 
 detour 在**原函数之前**跑插件回调，跑完把该 thread 的 Lua 栈削回原高度：注册流程随后要在栈上
 `getglobal` / `pushclosure` / `setfield`，残留值会让它填错位置。
+
+**没有补跑点**：这条链路是唯一入口。每个 thread 环境建好时钩子必然已经装上（Global 插件在
+阶段 A 注册时就会装钩，早于任何 thread），所以不存在"漏掉某个环境"的情况。曾经在
+`LoadPluginsOf(GameCore)` 与 `UiInject` 的 LoadUI 里各加过一个补跑点，后来删掉了：它们写的都是
+**主 VM**，而各 thread 有独立环境表，写主 VM 覆盖不到 gameplay / FrontEnd 那些 thread，等于
+既没解决问题、又在主 VM 上重复执行了一次。
 
 ### 6.4 PushLuaMethods
 

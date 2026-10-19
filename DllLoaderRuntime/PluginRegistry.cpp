@@ -815,12 +815,6 @@ void LoaderCore::LoadPluginsOf(PluginCategory cat) {
     for (const auto& wpath : wpaths) {
         LoadSinglePlugin(wpath);
     }
-    // 全局脚本的补跑点：GameCore 插件是在对局加载时（游戏线程）才 OnLoad 的，它们的
-    // RegisterGlobalScript 赶不上本代 Locale 注册那一刻，这里补一次。同一 state 上已跑过的
-    // 项不会重复执行（ScriptGlobalsEntry::appliedStates）。
-    if (cat == PluginCategory::GameCore) {
-        ScriptBridge::RunGlobalScripts();
-    }
 }
 
 // ==== UnloadPluginsOf ====

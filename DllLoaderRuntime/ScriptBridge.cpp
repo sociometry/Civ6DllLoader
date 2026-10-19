@@ -150,10 +150,6 @@ struct ScriptGlobalsEntry {
     ScriptGlobalsFn fn;
     // 登记时解析一次并常驻：运行时守卫不再做宽字符串哈希。
     PluginInFlight::Owner* inFlight = nullptr;
-    // 全局脚本专用：已经跑过哪些 lua_State。同一个 state 只跑一次；FrontEnd 与 GameCore
-    // 是两个不同的 state，因此各自跑一次。
-    // GameCore 侧两个列表不使用这个字段。
-    std::vector<void*> appliedStates;
 };
 
 std::vector<ScriptGlobalsEntry> g_scriptGlobals;
@@ -990,6 +986,10 @@ void RegisterGlobalScriptImpl(ScriptGlobalsFn fn) {
         auto owner = PluginDomain::RequirePluginOwner(reinterpret_cast<const void*>(fn),
             "RegisterGlobalScript");
         if (!owner) return;
+        // Global 专属：编译期已由 HookAPI.h 的 kGlobal 类别挡住 GameCore 插件，
+        // 这里再挡一次绕过头文件、按结构体偏移直接调用的。
+        if (!PluginDomain::RequireGlobalOwner(reinterpret_cast<const void*>(fn),
+                                "RegisterGlobalScript")) return;
         lock_guard<mutex> stateLock(g_scriptStateMutex);
         g_globalScriptGlobals.push_back(ScriptGlobalsEntry{
             owner->ownerId, fn, PluginInFlight::Resolve(owner->ownerId) });
@@ -1126,19 +1126,16 @@ static void EnsureGlobalScriptHooksInstalled() {
 // 把所有已登记的回调跑在【指定的】lua_State 上。约束：
 //   1) 游戏线程（Lua 状态非线程安全）；
 //   2) state 已就绪。
-// 每个 thread state 各自持有一份环境表（实测跨 state 看不到对方挂的接口），所以每个
-// 不同的 L 都要跑一遍；appliedStates 只负责挡住"同一个 L 被重复触发"，不是跨 state 去重。
+// 每个 thread state 各自持有一份环境表（实测跨 state 看不到对方挂的接口），所以每个 L 都要跑。
+// **不按 state 去重**：唯一的两个调用点（CreateLuaThread / RegisterThreadLibraries）都是
+// 新建 thread 后立刻调一次，同一个 L 本来就不会来两次；多做一层记录只会在真出现重复触发时
+// 把回调静默吞掉。回调的幂等性由插件自己负责（指南有要求）。
 void RunGlobalScriptsFor(void* L) {
     if (!L) return;
     std::vector<ScriptGlobalsEntry> pending;
     {
         lock_guard<mutex> stateLock(g_scriptStateMutex);
-        for (auto& entry : g_globalScriptGlobals) {
-            const auto& seen = entry.appliedStates;
-            if (std::find(seen.begin(), seen.end(), L) != seen.end()) continue;
-            entry.appliedStates.push_back(L);
-            pending.push_back(entry);
-        }
+        pending = g_globalScriptGlobals;
     }
     if (pending.empty()) return;
     Logger::Log("RunGlobalScripts: running %zu registrar(s) on lua_State %s",
@@ -1153,18 +1150,6 @@ void RunGlobalScriptsFor(void* L) {
             Logger::Log("RunGlobalScripts: skipped for inactive owner=%ls", entry.owner.c_str());
         }
     }
-}
-
-// ==== RunGlobalScripts ====
-// 补跑包装：拿引擎主 lua_State 再跑一遍。钩子没装上、或插件注册晚于该代脚本环境构建时
-// 靠它兜底；已经跑过的 state 会被 appliedStates 挡掉，不会重复。
-void RunGlobalScripts() {
-    void* L = GetMainLuaStateImpl();
-    if (!L) {
-        Logger::Log("RunGlobalScripts: engine main lua_State not ready, skipped");
-        return;
-    }
-    RunGlobalScriptsFor(L);
 }
 
 // ==== RebuildSlotOwners ====

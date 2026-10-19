@@ -38,6 +38,10 @@ std::optional<CallerPluginInfo> RequirePluginOwner(const void* codeAddress, cons
 // 按结构体偏移直接调这些入口的插件。
 bool RequireGameCoreOwner(const void* codeAddress, const char* apiName);
 
+// Global 专属入口的运行期兜底门：owner 缺失或不是 Global -> false + 日志。
+// 与 RequireGameCoreOwner 对称，防的是绕过 HookAPI.h 直接按偏移调用的插件。
+bool RequireGlobalOwner(const void* codeAddress, const char* apiName);
+
 // target 是否落在【当前】GameCore 映像内。
 bool TargetInCurrentGameCore(void* target);
 
