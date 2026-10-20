@@ -41,7 +41,6 @@ docs/*
 __pycache__/
 *.pyc
 *.pyo
-tools/out/
 
 # Local leftovers
 example1.log
@@ -59,17 +58,29 @@ third_party/asmjit_src/*
 !third_party/asmjit_src/asmjit/
 !third_party/asmjit_src/asmjit/x86/
 
-# old sidecar（depot 版本，仅跨版本测试用，不纳入版本管理）
-tools/Civ6DllLoader.symdb.old.bin
-tools/Civ6DllLoader.symdb.old.json
-
-# tools/ 下的中间产物（仅本地，不入版本管理；交付物只有 DllLoaderRuntime/*.bin.xp，由 symdb.py all 部署）
-tools/*.symdb.bin
-tools/*.symdb.pack.bin
-tools/*.symdb.pack.bin.xp
-
-# exe 站点定位工具的输出（本地产物）
-tools/exe_site_map.json
-
-# Rust 工具编译产物
-tools/rva_to_symbol/target/
+# ---- tools/：默认整目录忽略，只放行下面逐个列出的既有工具 ----
+# 这里放的是本地工具链与一次性脚本，全量纳入版本管理会让临时产物、构建缓存、
+# 以及临时写的辅助脚本混进提交。默认拒绝，需要保留的显式放行。
+#
+# 必须用 tools/* 而不是 tools/：目录整体被忽略后 git 不再向下遍历，
+# 后面的 ! 放行规则会全部失效。
+tools/*
+!tools/symdb.py
+!tools/gen_rva_map.py
+!tools/lzma_selftest.c
+!tools/aob_helper.exe
+!tools/normhash_helper.exe
+!tools/demumble.exe
+!tools/rva_to_symbol.exe
+!tools/GameCore.symdb.json
+!tools/CivilizationVI.symdb.json
+!tools/CivilizationVI_DX12.symdb.json
+# rva_to_symbol 工程：放行源码 + 重建所需的构建脚本与内嵌数据；
+# target/（cargo 编译产物，含依赖缓存）沿用全局忽略，不入版本管理。
+!tools/rva_to_symbol/
+tools/rva_to_symbol/*
+!tools/rva_to_symbol/src/
+!tools/rva_to_symbol/data/
+!tools/rva_to_symbol/build.bat
+!tools/rva_to_symbol/Cargo.toml
+!tools/rva_to_symbol/Cargo.lock

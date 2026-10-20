@@ -138,7 +138,8 @@ aob 子命令规则（生成/核对 exe 域 loader 目标的 AOB，供 HookInfo/
 ================================================================================
 构建期工具链（Windows + python3 + pefile + capstone）
 ================================================================================
-  ① IDA 里跑 dump_functions_idapython.py        → <idb>.funcs.txt
+  ① 在 IDA 里导出全部函数清单                    → <idb>.funcs.txt
+       （File -> Script file...，脚本自备；格式见下面 json-exe 的 --funcs 说明）
   ② symdb.py json-exe --exe <去DRM的exe> --funcs <idb>.funcs.txt --asm <idb>.asm
        --demumble demumble.exe --out CivilizationVI[_DX12].symdb.json
   ③ symdb.py module --json <json> --dll <对应PE> --bin <单模块.bin> --image-id <id>
