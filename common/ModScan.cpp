@@ -3,6 +3,7 @@
 #include "EnabledMods.h"
 #include "LoaderProtocol.h"
 #include "Logger.h"
+#include "PluginVersion.h"
 
 #include <algorithm>
 #include <fstream>
@@ -164,24 +165,64 @@ void CollectRuntimesUnderContentRoot(const fs::path& contentRoot, std::vector<st
     }
 }
 
-void DedupPluginsByFilename(std::vector<std::wstring>& paths) {
-    std::set<std::wstring> seenNames;
-    std::vector<std::wstring> filtered;
-    filtered.reserve(paths.size());
+// 插件版本门禁 + 版本择优去重：实际逻辑在 common/PluginVersion.*（纯函数，可单测）。
+// 这里只负责"读文件版本"和"把决策翻译成日志"两件事。
+//
+// 门禁是强制要求：读不到文件版本的插件一律不加载。
+void FilterAndDedupByFileVersion(std::vector<std::wstring>& paths) {
+    if (paths.empty()) return;
+
+    std::vector<PluginVersion::Candidate> candidates;
+    candidates.reserve(paths.size());
     for (const auto& path : paths) {
-        std::wstring name = fs::path(path).filename().wstring();
-        for (auto& c : name) c = towlower(c);
-        if (seenNames.count(name)) {
-            const std::string narrow = WideToNarrow(path);
-            // 保留的是大小写不敏感字典序里的第一个（扫描结果在去重前已按该顺序排好）
-            Logger::Log("Skipping duplicate plugin basename (kept the lexicographically first path): %s",
-                narrow.c_str());
-            continue;
+        candidates.push_back({path, PluginVersion::ReadFileVersion(path)});
+    }
+
+    const std::vector<PluginVersion::Decision> decisions =
+        PluginVersion::Select(std::move(candidates));
+
+    std::vector<std::wstring> filtered;
+    filtered.reserve(decisions.size());
+    for (const auto& decision : decisions) {
+        switch (decision.kind) {
+        case PluginVersion::DecisionKind::Kept:
+            filtered.push_back(decision.path);
+            break;
+        case PluginVersion::DecisionKind::DroppedNoVersion:
+            // 失败即关闭：没有版本号的插件不参与加载。
+            Logger::Log("Rejected plugin (no VERSIONINFO file version resource): %s",
+                WideToNarrow(decision.path).c_str());
+            break;
+        case PluginVersion::DecisionKind::DroppedLowerVersion:
+            Logger::Log("Duplicate plugin basename: kept %s (v%s), dropped %s (v%s, lower version)",
+                WideToNarrow(decision.winner).c_str(),
+                PluginVersion::Format(decision.winnerVersion).c_str(),
+                WideToNarrow(decision.path).c_str(),
+                PluginVersion::Format(decision.version).c_str());
+            break;
+        case PluginVersion::DecisionKind::DroppedSameVersion:
+            Logger::Log("Duplicate plugin basename: kept %s (v%s), dropped %s (v%s, same version -> lexicographic tie-break)",
+                WideToNarrow(decision.winner).c_str(),
+                PluginVersion::Format(decision.winnerVersion).c_str(),
+                WideToNarrow(decision.path).c_str(),
+                PluginVersion::Format(decision.version).c_str());
+            break;
         }
-        seenNames.insert(name);
-        filtered.push_back(path);
     }
     paths.swap(filtered);
+}
+
+// 大小写不敏感的路径字典序。扫描排序与"版本相同时的平局裁决"共用同一个规则
+// （裁决实现在 PluginVersion 内部，两处必须一致，否则会出现"排序认为 A 在前、
+// 去重却保留了 B"的隐蔽不一致）。
+bool LessIgnoreCase(const std::wstring& a, const std::wstring& b) {
+    const size_t n = (std::min)(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        const wchar_t ca = static_cast<wchar_t>(towlower(a[i]));
+        const wchar_t cb = static_cast<wchar_t>(towlower(b[i]));
+        if (ca != cb) return ca < cb;
+    }
+    return a.size() < b.size();
 }
 
 // Keep only mods recorded as enabled in Mods.sqlite.
@@ -248,8 +289,14 @@ void CollectPluginsUnderContentRootDir(const fs::path& contentRoot, const fs::pa
 }
 
 // Shared pipeline (FindGlobalPluginCandidates / FindGameCorePluginCandidates 共用这条):
-// scan roots -> EnabledMods filter -> case-insensitive lexicographic sort ->
-// basename dedup (stable order, case-insensitive sort, dedup by filename).
+// scan roots -> EnabledMods filter -> file-version gate -> case-insensitive
+// lexicographic sort -> basename dedup picking the highest version.
+//
+// 顺序是有意的：
+//   ① 排序必须在去重之前 —— 版本相同的平局靠"输入已按字典序排好"裁决
+//      （PluginVersion::Select 里仍会显式比较路径，不依赖这个前提）；
+//   ② 门禁与去重在同一步完成（FilterAndDedupByFileVersion）：版本来回读两遍没必要；
+//   ③ Global / GameCore 各走一遍本函数，两条管线的去重互不干扰（跨类别同名各留一份）。
 std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdir) {
     std::vector<std::wstring> out;
     for (const auto& root : CollectScanRoots()) {
@@ -257,18 +304,11 @@ std::vector<std::wstring> FindSubdirPluginCandidates(const fs::path& pluginSubdi
     }
     FilterByEnabledMods(out, "plugin");
 
-    std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
-        // Case-insensitive lexicographic order for stable load order.
-        const size_t n = (std::min)(a.size(), b.size());
-        for (size_t i = 0; i < n; ++i) {
-            const wchar_t ca = towlower(a[i]);
-            const wchar_t cb = towlower(b[i]);
-            if (ca != cb) return ca < cb;
-        }
-        return a.size() < b.size();
-    });
+    // Case-insensitive lexicographic order for stable load order.
+    std::sort(out.begin(), out.end(), LessIgnoreCase);
 
-    DedupPluginsByFilename(out);
+    // 强制门禁 + 版本择优去重（没有文件版本的一律不加载）。
+    FilterAndDedupByFileVersion(out);
     return out;
 }
 

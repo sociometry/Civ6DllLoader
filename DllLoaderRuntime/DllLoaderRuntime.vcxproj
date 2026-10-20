@@ -135,6 +135,9 @@
     <ClCompile Include="PluginInFlight.cpp" />
     <ClCompile Include="UiInject.cpp" />
     <ClCompile Include="..\common\ModScan.cpp" />
+    <ClCompile Include="..\common\PluginVersion.cpp">
+    	<PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="..\common\RuntimePackage.cpp" />
     <ClCompile Include="..\common\EnabledMods.cpp" />
     <ClCompile Include="..\third_party\sqlite\sqlite3.c">

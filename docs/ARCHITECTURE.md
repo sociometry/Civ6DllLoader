@@ -392,14 +392,30 @@ ruleset 日志但插件一条没加载"时，要先确认不是被这个标志�
 
 扫描（`common/ModScan.cpp`）：内容根 = `Documents\My Games\...\Mods` / Workshop，
 每个根下找 `<mod>\Binaries\Win64\Plugins\<Global|GameCore>\*.dll`（插件目录固定是 `Binaries\Win64`；
-`Win64Steam` 只影响 exe 目录的形状，插件扫描不认它），
-按文件名去重，再用 `common/EnabledMods.*`（读 `Mods.sqlite` 的启用集）过滤：**路径必须落在某个启用 Mod
-的根下**，且**只认 SQL 返回的那个精确 mod root**（`AllowsPath` 不沿路径向上找 `.modinfo` 再放宽：
-外层 mod 目录即使包着某个启用 root，也不因此获得授权）。只比 GUID 不够：同一 GUID 可能有多份安装副本。
-**没有任何"锚本地豁免"**：授权判据只有 `AllowsPath` 一条。`Mods.sqlite` 读不到时**一个都不加载**
-（失败即关闭）。`CollectScanRoots()` 不接受锚模块参数：内容根的发现全部与调用方无关
-（`SHGetKnownFolderPath` 拿 Documents、注册表 + `libraryfolders.vdf` 拿 Steam/Workshop、
-exe 目录上溯拿 Workshop）。
+`Win64Steam` 只影响 exe 目录的形状，插件扫描不认它）。管线按这个顺序：
+
+1. **启用集过滤**（`common/EnabledMods.*`，读 `Mods.sqlite`）：**路径必须落在某个启用 Mod 的根下**，
+   且只认 SQL 返回的那个精确 mod root（`AllowsPath` 不沿路径向上找 `.modinfo` 再放宽：
+   外层 mod 目录即使包着某个启用 root，也不因此获得授权）。只比 GUID 不够：同一 GUID 可能有多份安装副本。
+   **没有任何"锚本地豁免"**：授权判据只有 `AllowsPath` 一条。`Mods.sqlite` 读不到时**一个都不加载**
+   （失败即关闭）。`CollectScanRoots()` 不接受锚模块参数：内容根的发现全部与调用方无关
+   （`SHGetKnownFolderPath` 拿 Documents、注册表 + `libraryfolders.vdf` 拿 Steam/Workshop、
+   exe 目录上溯拿 Workshop）。
+2. **文件版本门禁（强制）**：每个候选读 PE 的 `VERSIONINFO` 文件版本；**读不到就整份不加载**，
+   日志留 `Rejected plugin (no VERSIONINFO file version resource)`。注意 `0.0.0.0` 与"没有资源"
+   在这里等价，都算没有版本。
+3. **大小写不敏感字典序排序**。
+4. **按 basename 去重、组内取版本最高者**；版本相同时取路径字典序最小者
+   （与 §1.3 runtime 选举的 `BetterThan` 同规则）。`Global` / `GameCore` 各走一遍，跨类别同名各留一份。
+
+> 版本读取走 `common/PluginVersion.*`，用 `GetFileVersionInfoSizeW` / `GetFileVersionInfoW` /
+> `VerQueryValueW` 读 `VS_FIXEDFILEINFO` —— **纯文件读取，不加载模块**，不执行候选的
+> `DllMain`/TLS/导出，与读 runtime 的 `RCDATA 105` 是同一套纪律。
+> 选举逻辑是纯函数（`PluginVersion::Select`）：输入 `{path, version}` 列表，输出保留/淘汰决策，
+> 不碰文件系统也不写日志，规则可以脱离游戏直接验证。
+>
+> ⚠️ **破坏性要求**：插件 DLL 必须带 `VERSIONINFO` 文件版本，否则不会被加载。补版本的方式是给工程
+> 加一个 `.rc`（VS 资源视图 → 添加资源 → Version），不是加 `RCDATA`。
 
 **游戏安装根不是内容根**：它不是模组容器（直接子目录 `Base`/`CTP`/`DLC`/`Debug`/`LaunchPad`
 都不含 `Binaries\Win64`，实测候选取集恒为空）。游戏自己 `Mods.sqlite` 的 `ScannedFiles` 记录的
