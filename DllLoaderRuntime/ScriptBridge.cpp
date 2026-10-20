@@ -380,6 +380,10 @@ static void CleanupGameEventsForOwner(const std::wstring& owner) {
         ev.name[0] = '\0';
         ev.ownerId.clear();
         ev.inFlight = nullptr;
+        // 一并清掉 pushFn：否则槽位里留着一个指向已卸载插件映像的函数指针。
+        // 当前所有触发路径都先判 name[0]，所以现在还调不到它；但让「空槽判据」
+        // 与「指针有效性」两套规则保持一致，避免将来只判 luaPushFn 的新代码踩空。
+        ev.luaPushFn = nullptr;
         ++cleaned;
     }
     if (cleaned == 0) return;

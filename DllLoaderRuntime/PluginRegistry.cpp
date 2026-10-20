@@ -216,7 +216,7 @@ static bool KindToCategory(uint32_t kind, LoaderCore::PluginCategory& out) {
 
 // ==== IsOwnerActive ====
 // ResolvePluginOwnerForAddress 要查插件表，而插件表归本文件（阶段 6 后归
-// PluginRegistry.cpp）。按 REFACTOR_PLAN.md §5.2 把"查表"整体收进这个只读门面，
+// PluginRegistry.cpp）。把"查表"整体收进这个只读门面，
 // 这样 g_plugins / g_activePluginOwner / g_activePluginModule 三个变量都不必外泄，
 // PluginDomain 也不必看见 PluginEntry / PluginState 两个类型。
 // 对应拆分前 PushLuaMethodsImpl 里的 find_if：判断该 owner 是否还活着。

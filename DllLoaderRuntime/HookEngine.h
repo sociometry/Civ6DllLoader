@@ -1,7 +1,7 @@
 #pragma once
 // HookEngine.h — 挂钩站点表 / JIT stub / capture / teardown 站点操作（阶段 5）。
 //
-// 本模块拥有（不导出，见 REFACTOR_PLAN.md §5.1）：
+// 本模块拥有（不导出）：
 //   struct HookSite（含嵌套 CaptureOut）、g_hookSites、g_captureMutex、g_captureRuntime
 // 若把 capture 划给别的文件，两边就得互相暴露最私密的数据结构 —— 故 B（站点）与
 // E（capture）必须同文件。同理 teardown 的两个站点操作函数也归这里。

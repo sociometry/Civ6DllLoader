@@ -3,10 +3,10 @@
 //
 // 为什么单独一个头：插件表（g_plugins）与"当前活跃插件"（g_activePluginOwner/Module）
 // 三个变量归 PluginRegistry 所有，而 PluginDomain 是它的下层。若让 PluginDomain 直接
-// 看见这三个变量，就得把它们 extern 出去（违背 REFACTOR_PLAN.md §5 "不用 extern 全局
-// 变量"原则），且 PluginDomain 会被迫 include 插件表的数据结构（PluginEntry / PluginState）。
+// 看见这三个变量，就得把它们 extern 出去（违背"不用 extern 全局变量"原则），且 PluginDomain
+// 会被迫 include 插件表的数据结构（PluginEntry / PluginState）。
 //
-// 所以按 §5.2 设计：把"查表"整体收进一个函数，调用方只拿结果。
+// 所以把"查表"整体收进一个函数，调用方只拿结果。
 //
 // 实现归属：最终在 PluginRegistry.cpp。阶段 2 时插件表还在母体，故暂由母体实现，
 // 阶段 6 随表一起搬走 —— 声明与调用方不变。

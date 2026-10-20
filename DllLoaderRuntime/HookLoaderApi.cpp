@@ -129,7 +129,7 @@ static const HookAPI g_hookApi = {
 // ==== RuntimeHookContext / HookApiQuery ====
 // 插件不再拿到这张表：OnLoad 收到的是 HookContext（3 个字段，见 common/HookAPI.h），
 // 里面只有一个 Query —— 插件在 OnLoad 里按名字把自己那张 HookAPI 表填满。
-// 名字是白名单：只认 HOOK_API_LIST 里的 77 个入口，loader 的其它函数一律不暴露。
+// 名字是白名单：只认 HOOK_API_LIST 里的 80 个入口，loader 的其它函数一律不暴露。
 //
 // g_hookApi 不删除，它现在的角色是【loader 内部实现地址表】：
 // Query 按名字取其中的槽，其余用途（内部 header-only 工具）也照旧可用。

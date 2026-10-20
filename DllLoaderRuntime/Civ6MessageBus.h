@@ -68,7 +68,7 @@ private:
 //
 // g_bus 本身定义在 Civ6MessageBus.cpp 内（文件级 static，不导出变量）。
 // 需要它的其它模块（PluginRegistry 的加载/卸载/隔离路径要调 UnregisterOwner）
-// 经这个访问器拿引用 —— 而不是把 g_bus 做成 extern 全局（见 REFACTOR_PLAN.md §5）。
+// 经这个访问器拿引用 —— 而不是把 g_bus 做成 extern 全局（各模块只持有自己那份私有状态）。
 Civ6MessageBus& GlobalBus();
 
 // 插件 ABI 转发层（实现在 Civ6MessageBus.cpp）：把 HookAPI 里的函数指针

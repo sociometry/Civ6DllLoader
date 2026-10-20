@@ -10,10 +10,9 @@
 namespace LoaderCore {
 
 // 插件生命周期锁（递归）。所有模块都用它把"插件表状态"与"插件回调执行"串起来，
-// 故必须共享同一把 —— 见 REFACTOR_PLAN.md §5.2：它被 4 个模块、34 个函数引用，
-// 是拆分里引用面最广的一个共享对象。
+// 故必须共享同一把：它被 4 个模块、34 个函数引用，是引用面最广的一个共享对象。
 //
-// 锁层级（§5.4，实测 5 级）：
+// 锁层级（详见 docs/ARCHITECTURE.md §2.5，实测 5 级）：
 //   g_gameCoreTransitionMutex → LifecycleMutex() → g_pushStateMutex
 //     → Runtime::MinHookMutex() → g_captureMutex
 // 递归获取不会死锁，但不要在持 MinHook/capture 锁时反向取它（ABBA）。

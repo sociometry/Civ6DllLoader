@@ -3,7 +3,7 @@
 //
 // 这是所有子系统的公共下层：HookAPI 的每个插件入口都要先问"调用方是谁、这个地址
 // 对它开放吗"。因此它必须独立成模块 —— 塞进任何业务文件都会逼所有模块 include 那个
-// 业务头文件（见 docs/REFACTOR_PLAN.md §3.2）。
+// 业务头文件。
 //
 // 依赖方向：本模块【不依赖】PluginRegistry / HookEngine / ScriptBridge。
 // 它读插件表要经 PluginRegistry::ResolveOwnerByModule（只读门面），

@@ -274,6 +274,12 @@ typedef struct HookContext {
     X(LuaToBoolean, int, (void*, int), kCommon) \
     X(LuaPushNumber, void, (void*, double), kCommon) \
     X(LuaPushInteger, void, (void*, int), kCommon) \
+    /* LuaError = luaL_error：**raise，不返回**（longjmp，不是普通返回）。 \
+       不得在 Loader 持有回调帧的入口里调用（RegisterGlobalScript / RegisterGameCoreScriptFor* / \
+       GameEventPushFn / 消息 handler）：longjmp 会跳过那些帧里的 C++ 析构，PluginInFlight::Guard \
+       与 SharedDetourActivity 的计数会永久不减，之后 WaitAll / WaitForDetourDrain 永久阻塞。 \
+       需要「参数不合法就退出」时用 LuaType 判断后正常 return，别用 raise。 \
+       同类（类型不符时会 raise）：LuaCheckLString / LuaCheckInteger / LuaCheckNumber / LuaCheckTable。 */ \
     X(LuaError, void, (void*, char const*, ...), kCommon) \
     X(LuaPushFString, char const*, (void*, char const*, ...), kCommon) \
     X(LuaCheckLString, char const*, (void*, int, unsigned __int64*), kCommon) \

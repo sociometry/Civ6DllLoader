@@ -5,7 +5,7 @@
 // 输入路径之一（另外三条是 AOB 模式、RVA、vtable 槽序号）。符号库本身归 PdataMatch
 // （它读 sidecar、做跨版本矫正），本模块只负责"给一个线索，换回一个地址"。
 //
-// 分层（见 docs/REFACTOR_PLAN.md §3.1）：
+// 分层（架构说明见 docs/ARCHITECTURE.md §7.4）：
 //   * *Core：不做插件边界校验、不加插件生命周期锁 —— Loader 自身走这条
 //     （ResolveExeTarget / LoaderHooks / UiInject）。游戏线程在 LoadDLL detour 里
 //     解析自家 hook 目标时，不会去拿那把可能被卡住的插件锁。

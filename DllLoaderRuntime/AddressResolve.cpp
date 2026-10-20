@@ -19,7 +19,7 @@
 // 【命名】：本模块输出一律是地址，故叫 AddressResolve 而非 SymbolResolve。
 // 符号名只是四条输入路径之一；符号库归 PdataMatch。详见 AddressResolve.h。
 //
-// static 的取舍（REFACTOR_PLAN.md §4.4）：
+// static 的取舍：
 //   * ResolveSectionRva / *Core / *Impl / GetSymbolDb*Impl —— 外部链接
 //     （HookAPI 表与其它模块要用）；
 //   * ReadVTableSlotSafe / ExeMatchesAnchor / InternalToolApi —— 保持 static

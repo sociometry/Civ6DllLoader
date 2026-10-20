@@ -6,7 +6,7 @@
 //      阶段 6 把 g_hookApi 迁到 HookLoaderApi.cpp 后，改由那个文件取地址。
 //   2. 给 PluginRegistry / HookEngine 用的门面 —— 它们要复位本模块拥有的状态。
 //
-// 归属本模块的私有状态（不导出，见 REFACTOR_PLAN.md §5.1）：
+// 归属本模块的私有状态（不导出）：
 //   g_defaultPushTargetConfigs / kLuaSingletonPattern / g_mainLuaStateHit
 //   kGameEventNameMax / kGameEventCurrentGamePattern / g_gameEventContainerHit
 //   kMaxRegisteredGameEvents / g_gameEvents

@@ -26,7 +26,7 @@
 // 从 Civ6DLLHookLoaderAPI.cpp 拆出（阶段 5）：挂钩站点表 / JIT stub / capture /
 // teardown 站点操作。
 //
-// 本模块拥有（不导出，见 REFACTOR_PLAN.md §5.1）：
+// 本模块拥有（不导出）：
 //   struct HookSite（含嵌套 CaptureOut）、g_hookSites、g_captureMutex、g_captureRuntime
 // 跨模块常量 kHookPrologueWindow 放 HookEngine.h（PluginRegistry 的 HookPatch 也要用）。
 //

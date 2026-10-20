@@ -28,7 +28,10 @@
 **Civ6DllLoader 的核心优势**：
 1. **突破 GameCore 局限（全域扩展）**：通过 EXE 导入表代理（`version.dll`）进入进程，使插件能力不再局限于 GameCore 范畴，能够拦截主程序 EXE、注入前端界面以及常驻监听；
 2. **完全接管加载逻辑，消除 LoadOrder 竞争**：拦截 EXE 内部的 `GameCore::LoadDLL`，将规则集槽位重定向回官方原版 DLL，同时接管插件扫描与加载流水线。多个符合规范的独立 DLL 插件可以并行加载、安全共存，消除了模组间对规则集 `LoadOrder` 的争抢；
-3. **完善的跨版本函数自动匹配（抗更新能力强）**：内置基于 PE 异常展开表（`.pdata`）的跨版本自动矫正机制（`PdataMatch`），结合滑动窗口锚点链、线性插值/外推、函数序言哈希校验及虚表反推，能够有效应对游戏未来的版本更新。跨版本函数匹配成功率高达 80%，大幅降低了游戏更新导致 Mod 符号失效的维护与适配成本（§7.3）。
+3. **完善的跨版本函数自动匹配（抗更新能力强）**：内置基于 PE 异常展开表（`.pdata`）的跨版本自动矫正机制（`PdataMatch`），结合滑动窗口锚点链、线性插值/外推、归一化函数头哈希及虚表反推，能够有效应对游戏未来的版本更新，大幅降低了游戏更新导致 Mod 符号失效的维护与适配成本。
+   > 匹配率**没有内置统计**：`PdataMatch` 只按条目打 `matched %zu` 计数日志，
+   > `GetMatchRatio` 也仅对 CrossVersion 返回真实匹配率。需要评估时以实机日志为准，
+   > 不要引用本文档给出任何百分比（§7.3）。
 
 **已知局限与权衡**：
 1. **强规范约束**：Loader 不会加载不符合设定规则的随意 DLL，插件必须接入本项目的规范（遵循目录结构划分、导出 `Civ6PluginKind` 声明类别、基于 `HookAPI` 交互）；
@@ -52,10 +55,8 @@
 | 模块 | 角色 |
 |---|---|
 | `CivilizationVI.exe` | 游戏本体；Loader 的钩子目标（LoadDLL / UnloadDLL / LoadUI…） |
-| `version.dll` | **Loader 本体**（就是 `Civ6DllLoader.runtime.dll` 的副本，被放进 exe 目录）：exe 静态导入它，
-|  |  同时它把系统 `version.dll` 的导出逐条转发出去，所以系统版本查询行为不变 |
-| `GameCore_XP2_Shell_FinalRelease.dll` | **首次使用该类 Mod 时的 Loader 安装器**（零 hook、不启动 runtime）：
-|  |  只有 Loader 缺席时才会被引擎加载；Loader 在位时它不进进程（见下） |
+| `version.dll` | **Loader 本体**（就是 `Civ6DllLoader.runtime.dll` 的副本，被放进 exe 目录）：exe 静态导入它，同时它把系统 `version.dll` 的导出逐条转发出去，所以系统版本查询行为不变 |
+| `GameCore_XP2_Shell_FinalRelease.dll` | **首次使用该类 Mod 时的 Loader 安装器**（零 hook、不启动 runtime）：只有 Loader 缺席时才会被引擎加载；Loader 在位时它不进进程（见下） |
 | `GameCore_XP2_FinalRelease.dll` | 游戏的对局逻辑（"短命域"，每次进对局都换） |
 | `Localization_FinalRelease.dll` / `HavokScript_FinalRelease.dll` | 本地化 / Lua VM（常驻，按导出名解析） |
 
@@ -84,9 +85,9 @@
 | `DllLoader/ShellBootstrap.cpp` | 薄壳侧的补装（首次安装；运行时自更新在 `LoaderUpdate.cpp`） |
 | `tools/symdb.py` | 符号库流水线（唯一入口，含 AOB 生成/核对） |
 
-> 读源码的顺序建议：`HookLoaderApi.cpp`（看 ABI 表的 77 个指针各归谁）→ `PluginRegistry.cpp`（生命周期）
-> → `HookEngine.cpp`（挂钩）→ `ScriptBridge.cpp`（脚本面）。各模块的归属状态与门面见
-> `docs/REFACTOR_PLAN.md` §3/§5。
+> 读源码的顺序建议：`HookLoaderApi.cpp`（看 ABI 表的 80 个指针各归谁）→ `PluginRegistry.cpp`（生命周期）
+> → `HookEngine.cpp`（挂钩）→ `ScriptBridge.cpp`（脚本面）。各模块的归属状态与门面直接看各头文件
+> 顶部注释（原 `docs/REFACTOR_PLAN.md` 已并入本文，不再单独存在）。
 
 ---
 
@@ -177,26 +178,27 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 
 ### 1.4 一次性启动线程（阶段 A）
 
-`RuntimeEntry.cpp` 的 DllMain 通过休眠检测后建一个**一次性**线程（`WorkerMain`），步骤是固定的
-（下文编号与 `WorkerMain` 里的注释编号一一对应：1 / 1.2 / 1.5 / 2 / 2.5 / 3 / 4）：
+`RuntimeEntry.cpp` 的 DllMain 通过休眠检测后建一个**一次性**线程（`WorkerMain`），7 个步骤如下。
+**编号与 `WorkerMain` 里的注释一一对应**（代码里写的是 `1) / 1.2) / 1.5) / 2) / 2.5) / 3) / 4)` ——
+带小数的是后补插入的步骤，所以不连续，这是历史顺序的痕迹，不是笔误）：
 
-1. `LoaderCore::InitEarly()`：`Logger::Init` + `VerifyHookApiTableProtection`（HookAPI 表必须落在只读页）
+**1)** `LoaderCore::InitEarly()`：`Logger::Init` + `VerifyHookApiTableProtection`（HookAPI 表必须落在只读页）
    + `PdataMatch::Init`（加载 sidecar）+ **为当前 exe 变体建档** + `Runtime::InitMinHook`。
    建档这一步（`RuntimeEntry.cpp` 的 `IdentifyExecutable()` 分支）容易被漏掉：`PdataMatch::Init` 成功
    只是让 sidecar 可用，还要为**当前进程实际是 DX11 还是 DX12** 建一份 exe 符号表，供插件按旧 exe
    RVA 作跨版本矫正。缺模块或建档失败一律 fail-closed：该映像的 `ResolveByRva`/`ResolveByName`
    返回 `nullptr`，**不回退原 RVA**（原 RVA 在更新后本就是错的），所以这两种情况都会留醒目日志；
-2. `hks::InitHavokScript()` + `Localization::InitScript()`：两个**进程级静态导入**解析一次
+**1.2)** `hks::InitHavokScript()` + `Localization::InitScript()`：两个**进程级静态导入**解析一次
    （缺失只降级各自的 API，不影响插件加载；为什么放这一阶段见 §1.5）；
-3. `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
-4. `LoaderHooks::InstallAll()`：exe 域钩子。**两个都是必需项**：`LoadDLL` 或 `UnloadDLL` 任一
+**1.5)** `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
+**2)** `LoaderHooks::InstallAll()`：exe 域钩子。**两个都是必需项**：`LoadDLL` 或 `UnloadDLL` 任一
    校验失败都会把本次已建的钩子全部回滚。`UnloadDLL` 必需是因为插件模块的释放时机挂在它上面
    （§2.4）——只装加载钩的话 GameCore 插件永远等不到释放点。
    两个 `MH_CreateHook` 都成功、且引擎模块槽取址可用之后，才用一次
    `MH_QueueEnableHook ×2 + MH_ApplyQueued` 同时启用：避免出现"只有加载钩生效"的窗口。
-5. `UiInject::Install()`：主菜单 UI 注入钩，失败静默降级；
-6. `LoaderUpdate::CheckAndApplyUpdate()`：runtime 级自更新检查（薄壳之外的第二道）；
-7. `LoaderCore::LoadPluginsOf(PluginCategory::Global)`：扫描并加载 **Global 插件**。
+**2.5)** `UiInject::Install()`：主菜单 UI 注入钩，失败静默降级；
+**3)** `LoaderUpdate::CheckAndApplyUpdate()`：runtime 级自更新检查（薄壳之外的第二道）；
+**4)** `LoaderCore::LoadPluginsOf(PluginCategory::Global)`：扫描并加载 **Global 插件**。
 
 这条线程**不常驻**：没有事件循环、没有 reconcile（见 §3.3）。此后一切都在游戏线程上由 detour 驱动。
 
@@ -452,7 +454,8 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
    `inFlight` = **本次加载代**的 `PluginInFlight::Owner*`），
    `SetPluginState(Loading)`（同步放行镜像）并 push 进 `g_plugins`。
    **顺序不能反**：`SetPluginState` 要写 `entry.inFlight` 的放行镜像，先置状态会让它作用在 `nullptr` 上
-   而静默失效；`inFlight` 必须由 `BeginLifetime` 新建（不是 `Resolve`），否则代际隔离失效（§6.1）；7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadSafe`（SEH 包住）→ 清上下文 → 重新拿锁；
+   而静默失效；`inFlight` 必须由 `BeginLifetime` 新建（不是 `Resolve`），否则代际隔离失效（§6.1）；
+7. `SetActivePluginContext(ownerId, handle)` → 放锁 → `CallOnLoadSafe`（SEH 包住）→ 清上下文 → 重新拿锁；
 8. 初始化失败 → `QuarantinePluginByOwner`（§3.3）+ **模块释放策略**（§3.3 末），返回 false。
    两条来源走同一条回滚链，只是日志分开：**崩溃**（执行中异常）与 **`OnLoad` 返回 0**（插件
    明确拒绝）。失败时**不注册 `OnMessage`、不进 `Active`**，条目以 `Quarantined` 留在 `g_plugins`
@@ -521,7 +524,7 @@ GameCore（每局真卸载 + 只能动 GameCore 映像）。
 读成 `structSize`，`1 < sizeof(HookContext)` 直接判否；反向亦然。两个方向都在调用任何函数
 指针之前退出。
 
-**Loader 侧的 `g_hookApi`** 是 `const HookAPI`（`.rdata`，只读），77 项位置初始化，
+**Loader 侧的 `g_hookApi`** 是 `const HookAPI`（`.rdata`，只读），80 项位置初始化，
 供 Loader 内部使用并作为 `Query` 的地址来源。它的形状由两条 `static_assert` 钉死
 （`sizeof(HookAPI)` 与末尾成员偏移必须与 `CIV6_HOOK_API_ENTRY_COUNT` 吻合），
 启动时 `VerifyHookApiTableProtection` 再扫一遍空项（聚合初始化漏写一项只会静默零填，
@@ -574,6 +577,10 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 80 个入口，按"谁能用、受什么限制"分四类。清单在 `common/HookAPI.h` 的 `HOOK_API_LIST`，
 结构体与计数都由它生成。
 
+> 数量核对：**9**（按目标地址域设门的取址/改字节入口）+ **7**（GameCore 专属）
+> + **45**（Lua 原语）+ **18**（其它，其中 `RegisterGlobalScript` 仅 Global 可见）= **80**。
+> 这 80 个里有 1 个（`RegisterGlobalScript`）只在 §4.4 内部单独标注可见性，不另立一类。
+
 ### 4.1 双域通用，但按"目标地址域"设门（9 个）
 
 | 入口 | 门 |
@@ -615,8 +622,14 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 
 ### 4.3 Lua 原语（45 个）——不是 GameCore 专属
 
-全部是 `HavokScript_FinalRelease.dll` 导出的薄封装（`HavokScript.cpp` 里由一张导入表 + 宏批量登记，
-加 `checkplayerid` + 极端情况下的原始栈兜底）。入口本身**与 GameCore 无关**：作用对象是**调用方传进来的**
+绝大多数是 `HavokScript_FinalRelease.dll` 导出的薄封装（`HavokScript.cpp` 里由一张导入表 + 宏批量登记，
+加 `checkplayerid`）。**例外是 `LuaPushBoolean`**：该 DLL 不导出 `pushboolean` / `hksi_lua_pushboolean` /
+`lua_pushboolean` 中的任何一个（导出表实证），只能走裸栈写入 —— 按 `lua_State::top` 的硬编码偏移
+`kLuaStateTopSlotOffset = 0x48` 直接构造 TValue 并推进栈顶（见 `HavokScript.cpp` 的注释）。
+这是整个 ABI 里**唯一的 `lua_State` 结构体布局依赖**，换游戏版本必须重验；写入前有可写探测，
+只能挡住「写不进去」，挡不住「偏移变了仍写到别处可写内存」。
+
+入口本身**与 GameCore 无关**：作用对象是**调用方传进来的**
 `lua_State*`，所以两类插件都开放。导入在**阶段 A** 解析一次（该 DLL 是 exe 静态导入、常驻）；
 缺失时逐个入口降级为安全默认值 + 限次日志，**不影响插件加载**。
 
@@ -624,7 +637,7 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 `LuaNext` 完整实现了 Lua 5.1 `lua_next` 的栈契约（首轮压 nil、每轮自己弹 value、遍历完 key 被弹走）。
 它让插件侧的 C++ 能直接遍历哈希表，不必再借一段 Lua 代码往返。
 
-### 4.4 其它（19 个，其中 1 个仅 Global）
+### 4.4 其它（18 个，其中 `RegisterGlobalScript` 仅 Global 可见）
 
 - 消息：`BroadcastMessage` / `RegisterMessageHandler` / `SendMessageTo`（§6.2）；
 - `Log`、映像元数据 `IsImageLoaded` / `GetImageInfo`；
@@ -690,9 +703,17 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 `CaptureDispatch`（及其内部调用，例如日志里的 `vsnprintf`）覆盖后的垃圾值——实测中目标函数
 直接算出 0 而不是期望结果。
 
-只存 xmm0-3 而不是 xmm0-5：前四个浮点参数只会落在这四个寄存器；xmm4/xmm5 不是参数寄存器，
-被 hook 的函数入口本来就不该依赖它们的值。**若将来支持函数中部 hook，需要另行扩大保护范围**——
-那时 xmm0-15 都可能处于活跃状态。
+只存 xmm0-3 而不是 xmm0-15：这四格是**前四个浮点参数的传入位置**，也是 stub 唯一必须替被 hook
+函数保住的东西——前提是 hook 点位于**函数入口**。
+
+> ⚠️ **这个前提目前没有被强制**。`RegisterGlobalCapture` 只校验 provider 地址落在可执行页
+> （`IsTargetOpenToCaller` + 页属性探测），**不要求它是函数入口**；而上文刚说过「hook 点可以落在
+> 函数中部」正是 `r11` 必须保存的理由。两件事合起来意味着：**若 provider 落在函数中部，
+> xmm4-15 可能处于活跃状态，而慢路径只保了 xmm0-3**。
+>
+> 当前所有已知调用方传的都是 `ResolveByName` / `ResolveByRva` 得到的函数入口地址，所以实际不会踩；
+> 但这是**约定**而非**校验**。要么在文档/头文件里把「provider 必须是函数入口」写成硬契约，
+> 要么在 `RegisterGlobalCaptureImpl` 里加校验，要么把保存范围扩到 xmm0-15（8 条 movaps 变 32 条）。
 
 代价可忽略：8 条 `movaps`（4 存 4 取），实测（100 万次 × 8 轮，`rdtscp` 计时）相对基线
 **−0.004 cycles/iter**，被乱序执行完全吸收；相比之下慢路径本来就有 `lock_guard` 原子操作与
@@ -860,8 +881,9 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 
 ### 6.1 PluginInFlight（在途登记与排空）
 
-`PluginInFlight::Owner`：owner 的放行镜像 + 在途计数 + 每类计数；`SetAllowed` 是镜像的**唯一写者**
-（只由 `SetPluginState` 调用）。守卫入口用 `Enter(owner, kind)`（先增量再检查、失败回退）与
+`PluginInFlight::Owner`：owner 的放行镜像 + 在途计数 + 每类计数。放行镜像只有 `SetAllowed` 一个写入口，
+而 `SetAllowed` 有**两个**调用方：`SetPluginState`（置 `Loading`/`Active` 时放行，其余状态关闭）与
+`BeginLifetime`（新代建立时把上一代关掉，见下）。守卫入口用 `Enter(owner, kind)`（先增量再检查、失败回退）与
 `ReleaseCount`；卸载/隔离用 `WaitAll(owner, name)`：谓词是「本 owner 的在途计数 ≤ 本线程自己的深度」，
 5 秒未满足就限次记日志但**继续等**（不放弃）。
 
@@ -879,12 +901,22 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 - 每次加载**新建一个 `Owner`**，把它设为当前代，并置 `allowed = false`；
 - 上一代**置 `allowed = false` 但绝不删除、也绝不重新放行**——锁外的快照（消息总线的 handler 快照、
   脚本注册表的快照）可能还握着那个指针，删了是 UAF，重新放行等于让上一代的回调又进来；
-- `PluginEntry::inFlight` 存的是**本代**那个指针，`SetPluginState` / `WaitAll` 都用它，不再按
-  ownerId 反查（反查会拿到当前代，从而失去代际隔离）；
+- `PluginEntry::inFlight` 存的是**本代**那个指针，`SetPluginState` 用它。
+  ⚠️ **但三个排空点（`QuarantinePluginByOwner` / `UnloadPluginByOwnerId` /
+  `Civ6MessageBus::UnregisterOwner`）目前仍走 `Resolve(ownerId)`**，取到的是「当前代」而不是「本代」——
+  与本节的设计意图相反。当前靠「插件加载只在游戏线程串行」掩盖，属已知缺陷（§9.1 #4）；
+  修法：把 `PluginEntry::inFlight` 一路传下去（`HandlerEntry` 里已经存了 inFlight）；
 - `Owner*` 本身终身稳定，`Owner` 对象不回收。旧代的计数自然归零，但没人再等它。
 
-`SetAllowed`、`WaitAll` 的谓词、`Enter` 的加计数，三处的内存序统一为 `seq_cst`：这三者必须处在
-同一个全序里，否则卸载方与回调方可能各读到旧值，形成"卸载方以为排空了、回调方以为门还开着"的窗口。
+内存序不是「全部 seq_cst」，而是按职责分三档：
+
+- `allowed` 的写（`SetAllowed`）、`WaitAll` 谓词里的 `activeCalls` 读、`Enter` 里的 `activeCalls`
+  自增与 `allowed` 读，这**四处**是 `seq_cst` —— 它们必须处在同一个全序里，否则卸载方与回调方
+  可能各读到旧值，形成「卸载方以为排空了、回调方以为门还开着」的窗口；
+- `ReleaseCount` 里 `activeCalls` 的 `fetch_sub` 是 `acq_rel`（要看到此前所有回调的写入）；
+- 每类计数 `byKind[*]` 只供 `Describe()` 的诊断日志使用，全部 `relaxed`，不承载同步语义。
+
+改这里的原子序之前先读 `PluginInFlight.cpp` 顶部关于「唯一的 decrement 出口」的注释。
 
 ### 6.2 消息总线（`Civ6MessageBus`）
 
@@ -1064,7 +1096,7 @@ detour 在**原函数之前**跑插件回调，跑完把该 thread 的 Lua 栈�
    把文件命名成 `FrontEndUI_<任意>.xml` 放进 Mod 目录任意层级即可。base name 取该文件相对
    Mod 根的 VFS 路径（分隔符统一 `/`、去掉 `.xml`），正是 `Initialize` 要的形参。递归遍历默认
    不跟随目录符号链接，另加 8 层深度上限，避免异常目录拖慢主菜单线程；启用与否只认
-   `Mods.sqlite` 返回的精确 mod root（§4.6），未启用的 Mod 不会被扫到；
+   `Mods.sqlite` 返回的精确 mod root（§3.1），未启用的 Mod 不会被扫到；
 5. **刷新与回收**：`g_frontEndContext` 变化（换了 FrontEnd）时重建；同一个 FrontEnd 收到
    `g_refreshRequested`（上次注入失败）时先用 exe 导出的 `DestroyChild` 销毁 loader 自己的根
    context 再重建。销毁失败或子 context 注入失败时，指针登记在 `g_rootContext` / `outAllocated`
@@ -1284,6 +1316,11 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | 1 | teardown 窗口在取不到映像信息时被清成空 | `ResetForReload`（`LoaderCore::Teardown::SetWindow(0, 0)` 分支） | 当 `base == 0` 时保护判定直接返回 false，等于在最不确定时关掉了保护门；而 `HookEngine.cpp` 的 `RemoveGameCoreDomainSiteRecords` 在同样情形下**刻意不清**（只在 `GetInfo` 成功时才 `SetWindow`），两者矛盾 |
 | 2 | 状态码 `3`（预留 Frontend）与若干空槽 | `common/HookAPI.h` | 属于未实现功能，不应长期保留在核心 ABI 枚举定义中 |
 | 3 | `ShouldSkipPluginFile` 用文件名黑名单而非白名单 | `common/ModScan.cpp` | 存在隐患：若官方将来在目录下新增 DLL，可能会被误当成第三方插件加载 |
+| 4 | 排空等的是「当前代」而非「本代」的 `PluginInFlight::Owner` | `PluginRegistry.cpp` 的 `QuarantinePluginByOwner` / `UnloadPluginByOwnerId`、`Civ6MessageBus.cpp` 的 `UnregisterOwner` | 三处都走 `Resolve(ownerId)`，与 `PluginEntry::inFlight` 的按代设计相反（§6.1）。并发加载同一 ownerId 时旧代在途回调等不到排空 → 旧代模块被 release → UAF。当前靠「加载只在游戏线程串行」掩盖 |
+| 5 | **GameCore 插件 detour 没有在途计数** | `PluginInFlight.h`（自述不覆盖 detour）、`HookEngine.cpp` 的 `WaitForDetourDrain` | 排空只等 Loader 自己的 5 个共享 detour。还原入口字节只排除**新**调用，不排除**在途**调用；此后 `FreeLibrary` 可能卸在仍在插件 detour 里的线程上。Global 用「驻留不卸」规避，GameCore 没有补偿（§9 表 #4 说的是同一类风险） |
+| 6 | `PdataMatch` 在「头身份一致但 pdata 指纹不同」时仍判恒等 | `PdataMatch.cpp` 的 `BuildNewTableImpl` | 检测到不一致后只打日志，仍置 `identical = true`；`CorrectRvaLocked` 会因此直接返回旧 RVA、跳过一切映射校验（fail-open）。应改走 `AlignTables`，零匹配则让 `BuildNewTable` 返回 false |
+| 7 | GameCore 插件模块的释放队列只有一个出口且被条件卡住 | `LoaderHooks.cpp` 的 `UnloadDllDetour` | 只有确认引擎把 hModule 槽清零才清窗口 + 冲刷队列 + 复位 `g_unloadIncomplete`，**没有 else 分支**。一旦该条件不成立：模块滞留泄漏、teardown 窗口永不清理（`Patch` 对旧区间恒拒绝）、`g_unloadIncomplete` 恒真使整个会话不再加载任何 GameCore 插件 |
+| 8 | `HookEngine` 的 `recordStale` 分支不清 capture 字段 | `HookEngine.cpp` 的 `RemoveGameCoreDomainSiteRecords` | 成功分支清了 `hasCapture`/`retiring`/`captureOuts`，失败分支只拔 detour 槽。此时入口仍跳本站 stub、`hasCapture` 仍为 true，`captureOuts` 指向的插件内存可能已释放 → 写侧 UAF |
 
 ---
 
@@ -1341,8 +1378,10 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 #### 加一个插件类别
 
-1. `common/HookAPI.h` 的 `CIV6_PLUGIN_KIND_VALUE` 加值（3 起是保留位）+ 头文件里的
-   `CIV6_PLUGIN_KIND_VALUE` 取值分支（新宏 → 新 kind）；
+1. `common/HookAPI.h`：`CIV6_PLUGIN_KIND_VALUE` 不是手填的常量，而是**由插件宏派生**的
+   （`#if defined(CIV6_PLUGIN_GLOBAL) -> 1u / #elif defined(CIV6_PLUGIN_GAMECORE) -> 2u`）。
+   所以加一个新类别 = 加一个新的 `CIV6_PLUGIN_<X>` 宏 + 一条 `#elif` 分支取值（3 起是保留位，
+   头注释里 3 已预留给未来的 Frontend）；文件尾部还有一处 `#ifndef` 兜底块要同步；
 2. 加载期映射：`KindToCategory` + `CategoryForPath` 的目录名判断（都在 `PluginRegistry.cpp`）；
 3. 域规则：`IsTargetOpenToCaller` 里加一条"该类别能碰哪块内存"的**正向**规则；
 4. teardown 策略：想清楚它的模块什么时候能 `FreeLibrary`（现在只有 GameCore 类别会排队释放）。
