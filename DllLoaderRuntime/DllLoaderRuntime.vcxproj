@@ -122,6 +122,7 @@
     <ClInclude Include="PluginBoundary.h" />
     <ClInclude Include="PluginInFlight.h" />
     <ClInclude Include="UiInject.h" />
+    <ClInclude Include="ConfigIni.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
@@ -134,6 +135,7 @@
     <ClCompile Include="PluginBoundary.cpp" />
     <ClCompile Include="PluginInFlight.cpp" />
     <ClCompile Include="UiInject.cpp" />
+    <ClCompile Include="ConfigIni.cpp" />
     <ClCompile Include="..\common\ModScan.cpp" />
     <ClCompile Include="..\common\PluginVersion.cpp">
     	<PrecompiledHeader>NotUsing</PrecompiledHeader>

@@ -4,6 +4,7 @@
 // Civ6DLLHookLoaderAPI.cpp（插件生命周期）、LoaderHooks.cpp（exe 域 hook 与阶段 B 编排）。
 #include <string>
 #include <mutex>
+#include <vector>
 
 #include "../common/HookAPI.h"
 
@@ -65,6 +66,10 @@ void* ResolveExeTarget(const HookInfoExe& info, size_t span = 1);
 
 // 扫描启用 Mod 并加载/卸载指定类别全部插件。实现于 Civ6DLLHookLoaderAPI.cpp。
 void LoadPluginsOf(PluginCategory cat);
+
+// 同一件事，但用调用方已经扫好的候选列表（不再重扫）。
+// LoadDLL detour 需要先扫一遍来判断"有没有插件"，那份列表在这儿复用。
+void LoadPluginsOf(PluginCategory cat, const std::vector<std::wstring>& candidates);
 void UnloadPluginsOf(PluginCategory cat);
 
 // 仅在 UnloadDLL 原函数返回且确认引擎模块槽从非空变空后调用：真正

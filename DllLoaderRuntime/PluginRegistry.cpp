@@ -685,13 +685,13 @@ static void RemovePluginHooks(const wchar_t* owner) {
 // 归 ScriptBridge 所有，收进门面后脚本全局表、槽位数组、槽位类型都不必外泄。
 //
 // 【日志格式必须逐字保持】：这行在基线日志里出现过，拆分后要逐条比对，
-// 改动措辞或字段顺序都会被判成行为差异。故门面返回全部四个计数。
+// 改动措辞或字段顺序都会被判成行为差异。故门面返回全部三个计数。
 static void RemovePluginOwnedRegistrations(const std::wstring& owner) {
     if (owner.empty()) return;
     lock_guard<std::recursive_mutex> lock(g_pluginLifecycleMutex);
     const ScriptBridge::RemovedCounts n = ScriptBridge::RemovePluginRegistrations(owner);
-    Logger::Log("RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu targetConfigs=%zu",
-        owner.c_str(), n.globals, n.globalsUI, n.luaMethods, n.targetConfigs);
+    Logger::Log("RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu",
+        owner.c_str(), n.globals, n.globalsUI, n.luaMethods);
 }
 
 // ==== QuarantinePluginByOwner ====
@@ -811,8 +811,13 @@ void LoaderCore::LoadPluginsOf(PluginCategory cat) {
     const auto wpaths = (cat == PluginCategory::GameCore)
         ? ModScan::FindGameCorePluginCandidates()
         : ModScan::FindGlobalPluginCandidates();
-    Logger::Log("LoadPluginsOf(%s): %zu candidate(s)", PluginDomain::CategoryNameForLog(cat), wpaths.size());
-    for (const auto& wpath : wpaths) {
+    LoadPluginsOf(cat, wpaths);
+}
+
+// ==== LoadPluginsOf（用调用方扫好的列表）====
+void LoaderCore::LoadPluginsOf(PluginCategory cat, const std::vector<std::wstring>& candidates) {
+    Logger::Log("LoadPluginsOf(%s): %zu candidate(s)", PluginDomain::CategoryNameForLog(cat), candidates.size());
+    for (const auto& wpath : candidates) {
         LoadSinglePlugin(wpath);
     }
 }

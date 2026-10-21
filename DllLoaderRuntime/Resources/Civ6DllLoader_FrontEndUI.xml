@@ -1,3 +1,146 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ContextDefaults Name="AdditionalFrontEndUI" >
-</ContextDefaults>
+<!--@ui-version=1-->
+<!--
+  ===========================================================================
+  Civ6DllLoader_FrontEndUI.xml —— Loader 的主菜单设置面板
+  ===========================================================================
+
+  与同目录 Civ6DllLoader_FrontEndUI.lua 配对。UiInject 在 MainMenuState::LoadUI
+  之后调 LuaContext::Initialize("Civ6DllLoader/Civ6DllLoader_FrontEndUI")，
+  ForgeUI 按 base name 自动加载同目录 .lua。
+
+  关于文本（LOC_ 键 vs 实际文字）：
+    所有面向用户的字符串都写成 LOC_ 键，与游戏本体、Mod 的写法一致。
+    这些键**不在游戏的 LocalizedText 表里** —— Loader 不是 Mod，没有 UpdateDatabase，
+    也不该为了一个设置面板去接管 Database::IDatabaseConnection
+    （Localization_FinalRelease.dll 的导出里没有任何写入接口，见 Localization.h）。
+    真实文本由 Loader 自己的三语表提供：lua 在 OnInit 里调
+    DllLoader.GetText(tag) 再用 SetText 落下去（en_US / zh_Hans_CN / zh_Hant_HK）。
+    xml 里保留 LOC_ 的另一个好处：将来若真接上数据库，这里一行都不用改。
+
+  关于 Offset：Civ6 的偏移是"向内为正"，右上角锚点要往里缩，X / Y 都取正数。
+
+  关于显示层级与输入命中（两件不同的事，别混）：
+
+  1) 画在谁上面 —— 根节点 Layer="Modal"。
+     ContextBase::LoadXML_File 解析 Layer 属性 → m_uiFlags |= 0x10000 并写
+     m_CommandStreamLayer(+0x548)；ContextBase::Render 据此把命令流指针下发给整棵
+     子树。8 条流：0=InGame 1=WorldAnchor 2=Default 3=Tutorial 4=Modal 5=Drag
+     6=Touch 7=Debug，编号大的后提交、盖住先提交的。取 Modal(4) 即盖住主菜单。
+
+  2) 谁收到鼠标 —— 只有进 UIManager 的 popup 队列才算。
+     ForgeUI_UIManager::ProcessPopupInput 是唯一做命中判定的地方，它【只遍历
+     popup 队列】，队列里没有的 context 根本不参与。所以光靠 Layer 只能盖住
+     画面：悬停仍会命中原主菜单，把它自己的 tooltip 弹出来。
+
+     解法在本 .lua 里：**面板打开时**入队、关闭时出队（SetPanelOpen）。
+     不能常驻队列 —— UIManager::QueuePopup 会把"入队前的当前 popup"隐藏掉
+     （清 m_uiFlags 的 0x8 再调它的虚函数 +336(1)），常驻就等于一直按着主菜单。
+
+     顺带说明为什么 Consume* 挡不住 tooltip：
+     ControlBase::DoConsumeMouse 只处理 InputStruct 消息（0x08 按键 / 0x10 滚轮 /
+     0x20 其他），而 tooltip 走 ControlBase::StartRaisingToolTip →
+     ToolTipManager::RequestToolTip，那条链只看控件自身的 m_uiFlags & 0x40，
+     与 Consume 无关。
+-->
+<Context Name="AdditionalFrontEndUI" Layer="Modal" Size="parent,parent"
+         ColorSet="Beige_Black" Style="FontNormal18" FontStyle="Shadow">
+
+    <!-- ============ 右上角入口按钮 ============ -->
+    <Button ID="LoaderOpenButton" Anchor="R,T" Offset="10,10" Size="40,40"
+            ToolTip="LOC_CIV6DLLLOADER_OPEN_TOOLTIP">
+        <Image ID="LoaderOpenIcon" Anchor="C,C" Size="32,32"
+               Texture="CityPanel_ActionProduction" />
+    </Button>
+
+    <!-- ============ 设置面板（初始隐藏） ============ -->
+    <Container ID="LoaderPanelRoot" Anchor="C,C" Size="parent,parent" Hidden="1"
+               ConsumeAllMouse="1">
+
+        <!-- 整个窗口压暗，同时吃掉鼠标不让它穿透到主菜单。
+             必须用 ConsumeAllMouse="1"：细分属性（ConsumeMouseButton /
+             ConsumeMouseOver）挡不住 tooltip —— 本体遮罩也一律用它
+             （MapPinListPanel.xml:5、NaturalWonderPopup.xml:52）。
+             Box 不是按钮、不挂点击回调；关面板走右上角 X 或 ESC。 -->
+        <Box ID="LoaderPanelBackdrop" Anchor="C,C" Size="parent,parent" Color="0,0,0,170"
+             ConsumeAllMouse="1" />
+
+        <!-- 820x420：标题条 0..53、分隔线 52/54，内容从 80 起。
+             字号：标题 FontFlair30、复选框 FontSize=20、说明 FontNormal20、
+             警告 FontNormal18 暗红。说明与警告都比初版大两档，因为这是玩家
+             真正需要读进去的"什么时候生效 / 关掉会有什么代价"。
+             布局不用 Stack（Stack 横向永远左对齐，说明文字要居中）。 -->
+        <Grid ID="LoaderPanelFrame" Anchor="C,C" Size="780,400" Padding="0,0"
+              Style="WindowFrameTitle" ConsumeAllMouse="1">
+
+            <Button ID="LoaderPanelClose" Anchor="R,T" Offset="0,0"
+                    Style="CloseButtonSmall" />
+
+            <!-- 标题：FontFlair26 → FontFlair30，字重和字号都提一档 -->
+            <Label ID="LoaderPanelTitle" Anchor="C,T" Offset="0,12"
+                   Style="FontFlair30" FontStyle="Shadow" ColorSet="ResGoldLabelCS"
+                   String="LOC_CIV6DLLLOADER_TITLE" />
+
+            <!-- 标题条下沿：一条 2px 的亮线 + 一条 1px 的暗影，做出分隔感 -->
+            <Box ID="LoaderPanelDivider" Anchor="C,T" Offset="0,52" Size="620,2"
+                 Color="122,176,232,235" />
+            <Box ID="LoaderPanelDividerShadow" Anchor="C,T" Offset="0,54" Size="620,1"
+                 Color="0,0,0,170" />
+
+            <!-- 不用 Stack：Stack 只纵向排布、横向总是左对齐，而说明文字要居中。
+                 改成 Anchor="C,T" + 固定 Offset 直接挂在 Grid 上 —— 锚点是控件
+                 中心的 C，父容器中心对齐，这才是真正的居中。
+                 间距自己算：复选框 A 80..112、B 132..164、说明 186/216、
+                 警告 258/288（折两行时到约 336），底部留 84。面板加宽到 820
+                 是为了让这两条较长的警告尽量单行，折行点落在句中会很难读。 -->
+
+            <!-- 复选框：高度必须保持 24 —— CheckBoxControl 是九宫格贴图
+                 （SliceTextureSize="45,24"、SliceCorner="10,12"、StateOffsetIncrement="0,24"），
+                 高度一旦超过 24，中间那段会被纵向拉伸，右侧的勾就被抻成了 U 形。
+                 字放大只改 FontSize，不动 Size 的高度。 -->
+            <GridButton ID="LoaderEnableGlobal" Style="CheckBoxControl" Anchor="C,T" Offset="0,84"
+                        Size="620,24" States="8" FontSize="20"
+                        TextOffset="-8,0"
+                        String="LOC_CIV6DLLLOADER_ENABLE_GLOBAL" />
+
+            <GridButton ID="LoaderEnableGameCore" Style="CheckBoxControl" Anchor="C,T" Offset="0,128"
+                        Size="620,24" States="8" FontSize="20"
+                        TextOffset="-8,0"
+                        String="LOC_CIV6DLLLOADER_ENABLE_GAMECORE" />
+
+            <!-- 说明文字：FontNormal20，深蓝字 + 白色描边。
+                 对齐用 Align="Center"：按 ForgeUI 的 TextControl 文档，Align 就是
+                 "文本行的对齐方式"，基准是**最长那一行**的宽度（折行的段落）或父控件
+                 宽度。所以折行后每一行都会居中，不需要把句子拆开。
+                 反过来，TextControl 的注释明确写了 "its size will automatically be
+                 calculated to the bounds of the text string, and should not be set
+                 manually" —— 一旦手动给 Size，宽度就固定在那个值上，Align 的参照
+                 变成那个死宽度，文字反而按左边缘起排（这是之前试 Size 越试越歪的原因）。
+                 结论：只给 WrapWidth 定义折行宽度，不给 Size。 -->
+            <Label ID="LoaderPanelHintGlobal" Style="FontNormal20" FontStyle="Stroke"
+                   Anchor="C,T" Offset="0,172" WrapWidth="700" Align="Center"
+                   Color="28,48,72,255" EffectColor="255,255,255,180"
+                   String="LOC_CIV6DLLLOADER_HINT_GLOBAL" />
+
+            <Label ID="LoaderPanelHintGameCore" Style="FontNormal20" FontStyle="Stroke"
+                   Anchor="C,T" Offset="0,202" WrapWidth="700" Align="Center"
+                   Color="28,48,72,255" EffectColor="255,255,255,180"
+                   String="LOC_CIV6DLLLOADER_HINT_GAMECORE" />
+
+            <!-- 两条警告：暗红字，和上面"什么时候生效"分开。
+                 第二条会折成两行，行距按两行算（272 → 到约 320）。 -->
+            <Label ID="LoaderPanelWarnDisable" Style="FontNormal18" FontStyle="Stroke"
+                   Anchor="C,T" Offset="0,244" WrapWidth="700" Align="Center"
+                   Color="128,32,32,255" EffectColor="255,255,255,160"
+                   String="LOC_CIV6DLLLOADER_WARN_DISABLE" />
+
+            <Label ID="LoaderPanelWarnGameCore" Style="FontNormal18" FontStyle="Stroke"
+                   Anchor="C,T" Offset="0,272" WrapWidth="700" Align="Center"
+                   Color="128,32,32,255" EffectColor="255,255,255,160"
+                   String="LOC_CIV6DLLLOADER_WARN_GAMECORE" />
+
+        </Grid>
+
+    </Container>
+
+</Context>

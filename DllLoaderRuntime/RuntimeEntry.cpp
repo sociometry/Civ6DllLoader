@@ -26,6 +26,8 @@
 #include "PdataMatch.h"
 #include "ImageAddress.h"
 #include "UiInject.h"
+#include "ConfigIni.h"
+#include "ScriptBridge.h"
 #include "HavokScript.h"
 #include "Localization.h"
 
@@ -124,6 +126,10 @@ DWORD WINAPI WorkerMain(LPVOID) {
     // 1.5) 释放内嵌 FrontEnd UI 资源到 exe 目录的 Civ6DllLoader 子目录
     UiInject::ExtractResources();
 
+    // 1.6) 开关文件：与 UI 资源同目录。文件缺失时以两个 true 新建。
+    //      必须在第 4 步读 ENABLE_GLOBAL 之前完成。
+    CfgIni::EnsureExists();
+
     // 2) hook 安装（LoadDLL / UnloadDLL；失败静默降级）
     if (!LoaderHooks::InstallAll()) {
         Logger::Log("hook 安装降级");
@@ -137,8 +143,17 @@ DWORD WINAPI WorkerMain(LPVOID) {
     // 3) 自更新检查
     LoaderUpdate::CheckAndApplyUpdate();
 
+    // 3.5) Loader 自身的 Lua 接口（DllLoader 表）。必须在 LoadPluginsOf 之前：
+    //      它对所有 thread 生效，且不依赖是否有插件。
+    ScriptBridge::EnsureLoaderLuaGlobalsInstalled();
+
     // 4) 阶段 A：加载启用 Mod 的 Global 插件（仅此一次；运行期不重查，开关 mod 重启生效）
-    LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::Global);
+    //    ENABLE_GLOBAL=false 只跳过插件加载，Loader 自身的钩子/UI 注入/自更新照常。
+    if (CfgIni::ReadGlobalEnabled()) {
+        LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::Global);
+    } else {
+        Logger::Log("WorkerMain: ENABLE_GLOBAL=false; Global plugins not loaded");
+    }
 
     return 0;
 }

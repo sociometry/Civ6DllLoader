@@ -5,11 +5,6 @@
 #include <vector>
 #include <string>
 
-enum class PushMethodSigType {
-    NoManager,
-    WithManager
-};
-
 struct StoredLuaMethod {
     LuaMethodFunc luaMethodFunc = nullptr;
     std::string internalName;

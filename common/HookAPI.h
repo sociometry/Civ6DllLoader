@@ -151,7 +151,9 @@ enum {
     kHookApiLuaCallInvalidArgument = -2
 };
 
-// RegisterPushMethodsTarget sigType
+// PushLuaMethods sigType：目标 PushMethods 函数的第一个参数形态。
+//   NoManager   = PushMethods(lua_State* L, int stackOffset)
+//   WithManager = PushMethods(void* manager, lua_State* L, int stackOffset)
 enum {
     kHookApiPushNoManager = 0,
     kHookApiPushWithManager = 1
@@ -254,13 +256,18 @@ typedef struct HookContext {
        定位 vtable 地址（版本一致恒等，跨版本走槽位结构匹配），读 [vtable + index*8] 的 \
        槽函数指针并返回。index 超出 vtable 槽位数时打日志并返回 nullptr。 */ \
     X(ResolveByVTable, void*, (HookImageId image, const char* vtableSymbol, uint32_t index), kCommon) \
-    /* Failed：本次没有安装任何方法（GameCore 未就绪、符号解析失败，或与同一 target 上 \
+    /* 给引擎已有的 C++ Lua 对象挂方法。pushMethodsSymbol 是【完整符号名】， \
+       如 "GameCore::Lua::IUnit::PushMethods"——不做任何推导，原样交给符号解析， \
+       因此目标不叫 "::PushMethods" 时也能挂。 \
+       sigType 说明该 PushMethods 的签名形态（kHookApiPushNoManager / kHookApiPushWithManager）， \
+       必须与该符号的实际签名一致——选错不会报错，但参数会整体错位。 \
+       Failed：本次没有安装任何方法（GameCore 未就绪、符号解析失败，或与同一 target 上 \
        的既有定义冲突）；Installed：本次已安装。 \
        同 owner + target + exposedName 的相同定义重复调用幂等；同 target 的同名 \
        不同定义（包括不同 owner）整批拒绝。函数和 internalName/exposedName 均须非空。 \
        参数由 Loader 复制。原 PushMethods 由 Loader 自动调用，本接口不再返回其 \
        trampoline；预发布插件须按当前头文件重新编译。 */ \
-    X(PushLuaMethods, HookApiPushMethodsResult, (const char* name, const LuaMethodInfo* methods, uint32_t count), kGameCore) \
+    X(PushLuaMethods, HookApiPushMethodsResult, (const char* pushMethodsSymbol, int sigType, const LuaMethodInfo* methods, uint32_t count), kGameCore) \
     /* 注册 GameCore 的 gameplay 脚本环境里的全局：fn 在 GameCore 调用        GameCore::Lua::Utility::RegisterScriptData 时被顺带执行，参数 L 是那一侧的 lua_State。        每局换局后由引擎重新调用注册入口，Loader 会按当次仍存在的登记重装钩子。        只对 GameCore 类别可见（Global 插件拿不到这个成员）。 */ \
     X(RegisterGameCoreScriptForGamePlay, void, (ScriptGlobalsFn fn), kGameCore) \
     /* 同上，但接进 GameCore 的 UI 脚本环境（GameCore::Lua::Utility::RegisterScriptDataForUI），        lua_State 是 GameCore 侧界面脚本用的那个，与 gameplay 不是同一个。 */ \
@@ -340,11 +347,6 @@ typedef struct HookContext {
     /* 字符串哈希：不再解析 GameCore 符号，改为 Loader 内部实现的原生 CRC32（raw， \
        无最终异或，与官方 GameCore::Utilities::MakeHash 逐位一致）。对局前/重载后都能算。 */ \
     X(MakeHash, uint32_t, (const char* str), kCommon) \
-    /* 注册插件自己的 PushMethods 目标配置。pushMethodsSymbol 为空时使用 name + "::PushMethods"； \
-       非空时该完整符号名用于解析本次安装的目标。 \
-       配置按调用插件 owner 隔离，不能覆盖 Loader 内置目标或其他插件配置；同 owner 重复配置 \
-       必须完全一致。name 指针必须来自调用插件模块。 */ \
-    X(RegisterPushMethodsTarget, int, (const char* name, int sigType, const char* pushMethodsSymbol), kGameCore) \
     /* 原始字节补丁（单层存档，见 patch registry）。两个槽在 Loader 的静态 HookAPI 表 \
        （g_hookApi，编译期常量初始化）里一次性填好，运行期不再改表。 */ \
     X(Patch, bool, (void* target, const void* bytes, size_t len), kCommon) \

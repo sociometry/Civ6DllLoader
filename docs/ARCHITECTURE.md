@@ -265,6 +265,11 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 `LoadDllDetour`：
 
 1. `GetRuleSetName()` 返回空 → 还没进游戏（启动早期加载 Base 等），原样透传；非 `EXPANSION_2` → 透传（只支持 XP2）；
+1.5 **开关与候选门禁（XP2 分支内）**：`config.ini` 的 `ENABLE_GAMECORE=false`，或
+   `ModScan::FindGameCorePluginCandidates()` 扫不到任何候选 → **原样透传引擎给的 Path**，
+   不喂官方 DLL、不初始化阶段 B、不加载插件。这样在本框架没有 GameCore 插件时，
+   引擎仍按自己的规则加载，与不走本框架的其它 GameCore DLL Mod 兼容。
+   候选列表在这时扫出来并缓存，供第 6 步复用（避免一次进对局扫两遍）。
 2. 把入参（Mod 顶替 `GameCores` 后引擎请求的**薄壳**路径）**改写成官方 GameCore 的绝对路径**
    （`OfficialGameCoreRelPath` 给官方相对路径、`BuildOfficialPath` 拼到游戏根下；官方文件不存在才
    透传原路径）。重定向规则：**引擎槽位=官方**，薄壳只在 Loader 缺席、没有这个 detour 时才被加载；
@@ -291,6 +296,48 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
    `ClearGameCoreTeardownWindow()` + `FreePendingPluginModules()`，并清 `g_unloadIncomplete`。
    引擎的空操作或失败不能触发释放：此时 Lua 环境可能还在引用插件映像里的闭包。
    这也是"LoadDLL 返回 0 不算卸载屏障"的另一半——卸载屏障是**槽被清零**，不是函数返回。
+
+### 2.2.1 进程级开关：`Civ6DllLoader\config.ini`
+
+`<exe目录>\Civ6DllLoader\config.ini`（与 FrontEnd UI 资源同目录）：
+
+```ini
+[Loader]
+ENABLE_GLOBAL=true
+ENABLE_GAMECORE=true
+```
+
+| 键 | 生效点 | 影响范围 |
+|---|---|---|
+| `ENABLE_GLOBAL` | 阶段 A 的 `WorkerMain` 第 4 步 | 只决定是否 `LoadPluginsOf(Global)`。Loader 的钩子、UI 注入、自更新**照常执行** |
+| `ENABLE_GAMECORE` | `LoadDllDetour` 的 XP2 分支 | false 时透传原始 Path，不接管加载、不加载 GameCore 插件 |
+
+**两条独立的读取规则，别混淆**：
+
+- **文件不存在** → 新建，两个键都写 `true`（装好即启用）；
+- **文件在但键缺失 / 值非法** → 该键读作 `false`（fail-closed：宁可插件不加载，
+  也不让一个写错的 ini 意外启用功能）。
+
+值只认 `true` / `false`（大小写不敏感）与 `1` / `0`；其它写法记一行日志后按 `false`。
+实现用 `GetPrivateProfileStringW` 而非 `GetPrivateProfileIntW`——后者的整数解析会把
+`true` 读成 0，表达不了布尔。
+
+**生效时机**：这两个键都只影响"接下来那一次"的加载决策。主菜单出现时 Global 已加载完毕，
+改 `ENABLE_GLOBAL` 只能下次启动生效；GameCore 在进对局时才加载，所以主菜单里改它对下一次进局有效。
+运行期**不会**因此卸载已加载的插件。
+
+**Lua 接口**：`DllLoader` 表由 Loader 自身提供（不依赖任何插件），挂在每个 thread 环境上：
+
+```lua
+DllLoader.GetGlobalState()        --> boolean
+DllLoader.SetGlobalState(true)    --> boolean（写盘成功与否）
+DllLoader.GetGameCoreState()      --> boolean
+DllLoader.SetGameCoreState(false) --> boolean
+```
+
+这条通路与插件用的 `RegisterGlobalScript` 分开：后者用 `RequirePluginOwner` 按回调地址
+反查插件模块，而 Loader 自己不是插件、过不了那道校验，故 `ScriptBridge` 另设
+`ExposeLoaderLuaGlobals`，由 `RunGlobalScriptsFor` 在每个 thread 环境先行调用。
 
 ### 2.3 ResetForReload 的完整顺序（每一步的位置都有理由）
 
@@ -610,10 +657,10 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 （`PatchRegistry::OverlapsRegistered`）、装钩前导窗口仲裁（`OverlapsHookPrologue`）、teardown 窗口
 （`TargetInTearingDownGameCore`）。
 
-### 4.2 GameCore 专属（7 个，编译期 + 加载期 + 运行期三层限制）
+### 4.2 GameCore 专属（6 个，编译期 + 加载期 + 运行期三层限制）
 
 `GetPlayer`、`RegisterGameEvent`、`TriggerGameEvent`、`RegisterGameCoreScriptForGamePlay`、
-`RegisterGameCoreScriptForUI`、`PushLuaMethods`、`RegisterPushMethodsTarget`。
+`RegisterGameCoreScriptForUI`、`PushLuaMethods`。
 
 为什么专属：`GetPlayer` 解析 `GameCore::Context::Globals::EditPlayer` 符号（引擎侧的函数名就是
 `EditPlayer`，接口名只表达"取玩家对象"）；其余六个操作
@@ -993,14 +1040,17 @@ detour 在**原函数之前**跑插件回调，跑完把该 thread 的 Lua 栈�
 
 ### 6.4 PushLuaMethods
 
-`RegisterPushMethodsTarget(name, sigType, symbol)` + `PushLuaMethods(name, methods[], count)`
-（都是 GameCore 专属）：把目标名解析成游戏符号（如 `GameCore::Lua::IUnit::PushMethods`）→ 合并/去重/
-冲突预检 → 装到站点（16 个槽位，loader 自己的 detour）→ 游戏调用该目标函数时，detour 把插件的 C 闭包
-按 `exposedName` 写进游戏给的那张表；每个方法推送前走 `PluginInFlight::Enter`。
+`PushLuaMethods(pushMethodsSymbol, sigType, methods[], count)`（GameCore 专属）：第一个参数是
+**完整符号名**（如 `GameCore::Lua::IUnit::PushMethods`），原样交给符号解析、不做任何拼接 →
+解析地址 → 合并/去重/冲突预检 → 装到站点（16 个槽位，loader 自己的 detour）→ 游戏调用该目标函数时，
+detour 把插件的 C 闭包按 `exposedName` 写进游戏给的那张表；每个方法推送前走 `PluginInFlight::Enter`。
+
+`sigType`（`kHookApiPushNoManager` / `kHookApiPushWithManager`）指定该 PushMethods 的签名形态，
+决定走 `NoManagerDetourTable` 还是 `WithManagerDetourTable`；填错不会有任何报错，但参数会整体错位。
+
 **没有"延迟登记"**：GameCore 未就绪时直接失败。
-**注意两个层次的处理不同**：`PushLuaMethods` 的**方法**确实要插件在新一局自己重新注册；
-但 `RegisterPushMethodsTarget` 登记的**目标配置**（`g_pluginPushTargetConfigs`，按 owner 隔离）
-是**跨 `ResetForReload` 存活**的，只在插件被卸载或隔离时才随 `RemovePluginOwnedRegistrations` 清除。
+**方法要插件每局自己重新注册**：`ResetForTeardown` 会清空全部槽位。
+**符号名由插件负责**：Loader 不推导、不拼接，写错一个字符就是 `resolve failed`。
 
 ### 6.5 GameEvent
 

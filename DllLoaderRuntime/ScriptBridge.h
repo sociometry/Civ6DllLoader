@@ -7,7 +7,7 @@
 //   2. 给 PluginRegistry / HookEngine 用的门面 —— 它们要复位本模块拥有的状态。
 //
 // 归属本模块的私有状态（不导出）：
-//   g_defaultPushTargetConfigs / kLuaSingletonPattern / g_mainLuaStateHit
+//   kLuaSingletonPattern / g_mainLuaStateHit
 //   kGameEventNameMax / kGameEventCurrentGamePattern / g_gameEventContainerHit
 //   kMaxRegisteredGameEvents / g_gameEvents
 //   NoManagerDetourTable / WithManagerDetourTable / SharedDetourActivity
@@ -29,15 +29,13 @@ namespace ScriptBridge {
 // 插件注册项的 owner 级摘除（PluginRegistry 的 RemovePluginOwnedRegistrations 用）。
 // 原实现直接操作本模块 7 个变量；收进这一个函数后它们都不必外泄。
 //
-// 返回四个计数而不是一个总数：调用方的日志格式
-//   "RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu
-//    luaMethods=%zu targetConfigs=%zu"
+// 返回三个计数而不是一个总数：调用方的日志格式
+//   "RemovePluginOwnedRegistrations: owner=%ls globals=%zu globalsUI=%zu luaMethods=%zu"
 // 在基线日志里出现过，拆分后要逐条比对，字段不能合并或改序。
 struct RemovedCounts {
     size_t globals = 0;        // 脚本全局表（RegisterScriptData）
     size_t globalsUI = 0;      // 脚本全局表（ForUI）
     size_t luaMethods = 0;     // PushMethods 槽位里该 owner 的方法数
-    size_t targetConfigs = 0;  // 该 owner 的 PushMethods 目标配置条数
 };
 RemovedCounts RemovePluginRegistrations(const std::wstring& owner);
 
@@ -130,9 +128,8 @@ void* LuaToUserDataImpl(void* L, int index);
 int LuaTypeImpl(void* L, int num);
 void LuaUnrefImpl(void* L, int a, int b);
 uint32_t MakeHashImpl(const char* str);
-HookApiPushMethodsResult PushLuaMethodsImpl( const char* name, const LuaMethodInfo* methods, uint32_t count);
+HookApiPushMethodsResult PushLuaMethodsImpl( const char* pushMethodsSymbol, int sigType, const LuaMethodInfo* methods, uint32_t count);
 bool RegisterGameEventImpl(const char* name, GameEventPushFn pushFn);
-int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pushMethodsSymbol);
 void RegisterGameCoreScriptForUIImpl(ScriptGlobalsFn fn);
 void RegisterGameCoreScriptForGamePlayImpl(ScriptGlobalsFn fn);
 
@@ -142,6 +139,15 @@ void RegisterGlobalScriptImpl(ScriptGlobalsFn fn);
 // 把已登记的全局脚本回调跑在【指定】的 lua_State 上。由 LuaExposureLibrary::Register
 // 的 detour 在每个 thread 环境建好时调用；不按 state 去重，回调需自备幂等。
 void RunGlobalScriptsFor(void* L);
+
+// Loader 自身的 Lua 表（DllLoader.GetGlobalState / SetGlobalState /
+// GetGameCoreState / SetGameCoreState）。由 RunGlobalScriptsFor 在每个 thread 环境上调用，
+// 不依赖插件登记、也不经过 owner 校验。实现在 ScriptBridge.cpp。
+void ExposeLoaderLuaGlobals(void* L);
+
+// 确保上述接口所在的 detour 已安装。阶段 A 的 WorkerMain 调一次：
+// 没装任何插件时也需要它，否则 Lua 侧看不到 DllLoader。
+void EnsureLoaderLuaGlobalsInstalled();
 
 // TriggerGameEventImpl 的 __declspec(noinline) 是【行为的一部分】，不是装饰：
 // 它用 _ReturnAddress() 反查调用方是不是插件。被内联后取到的是 Loader 自身的栈帧，

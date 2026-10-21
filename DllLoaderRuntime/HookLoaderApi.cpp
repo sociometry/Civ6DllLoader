@@ -109,8 +109,6 @@ static const HookAPI g_hookApi = {
     &ScriptBridge::GetPlayerImpl,
     &ScriptBridge::MakeHashImpl,
 
-    &ScriptBridge::RegisterPushMethodsTargetImpl,
-
     &PluginRegistry::HookPatch,
     &PluginRegistry::HookUnpatch,
 

@@ -13,7 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "Civ6DLLHookLoaderAPI.h"   // PushMethodSigType / PushMethods*Func / StoredLuaMethod
+#include "Civ6DLLHookLoaderAPI.h"   // PushMethods*Func / StoredLuaMethod
+#include "ConfigIni.h"
 #include "Civ6MessageBus.h"
 #include "HavokScript.h"
 #include "ImageAddress.h"
@@ -47,21 +48,8 @@ using namespace std;
 
 namespace ScriptBridge {
 
-struct PushTargetConfig {
-    PushMethodSigType signature = PushMethodSigType::NoManager;
-    std::string symbolName;
-};
-
-// Loader 内置目标只读；插件自定义目标保存在自己的 owner 命名空间，
-// 防止一个插件覆盖另一个插件的签名或符号。
-static const unordered_map<string, PushTargetConfig> g_defaultPushTargetConfigs = {
-    {"GameCore::Cache::Lua::IQuestsManager",
-        { PushMethodSigType::WithManager, "GameCore::Cache::Lua::IQuestsManager::PushMethods" }},
-    {"GameCore::Lua::IQuestsManager",
-        { PushMethodSigType::NoManager, "GameCore::Lua::IQuestsManager::PushMethods" }},
-};
-static unordered_map<std::wstring, unordered_map<string, PushTargetConfig>>
-    g_pluginPushTargetConfigs;
+// PushMethods 目标不需要配置表：符号名由插件在 PushLuaMethods 第一个参数里直接给出，
+// 签名形态由第二个参数（sigType）给出。
 
 // Symbol RVAs live in Civ6DllLoader.symdb.bin (see PdataMatch.cpp).
 
@@ -719,8 +707,13 @@ static bool MergeLuaMethods(vector<StoredLuaMethod>& candidate,
 
 // ==== PushLuaMethodsImpl ====
 HookApiPushMethodsResult PushLuaMethodsImpl(
-        const char* name, const LuaMethodInfo* methods, uint32_t count) {
-    if (!name || !*name || !methods || count == 0) return kHookApiPushMethodsFailed;
+        const char* pushMethodsSymbol, int sigType, const LuaMethodInfo* methods, uint32_t count) {
+    if (!pushMethodsSymbol || !*pushMethodsSymbol || !methods || count == 0)
+        return kHookApiPushMethodsFailed;
+    if (sigType != kHookApiPushNoManager && sigType != kHookApiPushWithManager) {
+        Logger::Log("PushLuaMethods: bad sigType %d for %s", sigType, pushMethodsSymbol);
+        return kHookApiPushMethodsFailed;
+    }
     if (count > PluginBoundary::kMaxLuaMethodsPerCall) {
         Logger::Log("PushLuaMethods rejected: count=%u over limit", count);
         return kHookApiPushMethodsFailed;
@@ -729,9 +722,9 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
     // ===== 阶段 1：不持任何 Loader 锁，先把插件内存抄进 Loader 自有存储 =====
     // name、methods 数组、每个 LuaMethodInfo 本身、以及它指向的两个字符串，全都是
     // 插件内存。任何一处是坏地址都在这里失败 —— 此刻没有锁被持有，失败是干净的。
-    std::string targetName;
-    if (!PluginBoundary::CopyCString(name, targetName) || targetName.empty()) {
-        Logger::Log("PushLuaMethods rejected: name pointer unreadable");
+    std::string symbolName;
+    if (!PluginBoundary::CopyCString(pushMethodsSymbol, symbolName) || symbolName.empty()) {
+        Logger::Log("PushLuaMethods rejected: symbol pointer unreadable");
         return kHookApiPushMethodsFailed;
     }
     std::vector<StoredLuaMethod> copies;
@@ -752,7 +745,7 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         copies.push_back(std::move(method));
     }
 
-    // ===== 阶段 2：持锁，此后只碰 copies / targetName（Loader 自有） =====
+    // ===== 阶段 2：持锁，此后只碰 copies / symbolName（Loader 自有） =====
     // owner 校验、候选合并和安装提交共用生命周期锁，停用不能插入中间。
     // owner 探针用插件提供的函数地址（值拷贝；RequirePluginOwner 只做模块归属查询，
     // 不解引用该地址）。
@@ -773,21 +766,6 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
     // 必须在合并之前补齐（否则整批 PushLuaMethods 都会失败）。
     for (auto& method : copies) method.owner = owner->ownerId;
 
-    PushTargetConfig config;
-    const auto ownerConfigs = g_pluginPushTargetConfigs.find(owner->ownerId);
-    if (ownerConfigs != g_pluginPushTargetConfigs.end()) {
-        const auto configured = ownerConfigs->second.find(targetName);
-        if (configured != ownerConfigs->second.end()) config = configured->second;
-    }
-    if (config.symbolName.empty()) {
-        const auto builtIn = g_defaultPushTargetConfigs.find(targetName);
-        if (builtIn != g_defaultPushTargetConfigs.end()) config = builtIn->second;
-    }
-    if (config.symbolName.empty()) {
-        Logger::Log("PushLuaMethods: unknown target %s", targetName.c_str());
-        return kHookApiPushMethodsFailed;
-    }
-
     // 同一批内的去重/冲突预检：整批验证通过后才安装。安装侧（InstallPushMethods*）会再
     // 与槽位上已有的定义合并一次，跨 owner 抢占同一 exposedName 在那里被整批拒绝。
     vector<StoredLuaMethod> batch;
@@ -798,7 +776,7 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
         if (!methodOwner || methodOwner->ownerId != owner->ownerId ||
                 !MergeLuaMethod(batch, copies[i])) {
             Logger::Log("PushLuaMethods rejected: invalid or conflicting method for %s",
-                targetName.c_str());
+                symbolName.c_str());
             return kHookApiPushMethodsFailed;
         }
     }
@@ -807,16 +785,15 @@ HookApiPushMethodsResult PushLuaMethodsImpl(
     // 未就绪时无法延迟安装（Deferred 不再产生），直接失败。
     if (!IsGameCorePhaseReady()) {
         Logger::Log("PushLuaMethods: GameCore not ready; cannot install %s "
-                    "(no deferred registration)", targetName.c_str());
+                    "(no deferred registration)", symbolName.c_str());
         return kHookApiPushMethodsFailed;
     }
-    const std::string& symbolName = config.symbolName;
     void* target = ResolveCurrentGameCoreByName(symbolName.c_str());
     if (!target) {
         Logger::Log("PushLuaMethods: resolve failed: %s", symbolName.c_str());
         return kHookApiPushMethodsFailed;
     }
-    void* base = config.signature == PushMethodSigType::NoManager
+    void* base = sigType == kHookApiPushNoManager
         ? InstallPushMethodsNoManager(target, batch, owner->ownerId)
         : InstallPushMethodsWithManager(target, batch, owner->ownerId);
     if (!base) {
@@ -1107,10 +1084,8 @@ int64_t __fastcall Hook_LuaExposureRegister(void* threadL) {
 // 把 LuaExposureLibrary::Register 挂进统一站点表（与 GameCore 的两个脚本钩同构，目标是 exe 域）。
 // 幂等：站点表本身就是账本，重复调用只是复用同一站点、刷新跳板。
 static void EnsureGlobalScriptHooksInstalled() {
-    {
-        lock_guard<mutex> stateLock(g_scriptStateMutex);
-        if (g_globalScriptGlobals.empty()) return;
-    }
+    // 不因"插件登记表为空"提前返回：Loader 自身的 DllLoader 表也走这条链路，
+    // 在没装任何插件时同样必须挂钩子。
     void* target = LoaderCore::ResolveExeTarget(kExeLuaExposureRegister, 1);
     if (!target) {
         Logger::Log("EnsureGlobalScriptHooksInstalled: LuaExposureLibrary::Register not found");
@@ -1126,6 +1101,75 @@ static void EnsureGlobalScriptHooksInstalled() {
     }
 }
 
+// ==== Loader 自身的 Lua 接口（DllLoader 表）====
+// 与插件用的 RegisterGlobalScript 不同：这条通路不经过 owner 校验（Loader 不是插件），
+// 且不因"没装任何插件"而失效。表挂到每个 thread 环境，与插件全局同时机执行。
+//
+// 四个接口都只读写 config.ini，不触碰当前进程已加载的插件：
+// 主菜单出现时 Global 已加载完毕，改 ini 只能下次启动生效；GameCore 在进对局时才加载，
+// 所以主菜单里改它对本局有效。
+
+namespace {
+
+// 取参数 1 的布尔值；非布尔返回 -1 表示"没给/类型不对"。
+int ReadBoolArg(void* L, const char* fnName) {
+    const int t = LuaTypeImpl(L, 1);
+    if (t != 1 /*LUA_TBOOLEAN*/) {
+        Logger::Log("DllLoader.%s: argument is not boolean (type=%d), ignored", fnName, t);
+        return -1;
+    }
+    return LuaToBooleanImpl(L, 1) ? 1 : 0;
+}
+
+int __fastcall lGetGlobalState(void* L) {
+    LuaPushBooleanImpl(L, CfgIni::ReadGlobalEnabled());
+    return 1;
+}
+
+int __fastcall lGetGameCoreState(void* L) {
+    LuaPushBooleanImpl(L, CfgIni::ReadGameCoreEnabled());
+    return 1;
+}
+
+int __fastcall lSetGlobalState(void* L) {
+    const int v = ReadBoolArg(L, "SetGlobalState");
+    if (v < 0) { LuaPushBooleanImpl(L, false); return 1; }
+    LuaPushBooleanImpl(L, CfgIni::WriteGlobalEnabled(v != 0));
+    return 1;
+}
+
+int __fastcall lSetGameCoreState(void* L) {
+    const int v = ReadBoolArg(L, "SetGameCoreState");
+    if (v < 0) { LuaPushBooleanImpl(L, false); return 1; }
+    LuaPushBooleanImpl(L, CfgIni::WriteGameCoreEnabled(v != 0));
+    return 1;
+}
+
+}  // namespace
+
+void ExposeLoaderLuaGlobals(void* L) {
+    if (!L) return;
+    // 伪索引 kHookApiLuaGlobal：不随压栈漂移，直接写全局表。
+    LuaNewGlobalTableImpl(L, "DllLoader", 0, 4);
+    LuaPushCFunctionFieldImpl(L, -1, "GetGlobalState",
+        reinterpret_cast<void*>(&lGetGlobalState), "lGetGlobalState");
+    LuaPushCFunctionFieldImpl(L, -1, "SetGlobalState",
+        reinterpret_cast<void*>(&lSetGlobalState), "lSetGlobalState");
+    LuaPushCFunctionFieldImpl(L, -1, "GetGameCoreState",
+        reinterpret_cast<void*>(&lGetGameCoreState), "lGetGameCoreState");
+    LuaPushCFunctionFieldImpl(L, -1, "SetGameCoreState",
+        reinterpret_cast<void*>(&lSetGameCoreState), "lSetGameCoreState");
+    LuaPopImpl(L, 1);
+}
+
+// ==== EnsureLoaderLuaGlobalsInstalled ====
+// 让 Loader 自己的 Lua 表在没有插件的情况下也能挂上：只负责把
+// LuaExposureLibrary::Register 的 detour 装好（钩子装上后每个新 thread 都会触发）。
+// 由阶段 A 的 WorkerMain 主动调用一次；插件注册路径同样会调（幂等）。
+void EnsureLoaderLuaGlobalsInstalled() {
+    EnsureGlobalScriptHooksInstalled();
+}
+
 // ==== RunGlobalScriptsFor ====
 // 把所有已登记的回调跑在【指定的】lua_State 上。约束：
 //   1) 游戏线程（Lua 状态非线程安全）；
@@ -1136,6 +1180,10 @@ static void EnsureGlobalScriptHooksInstalled() {
 // 把回调静默吞掉。回调的幂等性由插件自己负责（指南有要求）。
 void RunGlobalScriptsFor(void* L) {
     if (!L) return;
+
+    // Loader 自身先行：DllLoader 表不依赖任何插件是否启用。
+    ExposeLoaderLuaGlobals(L);
+
     std::vector<ScriptGlobalsEntry> pending;
     {
         lock_guard<mutex> stateLock(g_scriptStateMutex);
@@ -1787,63 +1835,6 @@ uint32_t MakeHashImpl(const char* str) {
     return CivCrc32RawLen(str, len);
 }
 
-// ==== RegisterPushMethodsTargetImpl ====
-int RegisterPushMethodsTargetImpl(const char* name, int sigType, const char* pushMethodsSymbol) {
-    if (!name || !*name) return 0;
-
-    // name / pushMethodsSymbol 都是插件内存：锁外抄写（含早期日志读到的 name）。
-    std::string nameCopy;
-    if (!PluginBoundary::CopyCString(name, nameCopy) || nameCopy.empty()) {
-        Logger::Log("RegisterPushMethodsTarget rejected: name pointer unreadable");
-        return 0;
-    }
-    if (sigType != kHookApiPushNoManager && sigType != kHookApiPushWithManager) {
-        Logger::Log("RegisterPushMethodsTarget: bad sigType %d for %s",
-            sigType, nameCopy.c_str());
-        return 0;
-    }
-    std::string symbolCopy;
-    if (pushMethodsSymbol && *pushMethodsSymbol) {
-        if (!PluginBoundary::CopyCString(pushMethodsSymbol, symbolCopy)) {
-            Logger::Log("RegisterPushMethodsTarget rejected: pushMethodsSymbol unreadable");
-            return 0;
-        }
-    }
-
-    lock_guard<std::recursive_mutex> lifecycleLock(LoaderCore::LifecycleMutex());
-    PluginBoundary::LoaderLockScope pbLockScope;
-    // owner 探针仍用插件自己的 name 指针：RequirePluginOwner 只做模块归属查询，
-    // 不解引用；换成 Loader 副本会被判成 Loader 自身而全部拒绝。
-    auto owner = PluginDomain::RequirePluginOwner(reinterpret_cast<const void*>(name),
-                                    "RegisterPushMethodsTarget");
-    if (!owner) return 0;
-    if (!PluginDomain::RequireGameCoreOwner(reinterpret_cast<const void*>(name),
-                              "RegisterPushMethodsTarget")) return 0;
-
-    PushTargetConfig config{
-        sigType == kHookApiPushWithManager
-        ? PushMethodSigType::WithManager
-        : PushMethodSigType::NoManager,
-        !symbolCopy.empty() ? symbolCopy : (nameCopy + "::PushMethods")
-    };
-
-    auto& ownerConfigs = g_pluginPushTargetConfigs[owner->ownerId];
-    const auto existing = ownerConfigs.find(nameCopy);
-    if (existing != ownerConfigs.end()) {
-        if (existing->second.signature != config.signature ||
-                existing->second.symbolName != config.symbolName) {
-            Logger::Log("RegisterPushMethodsTarget: conflicting redefinition owner=%ls target=%s",
-                owner->ownerId.c_str(), nameCopy.c_str());
-            return 0;
-        }
-        return 1;
-    }
-    ownerConfigs.emplace(nameCopy, config);
-    Logger::Log("RegisterPushMethodsTarget: owner=%ls target=%s sig=%d sym=%s",
-        owner->ownerId.c_str(), nameCopy.c_str(), sigType, config.symbolName.c_str());
-    return 1;
-}
-
 // 官方表核对（ConsoleApplication1.cpp:17-50 里还原出来的 crc32_table，共 258 项）：
 //   前 256 项与标准反射表（多项式 0xEDB88320）【逐项一致】；尾部多出的 0xEDB88320 /
 //   0xDEBB20E3 永远不会被索引（索引只取 (uint8_t)），故闭式实现与官方查表实现逐位等价。
@@ -1990,7 +1981,6 @@ RemovedCounts RemovePluginRegistrations(const std::wstring& owner) {
             if (slot.used) n.luaMethods += RemoveOwnedSlotMethods(slot, owner);
         }
     }
-    n.targetConfigs = g_pluginPushTargetConfigs.erase(owner);
     // GameEvent 槽位：清空该 owner 注册的事件表（name/luaPushFn/ownerId）。
     // Quarantine/Unload 都经本函数，无需在各自路径重复接线。
     CleanupGameEventsForOwner(owner);

@@ -150,15 +150,94 @@ bool WriteWholeFile(const std::wstring& path, const void* data, size_t len) {
     return ok;
 }
 
-// 释放单个资源：目标 <exe目录>\Civ6DllLoader\<fileName> 已存在则跳过，否则写入。
+// ---- 资源版本标记 ----
+// 两份 UI 资源各自在文件头带一行版本标记：
+//   lua:  --@ui-version=N
+//   xml:  <!--@ui-version=N-->
+// 标记值 = 内嵌资源自身的版本；解压时与磁盘上那份的标记比较，决定覆盖与否。
+// 这样"用户改过副本"和"Loader 升级了资源"两个需求不会互相踩：
+//   · 磁盘版本 == 内嵌版本  -> 保留（用户可能改过）
+//   · 磁盘版本 <  内嵌版本  -> 覆盖（Loader 升级过资源）
+//   · 磁盘没有标记          -> 覆盖（旧版资源，或用户重写过）
+constexpr int kUiResourceVersion = 1;
+// 只扫文件头这么多字节：标记一定在最前面，避免整份读进来。
+constexpr DWORD kVersionScanBytes = 256;
+
+// 从打开的句柄里扫出 @ui-version=N。找不到或格式不对返回 0。
+int ReadUiVersionFromHandle(HANDLE h) {
+    char buf[kVersionScanBytes]{};
+    DWORD got = 0;
+    if (!ReadFile(h, buf, kVersionScanBytes, &got, nullptr) || got == 0) return 0;
+    constexpr char kTag[] = "@ui-version=";
+    constexpr size_t kTagLen = sizeof(kTag) - 1;
+    for (size_t i = 0; i + kTagLen < got; ++i) {
+        if (memcmp(buf + i, kTag, kTagLen) != 0) continue;
+        size_t j = i + kTagLen;
+        int value = 0;
+        bool anyDigit = false;
+        while (j < got && buf[j] >= '0' && buf[j] <= '9') {
+            value = value * 10 + (buf[j] - '0');
+            anyDigit = true;
+            ++j;
+            if (value > 1000000) return 0;  // 防御异常长数字
+        }
+        if (anyDigit) return value;
+    }
+    return 0;
+}
+
+// 读磁盘文件的版本标记；文件不存在 / 打不开 / 无标记都返回 0。
+int ReadUiVersionFromDisk(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    const int v = ReadUiVersionFromHandle(h);
+    CloseHandle(h);
+    return v;
+}
+
+// 覆盖写：先写临时文件再原子替换，避免写到一半断电留下半个 UI。
+bool ReplaceWholeFile(const std::wstring& path, const void* data, size_t len) {
+    const std::wstring tmp = path + L".tmp";
+    DeleteFileW(tmp.c_str());
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool ok = WriteFile(h, data, static_cast<DWORD>(len), &written, nullptr) != 0 &&
+                    written == len;
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// 释放单个资源到 <exe目录>\Civ6DllLoader\<fileName>。
+// 是否覆盖由文件头版本标记决定，见上面 kUiResourceVersion 处的说明。
 void ExtractOne(HMODULE module, int id, const wchar_t* fileName) {
     std::wstring dir = GetExeDir();
     if (dir.empty()) return;
     std::wstring subdir = dir + L"\\" + kExtractDir;
     std::wstring target = subdir + L"\\" + fileName;
-    if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        return;  // 已存在，不覆盖（用户可编辑）
+
+    const bool exists = GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (exists) {
+        const int diskVersion = ReadUiVersionFromDisk(target);
+        if (diskVersion >= kUiResourceVersion) {
+            Logger::Log("UiInject: %ls 保留 (disk=%d, embedded=%d)",
+                        fileName, diskVersion, kUiResourceVersion);
+            return;  // 磁盘已是最新（或更新），保留——用户可能改过
+        }
+        Logger::Log("UiInject: %ls 版本落后 (disk=%d, embedded=%d)，覆盖",
+                    fileName, diskVersion, kUiResourceVersion);
     }
+
     std::vector<uint8_t> data;
     if (!ReadResourceData(module, id, data)) {
         Logger::Log("UiInject: RCDATA %d 读取失败", id);
@@ -166,6 +245,14 @@ void ExtractOne(HMODULE module, int id, const wchar_t* fileName) {
     }
     if (!CreateDirectoryW(subdir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
         Logger::Log("UiInject: 创建目录 %ls 失败 err=%lu", subdir.c_str(), GetLastError());
+        return;
+    }
+    if (exists) {
+        if (ReplaceWholeFile(target, data.data(), data.size())) {
+            Logger::Log("UiInject: 覆盖 %ls (%zu bytes)", fileName, data.size());
+        } else {
+            Logger::Log("UiInject: 覆盖 %ls 失败 err=%lu", fileName, GetLastError());
+        }
         return;
     }
     if (WriteWholeFile(target, data.data(), data.size())) {

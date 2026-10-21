@@ -17,7 +17,9 @@
 #include "LoaderCore.h"
 #include "ImageAddress.h"
 #include "Runtime.h"
+#include "ConfigIni.h"
 #include "../common/Logger.h"
+#include "../common/ModScan.h"
 #include "MinHook.h"
 
 #include <cwchar>
@@ -277,7 +279,26 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
         return g_origLoadDLL(Path);
     }
 
-    // XP2：喂官方 GameCore DLL 绝对路径给原 LoadDLL（引擎槽位=官方）。
+    // XP2 分支。两条前置条件任一不满足就不接管，原样透传引擎给的 Path：
+    //   ① ENABLE_GAMECORE=false（用户在 config.ini 显式关掉）；
+    //   ② 没有任何可用的 GameCore 插件候选（本框架在该 Mod 集里没装插件）。
+    // 透传的意义：不强制喂官方 DLL，把加载权交还引擎原本的路径选择，
+    // 从而与不走本框架的其它 GameCore DLL Mod 兼容。
+    if (!CfgIni::ReadGameCoreEnabled()) {
+        Logger::Log("LoadDLL: ENABLE_GAMECORE=false, passthrough (loader plugins disabled)");
+        return g_origLoadDLL(Path);
+    }
+
+    // 扫描必须发生在原函数之前（要先决定路径），结果缓存给后面的 LoadPluginsOf 复用，
+    // 避免一次进对局扫两遍（找 Steam 库、查 Mods.sqlite、逐个读 PE 版本资源）。
+    std::vector<std::wstring> candidates = ModScan::FindGameCorePluginCandidates();
+    if (candidates.empty()) {
+        Logger::Log("LoadDLL: no GameCore plugin candidate, passthrough (non-loader mods unaffected)");
+        return g_origLoadDLL(Path);
+    }
+    Logger::Log("LoadDLL: %zu GameCore plugin candidate(s), taking over", candidates.size());
+
+    // 喂官方 GameCore DLL 绝对路径给原 LoadDLL（引擎槽位=官方）。
     const wchar_t* rel = OfficialGameCoreRelPath(ruleset);
     wchar_t* target = Path;
     if (rel && BuildOfficialPath(rel)) {
@@ -294,7 +315,8 @@ static char __fastcall LoadDllDetour(wchar_t* Path) {
         return result;
     }
     if (LoaderCore::InitializeGameCorePhase()) {
-        LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::GameCore);
+        // 用上面那份候选列表，不重扫。
+        LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::GameCore, candidates);
     } else {
         Logger::Log("InitializeGameCorePhase failed; GameCore plugins not loaded");
     }
