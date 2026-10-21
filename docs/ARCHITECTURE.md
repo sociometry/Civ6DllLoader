@@ -348,8 +348,9 @@ Lua 接口注册）、插件加载（`LoadLibraryExW` 含 DllMain 与依赖链�
 阶段 B（`InitializeGameCorePhase`）、UI 注入（每次主菜单刷新都会进的
 `LoadUiDetour`）。
 
-**与 `ENABLE_DEBUG_LOG` 无关**：两者是独立开关。`ENABLE_DEBUG_LOG` 管细颗粒度日志，
-`ENABLE_PROFILER` 管耗时，分析器本身只听后者。
+**与 `ENABLE_DEBUG_LOG` 无关**：两者是独立开关。`ENABLE_DEBUG_LOG` 管细颗粒度日志
+（通过 HookAPI 的 `IsDebugLogEnabled` 暴露给插件），`ENABLE_PROFILER` 管耗时，
+且**不对外暴露** —— 分析器只量 Loader 自己的埋点，插件没有查询它的需要。
 
 值只认 `true` / `false`（大小写不敏感）与 `1` / `0`；其它写法记一行日志后按 `false`。
 实现用 `GetPrivateProfileStringW` 而非 `GetPrivateProfileIntW`——后者的整数解析会把
@@ -726,8 +727,9 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
   指针可解引用，因此**不过域门、不取插件锁**，只读 `PdataMatch` 自己的快照（§7.3）。
 - 本地化：`LocalizationLookup` / `LocStringBytes` / `LocCreate` / `LocDestroy` / `LocLookup` /
   `LocPushArgument` / `LocToUtf8`——走独立模块 `Localization_FinalRelease.dll` 的导出；
-- 开发者开关查询：`IsDebugLogEnabled` / `IsProfilerEnabled`——纯读 `config.ini` 的缓存值，
-  不过域门、不取插件锁；两个开关互相独立（前者管细颗粒度日志，后者管耗时统计）；
+- 开发者开关查询：`IsDebugLogEnabled`——纯读 `config.ini` 的缓存值，不过域门、不取插件锁。
+  插件用它决定自己的"逐条/每帧"日志打不打。`ENABLE_PROFILER` 不对外暴露：
+  它只控制 Loader 自己的 `PROFILE_SCOPE` 埋点，插件没有查询它的需要；
 - `MakeHash`：**已内化**为 loader 自己的原生 CRC32（raw，无最终异或，与官方 `GameCore::Utilities::MakeHash`
   逐位一致，并有编译期自检向量）；不再解析任何 GameCore 符号，任何时刻可算；
 - 脚本注册：`RegisterGlobalScript`（**仅 Global 类别**，登记到引擎的每个 Lua 环境，§6.3）

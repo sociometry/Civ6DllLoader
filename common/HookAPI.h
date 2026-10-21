@@ -340,11 +340,6 @@ typedef struct HookContext {
        常驻的少量日志（初始化、hook 安装、失败原因）不受它影响，始终输出。 \
        返回值在进程内恒定：改 ini 需要重启游戏才生效。 */ \
     X(IsDebugLogEnabled, bool, (void), kCommon) \
-    /* 是否开启了性能分析（config.ini 的 [Loader] ENABLE_PROFILER，默认 false）。 \
-       与 IsDebugLogEnabled 是两个独立开关：前者管细颗粒度日志，这个管耗时统计。 \
-       Loader 自己的 PROFILE_SCOPE 埋点只听它；插件可以用它决定是否给自己的热路径 \
-       计时（或者干脆不测）。同样进程内恒定，改 ini 需要重启。 */ \
-    X(IsProfilerEnabled, bool, (void), kCommon) \
     X(LuaPushCFunctionField, void, (void* L, int tableIndex, const char* fieldName, void* fn, const char* internalName), kCommon) \
     X(LuaNewGlobalTable, void, (void* L, const char* globalName, int narr, int nrec), kCommon) \
     X(LocalizationLookup, void*, (void* outLocString, const char* key), kCommon) \

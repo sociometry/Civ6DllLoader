@@ -95,7 +95,6 @@ static const HookAPI g_hookApi = {
 
     &ScriptBridge::LogImpl,
     &ScriptBridge::IsDebugLogEnabledImpl,
-    &ScriptBridge::IsProfilerEnabledImpl,
     &ScriptBridge::LuaPushCFunctionFieldImpl,
     &ScriptBridge::LuaNewGlobalTableImpl,
 

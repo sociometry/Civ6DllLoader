@@ -1777,13 +1777,6 @@ bool IsDebugLogEnabledImpl(void) {
     return CfgIni::ReadDebugLogEnabled();
 }
 
-// ==== IsProfilerEnabledImpl ====
-// 性能分析开关（config.ini 的 ENABLE_PROFILER，默认 false）。
-// 与 IsDebugLogEnabled 独立：Loader 自己的 PROFILE_SCOPE 埋点只听这个。
-bool IsProfilerEnabledImpl(void) {
-    return CfgIni::ReadProfilerEnabled();
-}
-
 // ==== GetPlayerImpl ====
 void* GetPlayerImpl(int playerId) {
     if (!PluginDomain::RequireGameCoreOwner(_ReturnAddress(), "GetPlayer")) return nullptr;
