@@ -6,6 +6,7 @@
 
 #include <Windows.h>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -39,6 +40,30 @@ bool ReadFlag(const wchar_t* key, const wchar_t* path) {
         static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])), path);
     if (n == 0) return false;   // 段/键缺失
     return ParseFlagValue(buf);
+}
+
+// 键是否存在（段里有没有这个名字，不看值）。
+// 与 ReadFlag 的区别：ReadFlag 把"键缺失"和"值为 false"都返回 false，
+// 分不出该不该补；补键需要知道"确实没有这条"。
+bool HasFlagKey(const wchar_t* key, const wchar_t* path) {
+    if (path == nullptr || *path == L'\0') return false;
+    wchar_t buf[2]{};   // 只需要知道有没有内容，不关心值
+    const DWORD n = GetPrivateProfileStringW(kSection, key, nullptr, buf,
+        static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])), path);
+    // 默认值传 nullptr 时，键缺失返回 0；键存在但值为空串也返回 0，
+    // 所以还要再用 GetPrivateProfileStringW 的另一种方式确认一次。
+    if (n != 0) return true;
+    // 退一步：把整个 [Loader] 段读出来，按 "KEY=" 前缀逐行找。
+    // 这是唯一能区分"键不存在"与"键存在但值为空"的办法（API 层没有直接接口）。
+    std::vector<wchar_t> sectionBuf(8192, L'\0');
+    const DWORD got = GetPrivateProfileSectionW(kSection, sectionBuf.data(),
+        static_cast<DWORD>(sectionBuf.size()), path);
+    if (got == 0) return false;
+    const size_t keyLen = wcslen(key);
+    for (const wchar_t* line = sectionBuf.data(); *line; line += wcslen(line) + 1) {
+        if (_wcsnicmp(line, key, keyLen) == 0 && line[keyLen] == L'=') return true;
+    }
+    return false;
 }
 
 bool WriteFlag(const wchar_t* key, bool enabled, const wchar_t* path) {
@@ -83,16 +108,46 @@ bool EnsureExists() {
     if (path.empty()) return false;
 
     if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        // 已存在：不动用户内容。缺失的键按 fail-closed 读成 false，
-        // 这里【不】自动补齐 —— 补了就等于把"删掉键"这个动作静默解释成"启用"。
-        // DEBUG_LOG 由 ReadDebugLogEnabled 缓存，这里直接调一次把值算出来，
-        // 让首行日志就能看到它 —— 排查问题时"日志为什么这么少"往往就是它没开。
+        // 已存在：**只补缺失的键，绝不改已有键的值**。
+        //
+        // 为什么要补：老版本只写 ENABLE_GLOBAL / ENABLE_GAMECORE，升级后
+        // ENABLE_DEBUG_LOG / ENABLE_PROFILER 在文件里根本不存在，用户不知道
+        // 有这两个开关、也不知道该填什么。补上等于把它们"公告"出来。
+        //
+        // 为什么只补不覆盖：WritePrivateProfileStringW 本身就只在键不存在时添加，
+        // 已存在时保持原值 —— 所以用户手改过的值、以及"删掉某键"的意图都不会被踩
+        // （删掉 ENABLE_GLOBAL 再启动，它读作 false，这里补回的也是 false，行为一致；
+        // 而功能键的默认值本来就是 false，补与不补结果相同）。
+        struct FlagSpec { const wchar_t* key; bool defaultValue; };
+        const FlagSpec kAll[] = {
+            { kKeyGlobal,   true  },   // 功能键默认开（与新建文件一致）
+            { kKeyGameCore, true  },
+            { kKeyDebugLog, false },   // 开发者键默认关
+            { kKeyProfiler, false },
+        };
+        std::wstring added;
+        for (const auto& spec : kAll) {
+            if (HasFlagKey(spec.key, path.c_str())) continue;
+            if (WriteFlag(spec.key, spec.defaultValue, path.c_str())) {
+                if (!added.empty()) added += L", ";
+                added += spec.key;
+                added += spec.defaultValue ? L"=true" : L"=false";
+            }
+        }
         const bool debugLog = ReadDebugLogEnabled();
         const bool profiler = ReadProfilerEnabled();
-        Logger::Log("ConfigIni: existing %ls (ENABLE_GLOBAL=%d ENABLE_GAMECORE=%d "
-            "ENABLE_DEBUG_LOG=%d ENABLE_PROFILER=%d)",
-            path.c_str(), ReadGlobalEnabled() ? 1 : 0, ReadGameCoreEnabled() ? 1 : 0,
-            debugLog ? 1 : 0, profiler ? 1 : 0);
+        if (added.empty()) {
+            Logger::Log("ConfigIni: existing %ls (ENABLE_GLOBAL=%d ENABLE_GAMECORE=%d "
+                "ENABLE_DEBUG_LOG=%d ENABLE_PROFILER=%d)",
+                path.c_str(), ReadGlobalEnabled() ? 1 : 0, ReadGameCoreEnabled() ? 1 : 0,
+                debugLog ? 1 : 0, profiler ? 1 : 0);
+        } else {
+            Logger::Log("ConfigIni: existing %ls; added missing key(s): %ls "
+                "(ENABLE_GLOBAL=%d ENABLE_GAMECORE=%d ENABLE_DEBUG_LOG=%d ENABLE_PROFILER=%d)",
+                path.c_str(), added.c_str(),
+                ReadGlobalEnabled() ? 1 : 0, ReadGameCoreEnabled() ? 1 : 0,
+                debugLog ? 1 : 0, profiler ? 1 : 0);
+        }
         return true;
     }
 
