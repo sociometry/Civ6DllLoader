@@ -21,6 +21,7 @@
 #include "Runtime.h"
 #include "LoaderCore.h"
 #include "../common/Logger.h"
+#include "../common/Profiler.h"
 #include "../common/EnabledMods.h"
 #include "ScriptBridge.h"
 #include "MinHook.h"
@@ -588,7 +589,11 @@ void RunInjectionSafely(void* state) {
 // ---- MainMenuState::LoadUI detour ----
 void* __fastcall LoadUiDetour(void* state) {
     void* result = g_origLoadUI(state);  // 先让原函数创建 FrontEnd + InvitePopup
+    // 只在真的要注入时才计时（g_refreshRequested 为 false 时 RunInjectionSafely 是空转）。
+    // 这个 detour 每次主菜单刷新都会进来，量全量就是纯浪费。
+    const int64_t prof = Profiler::Begin("UiInject::RunInjection");
     RunInjectionSafely(state);
+    Profiler::End("UiInject::RunInjection", prof);
     return result;
 }
 

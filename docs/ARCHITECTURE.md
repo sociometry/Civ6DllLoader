@@ -305,26 +305,60 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 [Loader]
 ENABLE_GLOBAL=true
 ENABLE_GAMECORE=true
+ENABLE_DEBUG_LOG=false
+ENABLE_PROFILER=false
 ```
 
 | 键 | 生效点 | 影响范围 |
 |---|---|---|
 | `ENABLE_GLOBAL` | 阶段 A 的 `WorkerMain` 第 4 步 | 只决定是否 `LoadPluginsOf(Global)`。Loader 的钩子、UI 注入、自更新**照常执行** |
 | `ENABLE_GAMECORE` | `LoadDllDetour` 的 XP2 分支 | false 时透传原始 Path，不接管加载、不加载 GameCore 插件 |
+| `ENABLE_DEBUG_LOG` | 插件侧自查 | 开发者开关，默认 false。**只读、只能手改**，没有 Writer / UI / Lua 接口。让插件决定"逐条/每帧"级别的诊断日志打不打 |
+| `ENABLE_PROFILER` | `WorkerMain` 开头的 `Profiler::SetEnabled` | 开发者开关，默认 false。同样只读、只能手改。开启后 Loader 打耗时分析（见下） |
 
 **两条独立的读取规则，别混淆**：
 
-- **文件不存在** → 新建，两个键都写 `true`（装好即启用）；
+- **文件不存在** → 新建，两个功能开关都写 `true`（装好即启用），两个开发者开关写 `false`；
 - **文件在但键缺失 / 值非法** → 该键读作 `false`（fail-closed：宁可插件不加载，
   也不让一个写错的 ini 意外启用功能）。
+
+两个开发者开关都在进程内**缓存一次**（手改后重启生效）：它们的读点在高频路径上
+（逐条日志的判断 / 每次 `Begin`），不能每次都去读盘。
+
+#### 性能分析（`ENABLE_PROFILER`）
+
+`common/Profiler.h` 提供 `PROFILE_SCOPE("名字")` 这个 RAII 宏，作用域结束自动收尾。
+**开关关着时 `Begin`/`End` 都是空操作**——只多一次原子 bool 读，不取时间、不分配、
+不打日志，所以埋点可以留在热路径上。
+
+计时用 `QueryPerformanceCounter`（单调，不受系统调时影响），频率缓存一次。
+每个 scope 打一行，阶段结束打汇总（按 total 降序）：
+
+```
+[Prof] InitEarly 12.345 ms
+[Prof] Plugin(LoadLibraryExW) 3.210 ms (MyPlugin.dll)
+[Prof] === summary(stage A): 14 scope(s), 21 sample(s), 456.789 ms total ===
+[Prof]   total=   210.123ms  count=     1  max=  210.123ms  avg=  210.123ms  WorkerMain(total)
+[Prof]   total=   102.456ms  count=     1  max=  102.456ms  avg=  102.456ms  LoadPluginsOf(Global)
+...
+```
+
+埋点覆盖：启动序列各步骤（`InitEarly` / 依赖导入 / 资源释放 / 各 hook 安装 / 自更新 /
+Lua 接口注册）、插件加载（`LoadLibraryExW` 含 DllMain 与依赖链、`OnLoad`、整批）、
+阶段 B（`InitializeGameCorePhase`）、UI 注入（每次主菜单刷新都会进的
+`LoadUiDetour`）。
+
+**与 `ENABLE_DEBUG_LOG` 无关**：两者是独立开关。`ENABLE_DEBUG_LOG` 管细颗粒度日志，
+`ENABLE_PROFILER` 管耗时，分析器本身只听后者。
 
 值只认 `true` / `false`（大小写不敏感）与 `1` / `0`；其它写法记一行日志后按 `false`。
 实现用 `GetPrivateProfileStringW` 而非 `GetPrivateProfileIntW`——后者的整数解析会把
 `true` 读成 0，表达不了布尔。
 
-**生效时机**：这两个键都只影响"接下来那一次"的加载决策。主菜单出现时 Global 已加载完毕，
-改 `ENABLE_GLOBAL` 只能下次启动生效；GameCore 在进对局时才加载，所以主菜单里改它对下一次进局有效。
-运行期**不会**因此卸载已加载的插件。
+**生效时机**：`ENABLE_GLOBAL` / `ENABLE_GAMECORE` 只影响"接下来那一次"的加载决策。
+主菜单出现时 Global 已加载完毕，改 `ENABLE_GLOBAL` 只能下次启动生效；GameCore 在进对局时才加载，
+所以主菜单里改它对下一次进局有效。运行期**不会**因此卸载已加载的插件。
+两个开发者开关（`ENABLE_DEBUG_LOG` / `ENABLE_PROFILER`）在进程内缓存，改完也需要重启。
 
 **Lua 接口**：`DllLoader` 表由 Loader 自身提供（不依赖任何插件），挂在每个 thread 环境上：
 
@@ -692,6 +726,8 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
   指针可解引用，因此**不过域门、不取插件锁**，只读 `PdataMatch` 自己的快照（§7.3）。
 - 本地化：`LocalizationLookup` / `LocStringBytes` / `LocCreate` / `LocDestroy` / `LocLookup` /
   `LocPushArgument` / `LocToUtf8`——走独立模块 `Localization_FinalRelease.dll` 的导出；
+- 开发者开关查询：`IsDebugLogEnabled` / `IsProfilerEnabled`——纯读 `config.ini` 的缓存值，
+  不过域门、不取插件锁；两个开关互相独立（前者管细颗粒度日志，后者管耗时统计）；
 - `MakeHash`：**已内化**为 loader 自己的原生 CRC32（raw，无最终异或，与官方 `GameCore::Utilities::MakeHash`
   逐位一致，并有编译期自检向量）；不再解析任何 GameCore 符号，任何时刻可算；
 - 脚本注册：`RegisterGlobalScript`（**仅 Global 类别**，登记到引擎的每个 Lua 环境，§6.3）

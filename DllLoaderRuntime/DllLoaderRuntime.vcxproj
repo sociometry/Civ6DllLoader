@@ -110,6 +110,7 @@
     <ClInclude Include="HavokScript.h" />
     <ClInclude Include="Localization.h" />
     <ClInclude Include="..\common\Logger.h" />
+    <ClInclude Include="..\common\Profiler.h" />
     <ClInclude Include="MinHook.h" />
     <ClInclude Include="NormHash.h" />
     <ClInclude Include="PdataMatch.h" />
@@ -167,6 +168,7 @@
     <ClCompile Include="HavokScript.cpp" />
     <ClCompile Include="Localization.cpp" />
     <ClCompile Include="..\common\Logger.cpp" />
+    <ClCompile Include="..\common\Profiler.cpp" />
     <ClCompile Include="NormHash.cpp" />
     <ClCompile Include="PdataMatch.cpp" />
     <ClCompile Include="Runtime.cpp" />

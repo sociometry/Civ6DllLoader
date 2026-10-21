@@ -70,6 +70,8 @@ void SetGameCorePhaseReady(bool ready);
 // 这些是 HookAPI 表里的函数指针目标。母体的 g_hookApi 初始化表取它们地址，
 // 故不能是 static。签名与实现逐字一致（从源码自动提取，未手工改写）。
 
+bool IsDebugLogEnabledImpl(void);
+bool IsProfilerEnabledImpl(void);
 void* GetPlayerImpl(int playerId);
 void* GetMainLuaStateImpl();
 void* LocCreateImpl(void);

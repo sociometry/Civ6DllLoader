@@ -22,6 +22,7 @@
 #include "LoaderHooks.h"
 #include "LoaderUpdate.h"
 #include "../common/Logger.h"
+#include "../common/Profiler.h"
 #include "Runtime.h"
 #include "PdataMatch.h"
 #include "ImageAddress.h"
@@ -106,8 +107,17 @@ bool LoadedFromExeDirectory(HMODULE hModule, const wchar_t** whyOut) {
 // 阶段 A：跑完启动序列即返回的一次性工作线程（没有事件循环，之后一切由 detour 驱动）。
 // Global 插件仅在此加载一次；之后主菜单开关 mod 只在下次启动生效。
 DWORD WINAPI WorkerMain(LPVOID) {
+    // 0) 性能分析开关先注入：Profiler 在 common/，不认识 config.ini，
+    //    由这里把 ENABLE_PROFILER 的值告诉它。必须在第一个 Begin 之前。
+    //    注意 profTotal 是"注入之后"才取的，否则它本来就是 0、永远不产生日志。
+    Profiler::SetEnabled(CfgIni::ReadProfilerEnabled());
+    const int64_t profTotal = Profiler::Begin("WorkerMain(total)");
+
     // 1) 基础初始化：Logger / PdataMatch / MinHook
-    LoaderCore::InitEarly();
+    {
+        PROFILE_SCOPE("InitEarly");
+        LoaderCore::InitEarly();
+    }
 
     // 1.2) 进程级依赖导入：HavokScript（Lua VM）与 Localization。
     // 这两个模块都是 **exe 的静态导入**（PE 导入表实证：Localization_FinalRelease.dll、
@@ -118,42 +128,71 @@ DWORD WINAPI WorkerMain(LPVOID) {
     // 缺失的处置是**降级**而非拒载：各自的包装（HKS_GUARD_* 宏 / Localization 的判空）
     // 已经逐入口返回安全默认值 + 限次日志。插件可能压根不用 Lua 或本地化，
     // 没有理由因为一个可选依赖残缺就拒绝加载它。
-    if (!hks::InitHavokScript()) {
-        Logger::Log("WorkerMain: HavokScript imports incomplete; Lua APIs degraded");
+    {
+        PROFILE_SCOPE("InitHavokScript");
+        if (!hks::InitHavokScript()) {
+            Logger::Log("WorkerMain: HavokScript imports incomplete; Lua APIs degraded");
+        }
     }
-    Localization::InitScript();
+    {
+        PROFILE_SCOPE("Localization::InitScript");
+        Localization::InitScript();
+    }
 
     // 1.5) 释放内嵌 FrontEnd UI 资源到 exe 目录的 Civ6DllLoader 子目录
-    UiInject::ExtractResources();
+    {
+        PROFILE_SCOPE("UiInject::ExtractResources");
+        UiInject::ExtractResources();
+    }
 
     // 1.6) 开关文件：与 UI 资源同目录。文件缺失时以两个 true 新建。
     //      必须在第 4 步读 ENABLE_GLOBAL 之前完成。
-    CfgIni::EnsureExists();
+    {
+        PROFILE_SCOPE("CfgIni::EnsureExists");
+        CfgIni::EnsureExists();
+    }
 
     // 2) hook 安装（LoadDLL / UnloadDLL；失败静默降级）
-    if (!LoaderHooks::InstallAll()) {
-        Logger::Log("hook 安装降级");
+    {
+        PROFILE_SCOPE("LoaderHooks::InstallAll");
+        if (!LoaderHooks::InstallAll()) {
+            Logger::Log("hook 安装降级");
+        }
     }
 
     // 2.5) FrontEnd UI 注入 hook（失败静默降级）
-    if (!UiInject::Install()) {
-        Logger::Log("FrontEnd UI 注入 hook 降级");
+    {
+        PROFILE_SCOPE("UiInject::Install");
+        if (!UiInject::Install()) {
+            Logger::Log("FrontEnd UI 注入 hook 降级");
+        }
     }
 
     // 3) 自更新检查
-    LoaderUpdate::CheckAndApplyUpdate();
+    {
+        PROFILE_SCOPE("LoaderUpdate::CheckAndApplyUpdate");
+        LoaderUpdate::CheckAndApplyUpdate();
+    }
 
     // 3.5) Loader 自身的 Lua 接口（DllLoader 表）。必须在 LoadPluginsOf 之前：
     //      它对所有 thread 生效，且不依赖是否有插件。
-    ScriptBridge::EnsureLoaderLuaGlobalsInstalled();
+    {
+        PROFILE_SCOPE("ScriptBridge::EnsureLoaderLuaGlobalsInstalled");
+        ScriptBridge::EnsureLoaderLuaGlobalsInstalled();
+    }
 
     // 4) 阶段 A：加载启用 Mod 的 Global 插件（仅此一次；运行期不重查，开关 mod 重启生效）
     //    ENABLE_GLOBAL=false 只跳过插件加载，Loader 自身的钩子/UI 注入/自更新照常。
     if (CfgIni::ReadGlobalEnabled()) {
+        PROFILE_SCOPE("LoadPluginsOf(Global)");
         LoaderCore::LoadPluginsOf(LoaderCore::PluginCategory::Global);
     } else {
         Logger::Log("WorkerMain: ENABLE_GLOBAL=false; Global plugins not loaded");
     }
+
+    // 阶段 A 收尾：先结束总计时，再打汇总 —— 否则 total 里不含汇总本身的耗时。
+    Profiler::End("WorkerMain(total)", profTotal);
+    Profiler::LogSummary("stage A");
 
     return 0;
 }

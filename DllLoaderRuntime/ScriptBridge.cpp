@@ -1767,6 +1767,23 @@ static EditPlayerFn ResolveEditPlayer() {
         ResolveCurrentGameCoreByName("GameCore::Context::Globals::EditPlayer"));
 }
 
+// ==== IsDebugLogEnabledImpl ====
+// 开发调试日志总闸（config.ini 的 ENABLE_DEBUG_LOG，默认 false）。
+// 插件用它决定"逐条/每帧"级别的日志到底打不打 —— 这类日志量极大，
+// 以 Civ6DllLoader_Loader.log 的实测为例，一个路线刷新回调就能刷掉三百多行，
+// 常开会把初始化、hook 安装、失败原因这些真正要看的信息淹掉。
+// 不需要插件锁/域校验：纯读一个 ini 值，不碰游戏状态。
+bool IsDebugLogEnabledImpl(void) {
+    return CfgIni::ReadDebugLogEnabled();
+}
+
+// ==== IsProfilerEnabledImpl ====
+// 性能分析开关（config.ini 的 ENABLE_PROFILER，默认 false）。
+// 与 IsDebugLogEnabled 独立：Loader 自己的 PROFILE_SCOPE 埋点只听这个。
+bool IsProfilerEnabledImpl(void) {
+    return CfgIni::ReadProfilerEnabled();
+}
+
 // ==== GetPlayerImpl ====
 void* GetPlayerImpl(int playerId) {
     if (!PluginDomain::RequireGameCoreOwner(_ReturnAddress(), "GetPlayer")) return nullptr;

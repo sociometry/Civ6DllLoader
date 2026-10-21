@@ -27,6 +27,7 @@
 #include "TeardownWindow.h"
 #include "../common/EnabledMods.h"
 #include "../common/Logger.h"
+#include "../common/Profiler.h"
 
 // 从 Civ6DLLHookLoaderAPI.cpp 拆出（阶段 6）：插件生命周期编排 + 映像查询。
 //
@@ -502,12 +503,16 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     // 失败路径只释放自己拿到的引用（GetModuleHandleEx 取回的引用不属于我们）。
     bool ownsRef = false;
     HMODULE hPlugin = nullptr;
+    // 只量真正 LoadLibraryExW 的那一段：它跑插件的 DllMain/CRT 初始化与整条依赖链，
+    // 是单插件加载里最不可控的一块。已驻留模块用 UNCHANGED_REFCOUNT 取回，代价极小，不必单独量。
+    const int64_t profLoad = Profiler::Begin("Plugin(LoadLibraryExW)");
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             wpath.c_str(), &hPlugin)) {
         hPlugin = LoadLibraryExW(wpath.c_str(), nullptr,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         ownsRef = (hPlugin != nullptr);
     }
+    Profiler::End("Plugin(LoadLibraryExW)", profLoad, ModScan::WideToNarrow(wpath).c_str());
     if (!hPlugin) {
         Logger::Log("LoadPlugin failed: %s err=%lu", ModScan::WideToNarrow(wpath).c_str(), GetLastError());
         return false;
@@ -599,7 +604,11 @@ static bool LoadPluginDllInternal(const std::wstring& wpath, const std::string& 
     // 无论 OnLoad 正常返回还是崩溃，都要在返回后清空，防止污染后续插件。
     SetActivePluginContext(ownerId, hPlugin);
     lifecycleLock.unlock();
+    // OnLoad 是插件自己的初始化代码，耗时差异可以极大（有的只挂钩子，
+    // 有的在这里建整张表）。单独量，才不会把 LoadLibraryExW 的开销和它混在一起。
+    const int64_t profOnLoad = Profiler::Begin("Plugin(OnLoad)");
     const OnLoadOutcome onLoadResult = CallOnLoadSafe(onLoad, pluginFileName.c_str());
+    Profiler::End("Plugin(OnLoad)", profOnLoad, pluginFileName.c_str());
     ClearActivePluginContext();
     lifecycleLock.lock();
 
@@ -817,9 +826,13 @@ void LoaderCore::LoadPluginsOf(PluginCategory cat) {
 // ==== LoadPluginsOf（用调用方扫好的列表）====
 void LoaderCore::LoadPluginsOf(PluginCategory cat, const std::vector<std::wstring>& candidates) {
     Logger::Log("LoadPluginsOf(%s): %zu candidate(s)", PluginDomain::CategoryNameForLog(cat), candidates.size());
+    // 整批的耗时：单个插件的耗时也各自量（见 LoadPluginDllInternal），
+    // 但两者不重叠 —— 这里只包 for 循环，嵌套的 scope 会各记一笔。
+    const int64_t profBatch = Profiler::Begin("LoadPluginsOf(batch)");
     for (const auto& wpath : candidates) {
         LoadSinglePlugin(wpath);
     }
+    Profiler::End("LoadPluginsOf(batch)", profBatch, PluginDomain::CategoryNameForLog(cat));
 }
 
 // ==== UnloadPluginsOf ====
@@ -869,6 +882,7 @@ bool LoaderCore::LoadSinglePlugin(const std::wstring& path) {
 
 // ==== InitializeGameCorePhase ====
 bool LoaderCore::InitializeGameCorePhase() {
+    PROFILE_SCOPE("InitializeGameCorePhase");
     lock_guard<std::recursive_mutex> transitionLock(g_gameCoreTransitionMutex);
     unique_lock<std::recursive_mutex> lifecycleLock(g_pluginLifecycleMutex);
     HMODULE gm = GetModuleHandleW(L"GameCore_XP2_FinalRelease.dll");
@@ -890,6 +904,9 @@ bool LoaderCore::InitializeGameCorePhase() {
     // 注册项重装。首次进入时若 Global 插件已在阶段 A 注册过脚本全局，也在此一并装钩。
     ScriptBridge::EnsureScriptHooksInstalled();
     Logger::Log("InitializeGameCorePhase: OK");
+    // 阶段 B 的汇总：与阶段 A 是同一个累计表（Loader 进程内只初始化一次聚合），
+    // 所以这里的数字包含阶段 A 的样本。要看"本阶段新增"，看 count 的增量即可。
+    Profiler::LogSummary("stage B");
     return true;
 }
 

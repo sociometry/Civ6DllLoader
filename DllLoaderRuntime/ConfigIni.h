@@ -30,7 +30,28 @@ bool ReadGameCoreEnabled();
 
 // 写入一个开关并落盘。返回 true = 写成功。
 // 只改 [Loader] 段里对应的那个键，保留文件里其它内容。
+// 注意：ENABLE_DEBUG_LOG 没有对应的 Writer —— 它只给开发者手改，
+// 运行期（含 UI）不该把它打开，否则一次误点就会让日志暴涨。
 bool WriteGlobalEnabled(bool enabled);
 bool WriteGameCoreEnabled(bool enabled);
+
+// ==== ENABLE_DEBUG_LOG ====
+// 开发者开关，**只读、只能手改 ini**：没有 Writer，也没有 UI 入口 / Lua 接口。
+// 默认 false（键缺失也读作 false，与其它键的 fail-closed 一致）。
+// 用途：控制运行期"逐条/每帧"级别的诊断日志；常驻的量少日志不受它影响，
+// 否则真出问题时反而看不到上下文。
+//
+// 结果在进程内缓存一次：这个键是给人手改的，改完要重启游戏才生效，
+// 没必要每次打日志都去读一次磁盘（那些日志本身就在高频路径上）。
+bool ReadDebugLogEnabled();
+
+// ==== ENABLE_PROFILER ====
+// 性能分析开关。同样**只读、只能手改 ini**，没有 Writer / UI / Lua 接口，默认 false。
+// 与 ENABLE_DEBUG_LOG **互不相关**：DEBUG_LOG 管细颗粒度诊断日志，
+// PROFILER 管耗时统计。分析器本身（Profiler 模块）也只听这个开关 ——
+// 关着的时候 Begin/End 是空操作，不取时间、不分配、不打日志。
+//
+// 同样进程内缓存一次（手改 + 重启生效）。
+bool ReadProfilerEnabled();
 
 }  // namespace CfgIni
