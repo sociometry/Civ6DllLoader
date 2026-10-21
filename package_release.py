@@ -9,12 +9,11 @@
     python package_release.py --version 1.0.1  # 覆盖版本号
     python package_release.py --no-build       # 跳过构建，直接用现有产物
 
-交付物（与 docs/ARCHITECTURE.md §8 的工程清单一致）：
+交付物（与 docs/ARCHITECTURE.md §8 的工程清单一致；架构文档本身不随包发布）：
     Shell      GameCore_XP2_Shell_FinalRelease.dll   首次安装用的薄壳
     Runtime    Civ6DllLoader.runtime.dll             真正的 Loader
     SDK        common/HookAPI.h                      插件 ABI 头
     Tool       tools/rva_to_symbol.exe               RVA -> 符号名
-    docs       docs/ARCHITECTURE.md
 
 产物落在 dist/ 下：Civ6DllLoader-<ver>.zip
 Mods 侧有自己独立的打包脚本（Civ6DllMods/package_release.py）。
@@ -98,7 +97,6 @@ def collect(repo, with_pdb):
          "Binaries/Win64/Civ6DllLoader.runtime.dll"),
         (repo / "common" / "HookAPI.h", "SDK/HookAPI.h"),
         (repo / "tools" / "rva_to_symbol.exe", "Tools/rva_to_symbol.exe"),
-        (repo / "docs" / "ARCHITECTURE.md", "docs/ARCHITECTURE.md"),
     ]
     if with_pdb:
         items.append((out / "GameCore_XP2_Shell_FinalRelease.pdb",
@@ -154,13 +152,12 @@ Global / GameCore 两个阶段加载插件，并提供主菜单设置面板。
     Binaries/Win64/Civ6DllLoader.runtime.dll             真正的 Loader
     SDK/HookAPI.h                                        插件 ABI 头（必须用这份）
     Tools/rva_to_symbol.exe                              RVA -> 符号名查表
-    docs/ARCHITECTURE.md                                 架构与实现细节
 
 ## 安装
 
 把这两个 DLL 放到 Mod 的 Binaries/Win64/ 下，并让 Mod 的 Config.sql 把
 DllPrefix 改写为 GameCore_XP2_Shell。薄壳会在 Loader 缺席时自动完成
-version.dll 的补装，装完提示重启。细节见 docs/ARCHITECTURE.md。
+version.dll 的补装，装完提示重启。
 
 ## 注意
 
