@@ -45,6 +45,9 @@ __pycache__/
 # Local leftovers
 example1.log
 
+# package_release.py 的输出目录（发布包是构建产物，不入版本管理）
+dist/
+
 # 审查报告（本地工作稿，不入版本管理）
 AUDIT_REPORT.md
 
