@@ -4,6 +4,8 @@ Binaries/
 docs/*
 !docs/ARCHITECTURE.md
 !docs/ARCHITECTURE.en.md
+!docs/FEATURE_CATALOG.md
+!docs/FEATURE_CATALOG.en.md
 
 # Visual Studio user/cache
 .vs/

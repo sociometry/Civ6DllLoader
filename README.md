@@ -6,6 +6,8 @@
 
 本仓库只包含 **loader 基础设施**。插件示例在独立仓库（`Civ6DllLoader-Examples`）。
 
+> 完整能力清单见 **[功能目录（API + UI 注入）](docs/FEATURE_CATALOG.md)**：80 个 HookAPI 入口按用途分组，另含主菜单 UI 免编译注入的用法与边界。
+
 ## 基本运作原理
 
 一句话：把自己伪装成 `version.dll` 进进程，接管规则集 DLL 的加载槽位，再把多个第三方 DLL 插件按生命周期挂进去。

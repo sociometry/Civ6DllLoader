@@ -6,6 +6,8 @@ A native C++ plugin loader for Civilization VI: a thin shell (first-run installe
 
 This repository contains **loader infrastructure only**. Plugin examples live in a separate repo (`Civ6DllLoader-Examples`).
 
+> **[Feature catalog (API + UI injection)](docs/FEATURE_CATALOG.en.md)** — all 80 HookAPI entries grouped by purpose, plus how to mount main-menu UI without compiling anything, and what the loader cannot do.
+
 ## How it works
 
 In one sentence: it disguises itself as `version.dll` to get into the process, takes over the ruleset-DLL load slot, and then mounts any number of third-party DLL plugins onto the game's lifecycle.
