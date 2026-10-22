@@ -3,6 +3,7 @@ x64/
 Binaries/
 docs/*
 !docs/ARCHITECTURE.md
+!docs/ARCHITECTURE.en.md
 
 # Visual Studio user/cache
 .vs/

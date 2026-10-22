@@ -1,5 +1,7 @@
 # Civ6DllLoader 架构总览
 
+> 中文 | [English](ARCHITECTURE.en.md)
+
 - 适用版本：预发布 `1.0.0`（`common/LoaderVersion.h`），插件 ABI `CIV6_HOOK_API_VERSION = 1`。
 - 这份文档是**唯一权威的架构说明**。
 - 约定：本文用 `file` / `file:函数名` 定位，尽量不写死行号（行号会随改动漂移）。
