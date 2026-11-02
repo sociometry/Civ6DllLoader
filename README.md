@@ -2,6 +2,8 @@
 
 > 中文 | [English](README.en.md)
 
+**DLL交流群：1131351989**
+
 《文明VI》的原生 C++ 插件加载器：薄壳（首次安装器）+ 带版本号的 runtime + 只读 HookAPI。
 
 本仓库只包含 **loader 基础设施**。插件示例在独立仓库（`Civ6DllLoader-Examples`）。
