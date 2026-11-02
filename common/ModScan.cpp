@@ -228,7 +228,7 @@ bool LessIgnoreCase(const std::wstring& a, const std::wstring& b) {
 // Keep only mods recorded as enabled in Mods.sqlite.
 // 授权判据只有一条：路径落在 Mods.sqlite 返回的某个精确 mod root 之下（AllowsPath）。
 // 【没有】任何"锚本地豁免"：早先的 shellLocal 把"文件在不在锚模块目录下"当成了授权条件，
-// 而插件的锚是 runtime 自己（装好即 version.dll，在游戏 exe 目录），等于无条件把整个
+// 而插件的锚是 runtime 自己（装好即 winmm.dll，在游戏 exe 目录），等于无条件把整个
 // 游戏 exe 目录加进白名单、与玩家启用了哪些 Mod 无关。见 ARCHITECTURE §3.1。
 void FilterByEnabledMods(std::vector<std::wstring>& paths, const char* what) {
     if (paths.empty()) return;

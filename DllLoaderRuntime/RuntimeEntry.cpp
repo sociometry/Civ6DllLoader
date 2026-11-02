@@ -1,13 +1,14 @@
 // RuntimeEntry.cpp — Civ6DllLoader v2 Loader 入口（DllLoaderRuntime 工程产物，
-// 安装形态 = 游戏 exe 目录的 version.dll 代理）。
+// 安装形态 = 游戏 exe 目录的 winmm.dll 代理；1.0.x 及更早的机器上还可能是 version.dll，
+// 那种会话会在阶段 A 把自己迁移成 winmm.dll，见 LegacyProxyMigration）。
 //
 // v2 架构：
 //   - DllMain：DisableThreadLibraryCalls → 休眠检测（自身父目录 == 游戏 exe 目录，且宿主进程是
 //     CivilizationVI*.exe）通过才 spawn 工作线程；其它任何加载场合（别的进程加载了这份
-//     version.dll、或开发中直接 LoadLibrary 本模块）→ 直接返回 TRUE，什么都不做。
-//   - WorkerMain（阶段 A）：LoaderCore::InitEarly → HKS/Localization 导入
-//     → UiInject::ExtractResources → LoaderHooks::InstallAll → UiInject::Install
-//     → LoaderUpdate::CheckAndApplyUpdate → LoadPluginsOf(Global) → 线程退出。
+//     代理 DLL、或开发中直接 LoadLibrary 本模块）→ 直接返回 TRUE，什么都不做。
+//   - WorkerMain（阶段 A）：LoaderCore::InitEarly → LegacyProxyMigration（仅旧代理名会动作）
+//     → HKS/Localization 导入 → UiInject::ExtractResources → LoaderHooks::InstallAll
+//     → UiInject::Install → LoaderUpdate::CheckAndApplyUpdate → LoadPluginsOf(Global) → 线程退出。
 //   - 阶段 B（LoadDLL detour）在游戏线程 detour 内同步执行（LoaderCore::InitializeGameCorePhase）。
 //   - Global 插件仅启动时加载一次：运行期不再卸载/重装、也不再被 park；
 //     主菜单开关 mod 需要重启才生效。
@@ -21,6 +22,7 @@
 #include "LoaderCore.h"
 #include "LoaderHooks.h"
 #include "LoaderUpdate.h"
+#include "LegacyProxyMigration.h"
 #include "../common/Logger.h"
 #include "../common/Profiler.h"
 #include "Runtime.h"
@@ -86,14 +88,14 @@ bool ProcessExeIsGame() {
 }
 
 // 休眠检测：**两个条件同时成立**才启动 Loader：
-//   1) 自身父目录 == 进程 exe 父目录（version.dll 代理安装形态）；
+//   1) 自身父目录 == 进程 exe 父目录（winmm.dll / 旧 version.dll 代理安装形态）；
 //   2) 拉起本模块的进程就是游戏本体（CivilizationVI*.exe）。
-// 只比目录的话，任何从游戏 exe 目录加载这个 version.dll 的进程（崩溃上报器、第三方工具、
+// 只比目录的话，任何从游戏 exe 目录加载这份代理 DLL 的进程（崩溃上报器、第三方工具、
 // 覆盖层等）都会把 Loader 连同 Global 插件拉进自己的地址空间。
 // whyOut 回填失败原因（静态字面量，休眠留痕用），成功时为 nullptr；不想知道就传 nullptr。
 bool LoadedFromExeDirectory(HMODULE hModule, const wchar_t** whyOut) {
     if (NormalizeDir(ModuleDirectory(hModule)) != NormalizeDir(ModuleDirectory(nullptr))) {
-        if (whyOut) *whyOut = L"module dir != host exe dir (not a version.dll proxy install)";
+        if (whyOut) *whyOut = L"module dir != host exe dir (not a proxy install)";
         return false;
     }
     if (!ProcessExeIsGame()) {
@@ -117,6 +119,15 @@ DWORD WINAPI WorkerMain(LPVOID) {
     {
         PROFILE_SCOPE("InitEarly");
         LoaderCore::InitEarly();
+    }
+
+    // 1.1) 旧代理名迁移（通道②）：本模块若仍以历史代理名 version.dll 装着，就在这里把自己
+    //      改名成 winmm.dll。不做版本比较、不重启——本会话继续以 version.dll 跑完，
+    //      下次启动加载的就是 winmm.dll。失败只留日志，最坏情形与升级前完全一致。
+    //      必须在所有"按当前安装形态做事"的步骤之前：例如 LoaderUpdate 只认 winmm.dll。
+    {
+        PROFILE_SCOPE("LegacyProxyMigration");
+        LegacyProxyMigration::MigrateIfLegacyProxy(g_runtimeModule);
     }
 
     // 1.2) 进程级依赖导入：HavokScript（Lua VM）与 Localization。
@@ -250,7 +261,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         // 休眠检测：自身位于游戏 exe 目录、且宿主进程是 CivilizationVI*.exe 时才启动工作线程；
-        // 其它任何加载场合（别的进程加载了这份 version.dll、开发中直接 LoadLibrary）都直接休眠。
+        // 其它任何加载场合（别的进程加载了这份代理 DLL、开发中直接 LoadLibrary）都直接休眠。
         const wchar_t* sleepWhy = nullptr;
         if (!LoadedFromExeDirectory(hModule, &sleepWhy)) {
             // 此时 Logger 还没 Init（它由工作线程创建），写不了日志文件，只能靠 DebugView：

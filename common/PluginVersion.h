@@ -10,6 +10,11 @@
 // 不执行候选的 DllMain / TLS / 导出，与 RuntimePackage::ProbeVersion
 // 读 RCDATA 105 是同一套纪律。
 //
+// 资源名约定：标准写法是 .rc 里的 `1 VERSIONINFO`。若写成 `VS_VERSION_INFO VERSIONINFO`，
+// RC 会把第一列当字符串资源名，GetFileVersionInfo* 只认 MAKEINTRESOURCE(1)，于是读不到
+// （实机踩过）。ReadFileVersion 对此有兜底：API 返回 0 时枚举任意资源名的 RT_VERSION。
+// 即便如此，插件侧仍应写 ID 1 —— 资源管理器/sigcheck/PowerShell 都只认它。
+//
 // 为什么插件要版本号：多个 Mod 可能各带一份同名插件，扫描时按 basename
 // 去重只能留一份。旧规则是"路径字典序第一"（与版本无关，纯属偶然），
 // 现在改为"版本最高者胜"。

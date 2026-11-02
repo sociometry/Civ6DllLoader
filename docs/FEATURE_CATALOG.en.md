@@ -266,7 +266,7 @@ The guide's chapter 7 has the full detail.
 | Calling Lua from an arbitrary thread | All Lua primitives are game-thread only |
 | Automatic patch rollback | The loader does not roll back; plugins call `Unpatch` from `OnUnload` |
 | Injecting into in-match UI | Main menu only; use the native UI mechanisms in a match |
-| Loading a plugin without a version resource | Plugin DLLs must carry `VERSIONINFO`, otherwise they are rejected |
+| Loading a plugin without a version resource | Plugin DLLs must carry `VERSIONINFO`; the resource must be named with the numeric ID `1` (`VS_VERSION_INFO` makes the version APIs see nothing), otherwise they are rejected |
 | Using Global and GameCore-only entries in one module | Invisible at compile time; split the module by domain |
 
 ---

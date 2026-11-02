@@ -68,12 +68,12 @@ bool ProbeLocked(HANDLE file, const std::wstring& path, uint32_t& outVersion,
     // 后者的句柄属于进程里已加载的同名模块，它的资源可能来自另一个（已被替换的）文件内容。
     //
     // 但"已安装的是不是我们的 loader"这个判定必须放宽到 allowCodeMapped ——
-    // 因为游戏 exe 静态导入 version.dll，薄壳运行时目标文件【必然】已被代码映射
+    // 因为游戏 exe 静态导入 winmm.dll，薄壳运行时目标文件【必然】已被代码映射
     // （实测 LoadLibraryExW 直接返回该代码映射句柄，m&3==0）。若沿用严格判据，
     // 已装载的【我们自己的 loader】会被误判成"不是我们的"，进而被错误地接管覆盖。
     // 放宽后仍由下面的资源校验兜底：
     //   我们的 loader（无论是否已代码映射）-> 有 RCDATA 105 且 magic/format 正确 -> ok
-    //   外来 version.dll（含 System32 原生）-> 没有该资源 -> false
+    //   外来 winmm.dll（含 System32 原生）-> 没有该资源 -> false
     if (allowCodeMapped || (reinterpret_cast<uintptr_t>(module) & 3u) != 0) {
         HRSRC resource = FindResourceW(module,
             MAKEINTRESOURCEW(CIV6_DLL_LOADER_VERSION_RESOURCE_ID), RT_RCDATA);
@@ -173,7 +173,7 @@ bool StageCandidate(const std::wstring& source, const std::wstring& staged, uint
 bool PublishStaged(const std::wstring& staged, const std::wstring& installed,
     const std::wstring& backup) {
     if (backup.empty()) {
-        // 首次安装不覆盖扫描期间由其它安装者创建的 version.dll。
+        // 首次安装不覆盖扫描期间由其它安装者创建的 winmm.dll。
         if (MoveFileW(staged.c_str(), installed.c_str())) return true;
         Logger::Log("RuntimePackage: initial publish failed err=%lu", GetLastError());
         DeleteFileW(staged.c_str());
@@ -181,8 +181,8 @@ bool PublishStaged(const std::wstring& staged, const std::wstring& installed,
     }
     // 首选：ReplaceFile 单次原子替换 —— 被替换文件被重命名到 backup，替换文件顶替它的名字。
     // 旧实现在 MoveFileW(installed -> backup) 与 MoveFileW(staged -> installed) 之间存在
-    // "version.dll 不存在"的窗口：进程恰好在此被杀/断电，磁盘上就只剩 version_Old.dll，
-    // 下次启动 exe 的静态导入只能回退到 System32 的系统 version.dll，loader 静默消失一个会话。
+    // "winmm.dll 不存在"的窗口：进程恰好在此被杀/断电，磁盘上就只剩 winmm_Old.dll，
+    // 下次启动 exe 的静态导入只能回退到 System32 的系统 winmm.dll，loader 静默消失一个会话。
     if (!DeleteIfPresent(backup)) {
         Logger::Log("RuntimePackage: stale backup cleanup failed err=%lu", GetLastError());
         DeleteFileW(staged.c_str());
@@ -197,7 +197,7 @@ bool PublishStaged(const std::wstring& staged, const std::wstring& installed,
     Logger::Log("RuntimePackage: ReplaceFileW failed err=%lu; falling back to rename dance", replaceError);
 
     // 回退路径：ReplaceFileW 在"被替换文件正被映射为映像"等场合会被拒
-    //（ShellBootstrap 接管外来 version.dll 时确实会走到），此时退回两步改名：
+    //（ShellBootstrap 接管外来 winmm.dll 时确实会走到），此时退回两步改名：
     // 先把现役文件挪成 backup，再把 staged 改名到位。第二步失败就把 backup 改回原位；
     // 连恢复都失败时保留两份完整文件（见下），绝不删掉唯一的旧副本。
     // backup 已在上面清掉，不会撞名字。

@@ -130,6 +130,7 @@
     <ClCompile Include="RuntimeEntry.cpp" />
     <ClCompile Include="ProxyExports.cpp" />
     <ClCompile Include="LoaderUpdate.cpp" />
+    <ClCompile Include="LegacyProxyMigration.cpp" />
     <ClCompile Include="ImageAddress.cpp" />
     <ClCompile Include="LoaderHooks.cpp" />
     <ClCompile Include="PatchRegistry.cpp" />

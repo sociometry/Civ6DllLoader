@@ -23,8 +23,12 @@ struct RuntimeCandidate {
     uint32_t version = 0;
 };
 
-// 自身模块句柄 + 全路径（即 exe 目录\version.dll），并推导 exe 目录。
-// 判据是自身文件名不是 version.dll（开发中直接加载、或被别的宿主加载）→ 返回 false 直接退出。
+// 自身模块句柄 + 全路径（即 exe 目录\winmm.dll），并推导 exe 目录。
+// 判据是自身文件名不是 winmm.dll（开发中直接加载、被别的宿主加载、或以历史代理名
+// version.dll 运行）→ 返回 false 直接退出。
+//
+// 为什么"以 version.dll 身份运行"要退出而不是就地自更新：那种会话的职责是把自己迁到
+// winmm.dll（见 LegacyProxyMigration），在旧名字上做自更新只会把新文件继续装在旧名字上。
 bool GetSelfPath(std::wstring& outPath, std::wstring& outExeDir) {
     HMODULE hSelf = nullptr;
     if (!GetModuleHandleExW(
@@ -49,7 +53,7 @@ bool GetSelfPath(std::wstring& outPath, std::wstring& outExeDir) {
     outExeDir = outPath.substr(0, slash);
 
     const std::wstring fileName = outPath.substr(slash + 1);
-    return _wcsicmp(fileName.c_str(), L"version.dll") == 0;
+    return _wcsicmp(fileName.c_str(), CIV6_DLL_LOADER_PROXY_FILENAMEW) == 0;
 }
 
 // 路径比较统一走 common/EnabledMods.h 的 NormalizePath（weakly_canonical + 小写 + 反斜杠）。
@@ -73,25 +77,32 @@ bool BetterThan(const RuntimeCandidate& a, const RuntimeCandidate& b) {
 }  // namespace
 
 void CheckAndApplyUpdate() {
-    // a. 自身路径与 exe 目录（文件名非 version.dll 的异常场合直接退出）
+    // a. 自身路径与 exe 目录（文件名非 winmm.dll 的异常场合直接退出）
     std::wstring selfPath, exeDir;
     if (!GetSelfPath(selfPath, exeDir)) {
         return;
     }
     Logger::Log("LoaderUpdate: self=%ls", selfPath.c_str());
 
-    const std::wstring oldPath = exeDir + L"\\version_Old.dll";
-    const std::wstring tmpPath = exeDir + L"\\version.tmp";
-    const std::wstring dllPath = exeDir + L"\\version.dll";
+    const std::wstring oldPath = exeDir + L"\\" CIV6_DLL_LOADER_PROXY_OLD_FILENAMEW;
+    const std::wstring tmpPath = exeDir + L"\\" CIV6_DLL_LOADER_PROXY_TMP_FILENAMEW;
+    const std::wstring dllPath = exeDir + L"\\" CIV6_DLL_LOADER_PROXY_FILENAMEW;
 
-    // a2. 每次启动清理上一版残留；version_Old.dll 存在 = 本会话是自更新后的首次运行。
-    //     仅清理 + 日志，不弹窗。
-    const bool wasUpdated = GetFileAttributesW(oldPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-    if (wasUpdated) {
-        if (!DeleteFileW(oldPath.c_str())) {
-            Logger::Log("LoaderUpdate: delete version_Old.dll failed err=%lu, will retry next run", GetLastError());
+    // a2. 每次启动清掉上一版残留（仅清理 + 日志，不弹窗）：
+    //     winmm_Old.dll    = 本会话是自更新 / 接管外来 winmm.dll 之后的首次运行；
+    //     version_Old.dll  = 从旧代理名 version.dll 迁移过来的机器留下的旧 loader 备份。
+    //     两者都只是"被顶掉的旧文件"：进程内没有任何人加载这两个名字（exe 只静态导入
+    //     winmm.dll 与 version.dll），留着不清理只会让用户以为还存在两条安装。
+    const wchar_t* staleNames[] = {CIV6_DLL_LOADER_PROXY_OLD_FILENAMEW,
+                                   CIV6_DLL_LOADER_LEGACY_PROXY_OLD_FILENAMEW};
+    for (const wchar_t* stale : staleNames) {
+        const std::wstring stalePath = exeDir + L"\\" + stale;
+        if (GetFileAttributesW(stalePath.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        if (!DeleteFileW(stalePath.c_str())) {
+            Logger::Log("LoaderUpdate: delete %ls failed err=%lu, will retry next run",
+                stale, GetLastError());
         } else {
-            Logger::Log("LoaderUpdate: removed stale version_Old.dll (post-update cleanup)");
+            Logger::Log("LoaderUpdate: removed stale %ls (post-update cleanup)", stale);
         }
     }
 

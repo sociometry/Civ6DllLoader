@@ -14,7 +14,7 @@ namespace RuntimePackage {
 bool ProbeVersion(const std::wstring& path, uint32_t& outVersion);
 
 // 放宽版：允许复用进程里已存在的代码映射。**只用于"已安装的这个文件是不是我们的
-// loader"** 这一判定 —— 因为游戏 exe 静态导入 version.dll，薄壳运行时该文件必然
+// loader"** 这一判定 —— 因为游戏 exe 静态导入 winmm.dll，薄壳运行时该文件必然
 // 已被代码映射，严格版会把我们自己的 loader 误判成外来文件（详见 .cpp 内说明）。
 // PE 校验与 RCDATA 105 + magic/format 校验与严格版完全一致。
 bool ProbeVersionIncludingLoaded(const std::wstring& path, uint32_t& outVersion);

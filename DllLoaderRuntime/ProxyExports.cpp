@@ -1,34 +1,241 @@
-// ProxyExports.cpp — Civ6DllLoader v2 version.dll 代理导出。
+// ProxyExports.cpp -- Civ6DllLoader forwarding exports (winmm.dll).
 //
-// 来源：E:\WorkSpace\Civ6\version.cpp（用户提供的代理 DLL 代码）。
-// 17 条 /EXPORT 转发 pragma 连同 MAKE_EXPORT 宏定义逐字搬入本文件，原注释风格一并保留。
-// 与原文件不同：① 本项目只有 x64 配置，原文件里的 SysWOW64 分支已删除（见下方宏）；
-// ② DllMain 不在此处（统一在 RuntimeEntry.cpp）。
+// GENERATED FILE -- do not edit by hand. Regenerate after changing the proxy target
+// or after a Windows update changes the real DLL's exports:
 //
-// 作用（见 docs/ARCHITECTURE.md §1.1）：Loader 以 version.dll 名义安装在游戏 exe 目录时，
-// 游戏对 version.dll 的静态导入（GetFileVersionInfoExW/SizeExW/W/SizeW 等 4 个 IAT 槽）
-// 被转发到系统 System32/SysWOW64 真 version.dll，崩溃日志/版本上报功能原样工作；
-// 其余 13 条转发保证对 version API 的间接调用同样落到系统 DLL。
+//   python tools/gen_proxy_exports.py C:\Windows\System32\winmm.dll -o DllLoaderRuntime/ProxyExports.cpp
+//     --aux C:\Windows\System32\version.dll --aux-base 183
+//
+// Source: C:\Windows\System32\winmm.dll (181 exports, ordinal base 2, 180 named, 1 unnamed, 0 forwarded)
+//
+// 作用（docs/ARCHITECTURE.md §1.1）：Loader 以 winmm.dll 名义安装在游戏 exe 目录时，
+// exe 对它的静态导入必须原样落到系统真 DLL 上，否则版本查询/计时器/音频等一切
+// 依赖它的代码都会失效。
+//
+// 为什么是 GLOBALROOT 绝对路径，而不是 .def 里的 "name=WINMM.Func"：
+// 后者按普通 DLL 搜索顺序解析，exe 目录里这份代理自己会第一个命中 -> 自转发死循环。
+// 绝对路径绕过搜索顺序，直接指向系统目录里的真身。
+//
+// 序号与真 DLL 完全一致，因此按序号（GetProcAddress(h, MAKEINTRESOURCE(n)) 或
+// 序号导入）使用它的模块也能正确落地；真 DLL 里无名的序号这里以 NONAME 复刻。
 
 #include "pch.h"
 
-// 本项目只有 x64 配置（Win32 配置已移除）：转发目标固定 System32，
-// 原文件里 SysWOW64 那一支不再保留。
-#define MAKE_EXPORT(func) "/EXPORT:" func "=\\\\.\\\\GLOBALROOT\\\\SystemRoot\\\\System32\\\\version.dll." func
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoA"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoByHandle"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoExA"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoExW"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoSizeA"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoSizeExA"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoSizeExW"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoSizeW"))
-#pragma comment(linker, MAKE_EXPORT("GetFileVersionInfoW"))
-#pragma comment(linker, MAKE_EXPORT("VerFindFileA"))
-#pragma comment(linker, MAKE_EXPORT("VerFindFileW"))
-#pragma comment(linker, MAKE_EXPORT("VerInstallFileA"))
-#pragma comment(linker, MAKE_EXPORT("VerInstallFileW"))
-#pragma comment(linker, MAKE_EXPORT("VerLanguageNameA"))
-#pragma comment(linker, MAKE_EXPORT("VerLanguageNameW"))
-#pragma comment(linker, MAKE_EXPORT("VerQueryValueA"))
-#pragma comment(linker, MAKE_EXPORT("VerQueryValueW"))
+// 本项目只有 x64 配置，转发目标固定 System32。
+#define MAKE_EXPORT(name, ord) "/EXPORT:" name "=\\\\.\\\\GLOBALROOT\\\\SystemRoot\\\\System32\\\\winmm.dll." name ",@" #ord
+#define MAKE_EXPORT_NONAME(name, ord) "/EXPORT:" name "=\\\\.\\\\GLOBALROOT\\\\SystemRoot\\\\System32\\\\winmm.dll.#" #ord ",@" #ord ",NONAME"
+
+// ordinal 2 has no name in the real DLL; replicate it as NONAME.
+#pragma comment(linker, MAKE_EXPORT_NONAME("__proxy2", 2))
+#pragma comment(linker, MAKE_EXPORT("mciExecute", 3))
+#pragma comment(linker, MAKE_EXPORT("CloseDriver", 4))
+#pragma comment(linker, MAKE_EXPORT("DefDriverProc", 5))
+#pragma comment(linker, MAKE_EXPORT("DriverCallback", 6))
+#pragma comment(linker, MAKE_EXPORT("DrvGetModuleHandle", 7))
+#pragma comment(linker, MAKE_EXPORT("GetDriverModuleHandle", 8))
+#pragma comment(linker, MAKE_EXPORT("OpenDriver", 9))
+#pragma comment(linker, MAKE_EXPORT("PlaySound", 10))
+#pragma comment(linker, MAKE_EXPORT("PlaySoundA", 11))
+#pragma comment(linker, MAKE_EXPORT("PlaySoundW", 12))
+#pragma comment(linker, MAKE_EXPORT("SendDriverMessage", 13))
+#pragma comment(linker, MAKE_EXPORT("WOWAppExit", 14))
+#pragma comment(linker, MAKE_EXPORT("auxGetDevCapsA", 15))
+#pragma comment(linker, MAKE_EXPORT("auxGetDevCapsW", 16))
+#pragma comment(linker, MAKE_EXPORT("auxGetNumDevs", 17))
+#pragma comment(linker, MAKE_EXPORT("auxGetVolume", 18))
+#pragma comment(linker, MAKE_EXPORT("auxOutMessage", 19))
+#pragma comment(linker, MAKE_EXPORT("auxSetVolume", 20))
+#pragma comment(linker, MAKE_EXPORT("joyConfigChanged", 21))
+#pragma comment(linker, MAKE_EXPORT("joyGetDevCapsA", 22))
+#pragma comment(linker, MAKE_EXPORT("joyGetDevCapsW", 23))
+#pragma comment(linker, MAKE_EXPORT("joyGetNumDevs", 24))
+#pragma comment(linker, MAKE_EXPORT("joyGetPos", 25))
+#pragma comment(linker, MAKE_EXPORT("joyGetPosEx", 26))
+#pragma comment(linker, MAKE_EXPORT("joyGetThreshold", 27))
+#pragma comment(linker, MAKE_EXPORT("joyReleaseCapture", 28))
+#pragma comment(linker, MAKE_EXPORT("joySetCapture", 29))
+#pragma comment(linker, MAKE_EXPORT("joySetThreshold", 30))
+#pragma comment(linker, MAKE_EXPORT("mciDriverNotify", 31))
+#pragma comment(linker, MAKE_EXPORT("mciDriverYield", 32))
+#pragma comment(linker, MAKE_EXPORT("mciFreeCommandResource", 33))
+#pragma comment(linker, MAKE_EXPORT("mciGetCreatorTask", 34))
+#pragma comment(linker, MAKE_EXPORT("mciGetDeviceIDA", 35))
+#pragma comment(linker, MAKE_EXPORT("mciGetDeviceIDFromElementIDA", 36))
+#pragma comment(linker, MAKE_EXPORT("mciGetDeviceIDFromElementIDW", 37))
+#pragma comment(linker, MAKE_EXPORT("mciGetDeviceIDW", 38))
+#pragma comment(linker, MAKE_EXPORT("mciGetDriverData", 39))
+#pragma comment(linker, MAKE_EXPORT("mciGetErrorStringA", 40))
+#pragma comment(linker, MAKE_EXPORT("mciGetErrorStringW", 41))
+#pragma comment(linker, MAKE_EXPORT("mciGetYieldProc", 42))
+#pragma comment(linker, MAKE_EXPORT("mciLoadCommandResource", 43))
+#pragma comment(linker, MAKE_EXPORT("mciSendCommandA", 44))
+#pragma comment(linker, MAKE_EXPORT("mciSendCommandW", 45))
+#pragma comment(linker, MAKE_EXPORT("mciSendStringA", 46))
+#pragma comment(linker, MAKE_EXPORT("mciSendStringW", 47))
+#pragma comment(linker, MAKE_EXPORT("mciSetDriverData", 48))
+#pragma comment(linker, MAKE_EXPORT("mciSetYieldProc", 49))
+#pragma comment(linker, MAKE_EXPORT("midiConnect", 50))
+#pragma comment(linker, MAKE_EXPORT("midiDisconnect", 51))
+#pragma comment(linker, MAKE_EXPORT("midiInAddBuffer", 52))
+#pragma comment(linker, MAKE_EXPORT("midiInClose", 53))
+#pragma comment(linker, MAKE_EXPORT("midiInGetDevCapsA", 54))
+#pragma comment(linker, MAKE_EXPORT("midiInGetDevCapsW", 55))
+#pragma comment(linker, MAKE_EXPORT("midiInGetErrorTextA", 56))
+#pragma comment(linker, MAKE_EXPORT("midiInGetErrorTextW", 57))
+#pragma comment(linker, MAKE_EXPORT("midiInGetID", 58))
+#pragma comment(linker, MAKE_EXPORT("midiInGetNumDevs", 59))
+#pragma comment(linker, MAKE_EXPORT("midiInMessage", 60))
+#pragma comment(linker, MAKE_EXPORT("midiInOpen", 61))
+#pragma comment(linker, MAKE_EXPORT("midiInPrepareHeader", 62))
+#pragma comment(linker, MAKE_EXPORT("midiInReset", 63))
+#pragma comment(linker, MAKE_EXPORT("midiInStart", 64))
+#pragma comment(linker, MAKE_EXPORT("midiInStop", 65))
+#pragma comment(linker, MAKE_EXPORT("midiInUnprepareHeader", 66))
+#pragma comment(linker, MAKE_EXPORT("midiOutCacheDrumPatches", 67))
+#pragma comment(linker, MAKE_EXPORT("midiOutCachePatches", 68))
+#pragma comment(linker, MAKE_EXPORT("midiOutClose", 69))
+#pragma comment(linker, MAKE_EXPORT("midiOutGetDevCapsA", 70))
+#pragma comment(linker, MAKE_EXPORT("midiOutGetDevCapsW", 71))
+#pragma comment(linker, MAKE_EXPORT("midiOutGetErrorTextA", 72))
+#pragma comment(linker, MAKE_EXPORT("midiOutGetErrorTextW", 73))
+#pragma comment(linker, MAKE_EXPORT("midiOutGetID", 74))
+#pragma comment(linker, MAKE_EXPORT("midiOutGetNumDevs", 75))
+#pragma comment(linker, MAKE_EXPORT("midiOutGetVolume", 76))
+#pragma comment(linker, MAKE_EXPORT("midiOutLongMsg", 77))
+#pragma comment(linker, MAKE_EXPORT("midiOutMessage", 78))
+#pragma comment(linker, MAKE_EXPORT("midiOutOpen", 79))
+#pragma comment(linker, MAKE_EXPORT("midiOutPrepareHeader", 80))
+#pragma comment(linker, MAKE_EXPORT("midiOutReset", 81))
+#pragma comment(linker, MAKE_EXPORT("midiOutSetVolume", 82))
+#pragma comment(linker, MAKE_EXPORT("midiOutShortMsg", 83))
+#pragma comment(linker, MAKE_EXPORT("midiOutUnprepareHeader", 84))
+#pragma comment(linker, MAKE_EXPORT("midiStreamClose", 85))
+#pragma comment(linker, MAKE_EXPORT("midiStreamOpen", 86))
+#pragma comment(linker, MAKE_EXPORT("midiStreamOut", 87))
+#pragma comment(linker, MAKE_EXPORT("midiStreamPause", 88))
+#pragma comment(linker, MAKE_EXPORT("midiStreamPosition", 89))
+#pragma comment(linker, MAKE_EXPORT("midiStreamProperty", 90))
+#pragma comment(linker, MAKE_EXPORT("midiStreamRestart", 91))
+#pragma comment(linker, MAKE_EXPORT("midiStreamStop", 92))
+#pragma comment(linker, MAKE_EXPORT("mixerClose", 93))
+#pragma comment(linker, MAKE_EXPORT("mixerGetControlDetailsA", 94))
+#pragma comment(linker, MAKE_EXPORT("mixerGetControlDetailsW", 95))
+#pragma comment(linker, MAKE_EXPORT("mixerGetDevCapsA", 96))
+#pragma comment(linker, MAKE_EXPORT("mixerGetDevCapsW", 97))
+#pragma comment(linker, MAKE_EXPORT("mixerGetID", 98))
+#pragma comment(linker, MAKE_EXPORT("mixerGetLineControlsA", 99))
+#pragma comment(linker, MAKE_EXPORT("mixerGetLineControlsW", 100))
+#pragma comment(linker, MAKE_EXPORT("mixerGetLineInfoA", 101))
+#pragma comment(linker, MAKE_EXPORT("mixerGetLineInfoW", 102))
+#pragma comment(linker, MAKE_EXPORT("mixerGetNumDevs", 103))
+#pragma comment(linker, MAKE_EXPORT("mixerMessage", 104))
+#pragma comment(linker, MAKE_EXPORT("mixerOpen", 105))
+#pragma comment(linker, MAKE_EXPORT("mixerSetControlDetails", 106))
+#pragma comment(linker, MAKE_EXPORT("mmDrvInstall", 107))
+#pragma comment(linker, MAKE_EXPORT("mmGetCurrentTask", 108))
+#pragma comment(linker, MAKE_EXPORT("mmTaskBlock", 109))
+#pragma comment(linker, MAKE_EXPORT("mmTaskCreate", 110))
+#pragma comment(linker, MAKE_EXPORT("mmTaskSignal", 111))
+#pragma comment(linker, MAKE_EXPORT("mmTaskYield", 112))
+#pragma comment(linker, MAKE_EXPORT("mmioAdvance", 113))
+#pragma comment(linker, MAKE_EXPORT("mmioAscend", 114))
+#pragma comment(linker, MAKE_EXPORT("mmioClose", 115))
+#pragma comment(linker, MAKE_EXPORT("mmioCreateChunk", 116))
+#pragma comment(linker, MAKE_EXPORT("mmioDescend", 117))
+#pragma comment(linker, MAKE_EXPORT("mmioFlush", 118))
+#pragma comment(linker, MAKE_EXPORT("mmioGetInfo", 119))
+#pragma comment(linker, MAKE_EXPORT("mmioInstallIOProcA", 120))
+#pragma comment(linker, MAKE_EXPORT("mmioInstallIOProcW", 121))
+#pragma comment(linker, MAKE_EXPORT("mmioOpenA", 122))
+#pragma comment(linker, MAKE_EXPORT("mmioOpenW", 123))
+#pragma comment(linker, MAKE_EXPORT("mmioRead", 124))
+#pragma comment(linker, MAKE_EXPORT("mmioRenameA", 125))
+#pragma comment(linker, MAKE_EXPORT("mmioRenameW", 126))
+#pragma comment(linker, MAKE_EXPORT("mmioSeek", 127))
+#pragma comment(linker, MAKE_EXPORT("mmioSendMessage", 128))
+#pragma comment(linker, MAKE_EXPORT("mmioSetBuffer", 129))
+#pragma comment(linker, MAKE_EXPORT("mmioSetInfo", 130))
+#pragma comment(linker, MAKE_EXPORT("mmioStringToFOURCCA", 131))
+#pragma comment(linker, MAKE_EXPORT("mmioStringToFOURCCW", 132))
+#pragma comment(linker, MAKE_EXPORT("mmioWrite", 133))
+#pragma comment(linker, MAKE_EXPORT("mmsystemGetVersion", 134))
+#pragma comment(linker, MAKE_EXPORT("sndPlaySoundA", 135))
+#pragma comment(linker, MAKE_EXPORT("sndPlaySoundW", 136))
+#pragma comment(linker, MAKE_EXPORT("timeBeginPeriod", 137))
+#pragma comment(linker, MAKE_EXPORT("timeEndPeriod", 138))
+#pragma comment(linker, MAKE_EXPORT("timeGetDevCaps", 139))
+#pragma comment(linker, MAKE_EXPORT("timeGetSystemTime", 140))
+#pragma comment(linker, MAKE_EXPORT("timeGetTime", 141))
+#pragma comment(linker, MAKE_EXPORT("timeKillEvent", 142))
+#pragma comment(linker, MAKE_EXPORT("timeSetEvent", 143))
+#pragma comment(linker, MAKE_EXPORT("waveInAddBuffer", 144))
+#pragma comment(linker, MAKE_EXPORT("waveInClose", 145))
+#pragma comment(linker, MAKE_EXPORT("waveInGetDevCapsA", 146))
+#pragma comment(linker, MAKE_EXPORT("waveInGetDevCapsW", 147))
+#pragma comment(linker, MAKE_EXPORT("waveInGetErrorTextA", 148))
+#pragma comment(linker, MAKE_EXPORT("waveInGetErrorTextW", 149))
+#pragma comment(linker, MAKE_EXPORT("waveInGetID", 150))
+#pragma comment(linker, MAKE_EXPORT("waveInGetNumDevs", 151))
+#pragma comment(linker, MAKE_EXPORT("waveInGetPosition", 152))
+#pragma comment(linker, MAKE_EXPORT("waveInMessage", 153))
+#pragma comment(linker, MAKE_EXPORT("waveInOpen", 154))
+#pragma comment(linker, MAKE_EXPORT("waveInPrepareHeader", 155))
+#pragma comment(linker, MAKE_EXPORT("waveInReset", 156))
+#pragma comment(linker, MAKE_EXPORT("waveInStart", 157))
+#pragma comment(linker, MAKE_EXPORT("waveInStop", 158))
+#pragma comment(linker, MAKE_EXPORT("waveInUnprepareHeader", 159))
+#pragma comment(linker, MAKE_EXPORT("waveOutBreakLoop", 160))
+#pragma comment(linker, MAKE_EXPORT("waveOutClose", 161))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetDevCapsA", 162))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetDevCapsW", 163))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetErrorTextA", 164))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetErrorTextW", 165))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetID", 166))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetNumDevs", 167))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetPitch", 168))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetPlaybackRate", 169))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetPosition", 170))
+#pragma comment(linker, MAKE_EXPORT("waveOutGetVolume", 171))
+#pragma comment(linker, MAKE_EXPORT("waveOutMessage", 172))
+#pragma comment(linker, MAKE_EXPORT("waveOutOpen", 173))
+#pragma comment(linker, MAKE_EXPORT("waveOutPause", 174))
+#pragma comment(linker, MAKE_EXPORT("waveOutPrepareHeader", 175))
+#pragma comment(linker, MAKE_EXPORT("waveOutReset", 176))
+#pragma comment(linker, MAKE_EXPORT("waveOutRestart", 177))
+#pragma comment(linker, MAKE_EXPORT("waveOutSetPitch", 178))
+#pragma comment(linker, MAKE_EXPORT("waveOutSetPlaybackRate", 179))
+#pragma comment(linker, MAKE_EXPORT("waveOutSetVolume", 180))
+#pragma comment(linker, MAKE_EXPORT("waveOutUnprepareHeader", 181))
+#pragma comment(linker, MAKE_EXPORT("waveOutWrite", 182))
+
+// ---------------------------------------------------------------------------
+// 附属导出：version.dll 的函数集（序号从 183 起，与上面的真序号不冲突）
+//
+// 为什么需要：1.0.x 的 loader 是以 version.dll 名字安装的，它的自更新会把【本文件】
+// 装到 version.dll 那个名字上。那个名字必须继续导出 VERSION.dll 的函数，否则 exe 的
+// 静态导入（GetFileVersionInfo*/VerQueryValue 等）在加载期就解析失败，游戏直接启动
+// 不了 —— 而把名字搬到 winmm.dll 要等下一次启动（LegacyProxyMigration）。
+//
+// 对 winmm.dll 这个角色没有任何影响：没有模块从 winmm.dll 导入这些名字，多出来的
+// 只是导出表项。真 version.dll 的这些导出本来就是名称导出，序号是这里自己排的，
+// 按序号导入 version.dll 的模块在这条历史路径上不受支持（换成 winmm.dll 之后也不再需要）。
+// ---------------------------------------------------------------------------
+#define MAKE_AUX_EXPORT(name, ord) "/EXPORT:" name "=\\\\.\\\\GLOBALROOT\\\\SystemRoot\\\\System32\\\\version.dll." name ",@" #ord
+
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoA", 183))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoByHandle", 184))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoExA", 185))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoExW", 186))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoSizeA", 187))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoSizeExA", 188))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoSizeExW", 189))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoSizeW", 190))
+#pragma comment(linker, MAKE_AUX_EXPORT("GetFileVersionInfoW", 191))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerFindFileA", 192))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerFindFileW", 193))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerInstallFileA", 194))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerInstallFileW", 195))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerLanguageNameA", 196))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerLanguageNameW", 197))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerQueryValueA", 198))
+#pragma comment(linker, MAKE_AUX_EXPORT("VerQueryValueW", 199))

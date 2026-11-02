@@ -117,7 +117,7 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why);
 //   2) nextTarget 是自然对齐的指针（stub 用 qword 读）；
 //   3) 三个偏移与结构体大小都落在 int32 内（asmjit 的位移宽度）。
 // 跨二进制的 stub 复用不需要额外保证：stub 里嵌的是本进程的 &HookSite 与本 DLL 编译期的
-// 偏移，而 version.dll 自更新会重启进程，新进程里不存在旧 stub。
+// 偏移，而 winmm.dll 自更新会重启进程，新进程里不存在旧 stub。
 static_assert(std::is_same_v<std::remove_cv_t<decltype(HookSite::hasCapture)>, bool> &&
               sizeof(HookSite::hasCapture) == 1,
               "stub 用 cmp byte ptr 读 hasCapture：它必须恰好是一个字节");

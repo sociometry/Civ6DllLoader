@@ -7,6 +7,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cwctype>
+#include <vector>
+
+// GetFileVersionInfo*/VerQueryValue 在 version.lib 里。用 pragma 而不是 vcxproj 的
+// AdditionalDependencies：本文件按 NotUsing 预编译头独立编译，依赖应当跟着源码走。
+#pragma comment(lib, "version.lib")
 
 namespace PluginVersion {
 namespace {
@@ -32,78 +37,91 @@ std::wstring GroupKey(const std::wstring& path) {
 }
 
 constexpr DWORD kVsFixedFileInfoSignature = 0xFEEF04BDu;
-// RT_VERSION 的整型 id。用 MAKEINTRESOURCE 而不是 RT_VERSION 宏：后者是
-// MAKEINTRESOURCE(16)，在需要常量表达式的场合不通用。
-constexpr WORD kVersionResourceType = 16;
 
-// 从 RT_VERSION 资源块里取 VS_FIXEDFILEINFO 的 Value 字段。
-//
-// 资源布局（VS_VERSIONINFO）：
-//   WORD wLength; WORD wValueLength; WORD wType; WCHAR szKey[]（"VS_VERSION_INFO\0"）
-//   -> 4 字节对齐 -> VS_FIXEDFILEINFO Value（wValueLength 非 0 时存在）-> 子块
-// 只想拿文件版本，所以不解析子块（StringFileInfo / VarFileInfo）。
-bool ExtractFixedFileInfo(const BYTE* data, size_t size, VS_FIXEDFILEINFO& out) {
-    if (!data || size < 6) return false;
-
-    WORD valueLength = 0;
-    std::memcpy(&valueLength, data + 2, sizeof(valueLength));
-
-    // 跳过 szKey：以 WCHAR 0 结尾，起点固定为偏移 6。
-    size_t cursor = 6;
-    while (cursor + sizeof(WCHAR) <= size) {
-        WCHAR ch = 0;
-        std::memcpy(&ch, data + cursor, sizeof(ch));
-        cursor += sizeof(WCHAR);
-        if (ch == 0) break;
-    }
-    // 4 字节对齐
-    cursor = (cursor + 3u) & ~static_cast<size_t>(3u);
-
-    if (valueLength < sizeof(VS_FIXEDFILEINFO)) return false;
-    if (cursor + sizeof(VS_FIXEDFILEINFO) > size) return false;
-
-    std::memcpy(&out, data + cursor, sizeof(out));
-    return out.dwSignature == kVsFixedFileInfoSignature;
+// 从一块 VS_VERSIONINFO 数据里取出 VS_FIXEDFILEINFO（"\" 根块）。
+bool ExtractFixed(const void* block, VS_FIXEDFILEINFO& out) {
+    VS_FIXEDFILEINFO* fixed = nullptr;
+    UINT fixedSize = 0;
+    if (!VerQueryValueW(block, L"\\", reinterpret_cast<void**>(&fixed), &fixedSize)) return false;
+    if (!fixed || fixedSize < sizeof(VS_FIXEDFILEINFO)) return false;
+    if (fixed->dwSignature != kVsFixedFileInfoSignature) return false;
+    out = *fixed;
+    return true;
 }
 
-// 只读文件、不加载模块：按数据映射打开，FindResource 取 RT_VERSION。
+// 兜底：资源名不是数字 1 的 RT_VERSION。
 //
-// 为什么不用 GetFileVersionInfo*/VerQueryValue：Loader 自身就是以 version.dll
-// 身份注入的代理，导入 VERSION.dll 会解析到自己（自引用），能否工作取决于
-// 转发导出是否恰好覆盖到那几个函数 —— 这是启动路径，不值得赌。这里只用
-// kernel32，纪律与 RuntimePackage 读 RCDATA 105 完全一致。
-bool ReadVersionResource(const std::wstring& path, VS_FIXEDFILEINFO& out) {
-    const HMODULE module = LoadLibraryExW(path.c_str(), nullptr,
-        LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+// 为什么需要：GetFileVersionInfo* 只按 MAKEINTRESOURCE(1) 找 RT_VERSION。若 .rc 写成
+// `VS_VERSION_INFO VERSIONINFO`（把关键字当资源名），资源本身完全合法、只是挂在字符串名下，
+// 这几个 API 一律返回 0 —— 于是插件被版本门禁判成"没有版本"直接丢弃，现象是文件明明有
+// VERSIONINFO 却加载不了。1.0 时代手写解析枚举资源名，所以不受影响；换用 Win32 API 后
+// 这个差异才暴露出来，实机已在 Civ6BasePlugin / FourRing 上复现（三份 .rc 同名写法）。
+//
+// 只枚举、只读块数据，仍然不加载模块、不跑 DllMain（LOAD_LIBRARY_AS_DATAFILE 把文件当
+// 数据映射，DllMain 不会执行）。
+struct FirstVersionName {
+    const void* name = nullptr;
+    bool found = false;
+};
+
+BOOL CALLBACK FindFirstVersionName(HMODULE module, LPCWSTR /*type*/, LPWSTR name, LONG_PTR param) {
+    auto* state = reinterpret_cast<FirstVersionName*>(param);
+    if (!state || state->found) return FALSE;
+    state->name = name;
+    state->found = true;
+    return FALSE;  // 只取第一个
+}
+
+bool ReadFixedFromAnyVersionResource(const std::wstring& path, VS_FIXEDFILEINFO& out) {
+    HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE);
     if (!module) return false;
 
-    // 枚举 RT_VERSION 下的所有块，取第一个能解析出 VS_FIXEDFILEINFO 的。
-    // 不假设资源 id 一定是 1：VS 默认用 1，但手写 .rc 可以取别的值。
-    struct EnumContext {
-        HMODULE module = nullptr;
-        VS_FIXEDFILEINFO* out = nullptr;
-        bool found = false;
-    } context{module, &out, false};
+    FirstVersionName first;
+    EnumResourceNamesW(module, MAKEINTRESOURCEW(16), FindFirstVersionName,
+        reinterpret_cast<LONG_PTR>(&first));
 
-    EnumResourceNamesW(module, MAKEINTRESOURCEW(kVersionResourceType),
-        [](HMODULE handle, LPCWSTR /*type*/, LPWSTR name, LONG_PTR param) -> BOOL {
-            auto* ctx = reinterpret_cast<EnumContext*>(param);
-            const HRSRC res = FindResourceW(handle, name, MAKEINTRESOURCEW(kVersionResourceType));
-            if (!res) return TRUE;
-            const DWORD size = SizeofResource(handle, res);
-            const HGLOBAL loaded = LoadResource(handle, res);
-            const void* bytes = loaded ? LockResource(loaded) : nullptr;
-            if (bytes && size && ExtractFixedFileInfo(static_cast<const BYTE*>(bytes), size, *ctx->out)) {
-                ctx->found = true;
-                return FALSE;   // 已经拿到，停止枚举
+    bool ok = false;
+    if (first.found) {
+        HRSRC resource = FindResourceW(module, static_cast<LPCWSTR>(first.name), MAKEINTRESOURCEW(16));
+        if (resource) {
+            const DWORD size = SizeofResource(module, resource);
+            HGLOBAL loaded = LoadResource(module, resource);
+            const void* data = loaded ? LockResource(loaded) : nullptr;
+            if (data && size >= sizeof(VS_FIXEDFILEINFO)) {
+                ok = ExtractFixed(data, out);
             }
-            return TRUE;
-        },
-        reinterpret_cast<LONG_PTR>(&context));
+        }
+    }
 
-    const bool ok = context.found;
     FreeLibrary(module);
     return ok;
+}
+
+// 用 Win32 版本 API 读 VS_FIXEDFILEINFO。
+//
+// 1.0 时代这里是手写解析 RT_VERSION 资源（LoadLibraryExW(AS_DATAFILE) + EnumResourceNamesW
+// + 跳过 szKey、4 字节对齐、校验签名），原因写在当时的注释里：Loader 自己就以 version.dll
+// 身份注入，导出 VERSION.dll 的函数会解析到自己（自引用），所以只能绕开这几个 API。
+// 代理名改成 winmm.dll 之后（见 common/LoaderProtocol.h）这个理由消失了。
+//
+// **耦合警告**：这段代码从此依赖"Loader 不以 version.dll 为代理名"。若将来代理名回到
+// VERSION.dll，这里必须改回资源解析，否则会解析到自己并大概率失败。
+//
+// 约束（PluginVersion.h:9）：不得加载候选模块、不得跑它的 DllMain。
+// GetFileVersionInfoSizeW/GetFileVersionInfoW 只读文件、不执行代码，与原来的
+// LoadLibraryExW(AS_DATAFILE) 语义一致；文件不存在或没有 VS_VERSIONINFO 时前者返回 0。
+// 返回 0 时再走一次"任意资源名"的兜底，覆盖 .rc 把资源名写成字符串的插件。
+bool ReadFixedFileInfo(const std::wstring& path, VS_FIXEDFILEINFO& out) {
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), nullptr);
+    if (size == 0) return ReadFixedFromAnyVersionResource(path, out);
+
+    std::vector<BYTE> buffer(size);
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, buffer.data())) {
+        return ReadFixedFromAnyVersionResource(path, out);
+    }
+
+    if (ExtractFixed(buffer.data(), out)) return true;
+    return ReadFixedFromAnyVersionResource(path, out);
 }
 
 }  // namespace
@@ -112,7 +130,7 @@ Version ReadFileVersion(const std::wstring& path) {
     if (path.empty()) return kNoVersion;
 
     VS_FIXEDFILEINFO fixed{};
-    if (!ReadVersionResource(path, fixed)) return kNoVersion;
+    if (!ReadFixedFileInfo(path, fixed)) return kNoVersion;
 
     // VS_FIXEDFILEINFO 的布局：MS = (major << 16) | minor，LS = (patch << 16) | build。
     // 拆成四段再按 a.b.c.d 打包，使整数比较等价于版本字典序。

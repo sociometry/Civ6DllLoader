@@ -268,7 +268,7 @@ UiInject: context 已加载 (FrontEndUI_MyMod)
 | 在任意线程调 Lua | 全部 Lua 原语仅限游戏线程 |
 | 自动回滚补丁 | Loader 不回滚，需插件自己在 `OnUnload` 撤销 |
 | 给对局内 UI 注入 | 只支持主菜单，对局内用原生 UI 机制 |
-| 加载无版本资源的插件 | 插件 DLL 必须带 `VERSIONINFO`，否则拒载 |
+| 加载无版本资源的插件 | 插件 DLL 必须带 `VERSIONINFO`（资源名须为数字 ID `1`，写成 `VS_VERSION_INFO` 会让版本 API 读不到），否则拒载 |
 | 同时用 Global 与 GameCore 专属入口 | 编译期就不可见，需按域拆分模块 |
 
 ---

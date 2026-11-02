@@ -143,8 +143,9 @@ def write_zip(zip_path, items, extra_text=None):
 
 README = """# Civ6DllLoader {version}
 
-Civ6 的 DLL 插件加载器。以 version.dll 代理的形态注入游戏进程，按
+Civ6 的 DLL 插件加载器。以 winmm.dll 代理的形态注入游戏进程，按
 Global / GameCore 两个阶段加载插件，并提供主菜单设置面板。
+（1.0.x 及更早的版本用 version.dll 作代理名；升级后旧安装会自动迁移。）
 
 ## 目录
 
@@ -157,7 +158,12 @@ Global / GameCore 两个阶段加载插件，并提供主菜单设置面板。
 
 把这两个 DLL 放到 Mod 的 Binaries/Win64/ 下，并让 Mod 的 Config.sql 把
 DllPrefix 改写为 GameCore_XP2_Shell。薄壳会在 Loader 缺席时自动完成
-version.dll 的补装，装完提示重启。
+winmm.dll 的补装（并把旧的 version.dll 退役掉），装完提示重启。
+
+如果你手工复制 DLL：请只留 winmm.dll 一个代理名，复制完立刻删掉
+旧的 version.dll（或改名成 version_Old.dll），否则同一进程会进两份 loader。
+卸载：删掉 <exe目录>/winmm.dll 与 version.dll / version_Old.dll /
+winmm_Old.dll 即可，没有注册表或服务残留。
 
 ## 注意
 

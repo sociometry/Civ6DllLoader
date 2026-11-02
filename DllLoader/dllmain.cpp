@@ -1,7 +1,7 @@
 // dllmain.cpp : thin GameCore proxy shell. When the Loader (exe-dir
-// version.dll) is missing, install it once from the highest-version runtime found
-// under the scan roots (deliberately NOT filtered by mod-enabled state); always
-// pass through to the real Expansion2 GameCore this session.
+// winmm.dll; legacy installs may still sit at version.dll) is missing, install it once
+// from the highest-version runtime found under the scan roots (deliberately NOT filtered
+// by mod-enabled state); always pass through to the real Expansion2 GameCore this session.
 #include "pch.h"
 
 #include <Windows.h>
@@ -68,7 +68,7 @@ extern "C" {
             return nullptr;
         }
 
-        // v2 shell: never starts the runtime. If the Loader (exe-dir version.dll) is
+        // v2 shell: never starts the runtime. If the Loader (exe-dir winmm.dll) is
         // missing, install it once from the highest-version runtime found under the ModScan
         // scan roots (no mod-enabled filter here: installation elects by version only);
         // either way this session passes through to the stock GameCore.

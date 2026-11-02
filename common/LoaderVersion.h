@@ -2,7 +2,7 @@
 
 // Shared by C++ and RC: the RCDATA 105 version resource and kLoaderRuntimeVersion come from these.
 #define CIV6_DLL_LOADER_VERSION_MAJOR 1
-#define CIV6_DLL_LOADER_VERSION_MINOR 0
+#define CIV6_DLL_LOADER_VERSION_MINOR 1
 #define CIV6_DLL_LOADER_VERSION_PATCH 0
 
 // RCDATA: magic(DWORD), format/major/minor/patch(WORD).

@@ -2,7 +2,7 @@
 
 > 中文 | [English](ARCHITECTURE.en.md)
 
-- 适用版本：预发布 `1.0.0`（`common/LoaderVersion.h`），插件 ABI `CIV6_HOOK_API_VERSION = 1`。
+- 适用版本：预发布 `1.1.0`（`common/LoaderVersion.h`），插件 ABI `CIV6_HOOK_API_VERSION = 1`。
 - 这份文档是**唯一权威的架构说明**。
 - 约定：本文用 `file` / `file:函数名` 定位，尽量不写死行号（行号会随改动漂移）。
 - **⚠️ 标记 = 关键注意事项与设计约束**：包含生命周期边界、跨平台结构体布局差异以及跨线程调用的硬性约束。
@@ -15,7 +15,7 @@
 《文明VI》采用双层执行模型：主进程（`CivilizationVI.exe`）常驻运行，负责前端界面与引擎渲染；而核心游戏对局逻辑（`GameCore_XP2_FinalRelease.dll`）则作为动态模块，随对局开始由引擎加载（`LoadDLL`）、随对局结束卸载（`UnloadDLL`）。
 
 **Civ6DllLoader** 是为《文明VI》构建的原生 C++ 插件扩展平台：
-1. **注入引导**：在游戏目录下通过 `version.dll` 代理（`Civ6DllLoader.runtime.dll` 的副本）在进程初始化最早阶段载入，辅以专用的“薄壳安装器”在首次使用时自动就位；
+1. **注入引导**：在游戏目录下通过 `winmm.dll` 代理（`Civ6DllLoader.runtime.dll` 的副本）在进程初始化早期载入（导入序号 15，紧随 `Localization`/`HavokScript` 之后），辅以专用的“薄壳安装器”在首次使用时自动就位；
 2. **挂钩基础设施**：拦截关键生命周期函数（`LoadDLL` / `UnloadDLL` / `LoadUI`），维护统一的“挂钩站点表（HookSite Registry）”，以统一的 Stub 和跳板管理原生钩子与参数捕获；
 3. **插件扩展面**：通过只读的函数指针表（`HookAPI`），向第三方插件提供模块取址、Hook 安装、内存补丁及引擎事件回调能力。
 
@@ -28,7 +28,7 @@
 2. **单实例排他与 LoadOrder 争抢**：引擎同一规则集（如 `Expansion2`）只能挂载一个 DLL。多个 DLL 模组如果不做源码级合并就无法共存，必须竞争 `LoadOrder` 优先级以争夺生效权。
 
 **Civ6DllLoader 的核心优势**：
-1. **突破 GameCore 局限（全域扩展）**：通过 EXE 导入表代理（`version.dll`）进入进程，使插件能力不再局限于 GameCore 范畴，能够拦截主程序 EXE、注入前端界面以及常驻监听；
+1. **突破 GameCore 局限（全域扩展）**：通过 EXE 导入表代理（`winmm.dll`）进入进程，使插件能力不再局限于 GameCore 范畴，能够拦截主程序 EXE、注入前端界面以及常驻监听；
 2. **完全接管加载逻辑，消除 LoadOrder 竞争**：拦截 EXE 内部的 `GameCore::LoadDLL`，将规则集槽位重定向回官方原版 DLL，同时接管插件扫描与加载流水线。多个符合规范的独立 DLL 插件可以并行加载、安全共存，消除了模组间对规则集 `LoadOrder` 的争抢；
 3. **完善的跨版本函数自动匹配（抗更新能力强）**：内置基于 PE 异常展开表（`.pdata`）的跨版本自动矫正机制（`PdataMatch`），结合滑动窗口锚点链、线性插值/外推、归一化函数头哈希及虚表反推，能够有效应对游戏未来的版本更新，大幅降低了游戏更新导致 Mod 符号失效的维护与适配成本。
    > 匹配率**没有内置统计**：`PdataMatch` 只按条目打 `matched %zu` 计数日志，
@@ -37,7 +37,7 @@
 
 **已知局限与权衡**：
 1. **强规范约束**：Loader 不会加载不符合设定规则的随意 DLL，插件必须接入本项目的规范（遵循目录结构划分、导出 `Civ6PluginKind` 声明类别、基于 `HookAPI` 交互）；
-2. **首次安装仍依赖官方机制**：在 EXE 目录下尚未生成 `version.dll` 的初始状态下，薄壳安装器仍需借助官方 `GameCores` 覆盖机制进场一次以完成选举与部署，因此首次安装仍需重启游戏生效，且薄壳自身在首次进场时仍需参与官方 `LoadOrder` 竞争。
+2. **首次安装仍依赖官方机制**：在 EXE 目录下尚未生成 `winmm.dll` 的初始状态下，薄壳安装器仍需借助官方 `GameCores` 覆盖机制进场一次以完成选举与部署，因此首次安装仍需重启游戏生效，且薄壳自身在首次进场时仍需参与官方 `LoadOrder` 竞争。
 3. **目前只支持Steam版本**
 
 ### 0.3 三大核心架构原则
@@ -57,7 +57,7 @@
 | 模块 | 角色 |
 |---|---|
 | `CivilizationVI.exe` | 游戏本体；Loader 的钩子目标（LoadDLL / UnloadDLL / LoadUI…） |
-| `version.dll` | **Loader 本体**（就是 `Civ6DllLoader.runtime.dll` 的副本，被放进 exe 目录）：exe 静态导入它，同时它把系统 `version.dll` 的导出逐条转发出去，所以系统版本查询行为不变 |
+| `winmm.dll` | **Loader 本体**（就是 `Civ6DllLoader.runtime.dll` 的副本，被放进 exe 目录）：exe 静态导入它，同时它把系统 `winmm.dll` 的 181 条导出逐条转发出去，所以计时器/多媒体/音频等一切依赖它的系统行为不变；导出表里还附带旧名 `version.dll` 的 17 条函数，让"新版被装成旧名字"的那一次启动也能起来。1.0.x 及更早的安装在外目录名 `version.dll` 上，由 §1.3 ② 自动迁移 |
 | `GameCore_XP2_Shell_FinalRelease.dll` | **首次使用该类 Mod 时的 Loader 安装器**（零 hook、不启动 runtime）：只有 Loader 缺席时才会被引擎加载；Loader 在位时它不进进程（见下） |
 | `GameCore_XP2_FinalRelease.dll` | 游戏的对局逻辑（"短命域"，每次进对局都换） |
 | `Localization_FinalRelease.dll` / `HavokScript_FinalRelease.dll` | 本地化 / Lua VM（常驻，按导出名解析） |
@@ -100,9 +100,21 @@
 进程里存在两条相互独立的进入路径：
 
 #### 1. Loader 注入路径（基于导入表劫持）
-EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE 目录解析该依赖。
-- 我们将 `Civ6DllLoader.runtime.dll` 部署为 EXE 目录下的 `version.dll`，使 Loader 在进程初始化最早阶段自动载入（`DllLoaderRuntime/ProxyExports.cpp`）；
-- 该模块将原生 `version.dll` 的导出函数逐条转发至系统真实库，完全不影响操作系统的版本查询行为。
+EXE 的静态导入表中包含 `winmm.dll`（导入序号 15），Windows 加载器优先从 EXE 目录解析该依赖。
+- 我们将 `Civ6DllLoader.runtime.dll` 部署为 EXE 目录下的 `winmm.dll`，使 Loader 在进程初始化早期自动载入（`DllLoaderRuntime/ProxyExports.cpp`）；
+- 该模块将原生 `winmm.dll` 的 **181 条导出（序号 2~182，含 1 条无名序号）逐条转发**至系统真实库，
+  完全不影响计时器/多媒体/音频等一切依赖它的代码；
+- 同一个导出表还附带 **`version.dll` 的 17 条命名导出（序号 183~199）**，同样转发到
+  `System32\version.dll.<name>`。原因是新版二进制有可能被装到旧名字上（老 loader 的自更新就只认
+  自己的文件名，见 §1.3 ②），而 exe 的静态导入表里有 6 个 `VERSION.dll` 函数（`VerQueryValueW/A`、
+  `GetFileVersionInfoExW`、`GetFileVersionInfoSizeExW`、`GetFileVersionInfoW`、
+  `GetFileVersionInfoSizeW`，实测按名导入）——少了它们，游戏在加载期就崩，代码一行都跑不到。
+  这组附属导出让新版无论叫 `winmm.dll` 还是 `version.dll` 都能把 exe 拉起来；
+- **为什么不再用 `version.dll`**：`version.dll` 是各注入工具共用的代理名，部分机器上（第三方启动器、
+  安全软件、DLL 预加载策略）会跳过 EXE 目录里那份、直接去 `System32` 取系统文件，表现为"loader 装了
+  却没生效"。`winmm.dll` 在同样位置能被正常解析（已实机验证）。附带收益：`winmm` 的导入序号晚于
+  `Localization`(10)/`HavokScript`(11)，Loader 因此晚于它们载入，消除了这两个模块在阶段 A 用
+  `GetModuleHandle` 取自身模块时的竞态。代价是 loader 晚约 7 个导入项才开始，实测无可观察影响。
 
 #### 2. 薄壳载入路径（基于模组配置重定向）
 薄壳（`GameCore_XP2_Shell_FinalRelease.dll`）依靠官方模组机制按需介入：
@@ -110,15 +122,17 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
 2. **模组配置重定向**：模组通过 `Config.sql` 将数据库中的 `DllPrefix` 改写为 `GameCore_XP2_Shell`，使引擎转向请求加载模组目录下的薄壳 DLL；
 3. **双态加载分支**：
    - **常规状态（Loader 已在位）**：Loader 的 `LoadDLL` Detour 拦截该调用，直接将请求路径改写回官方 GameCore 的绝对路径。因此**薄壳完全不会被载入内存**；
-   - **首次安装（Loader 缺席）**：由于没有 Detour 拦截，引擎正常载入薄壳。薄壳自行导出 `DllCreateGameContext` 等接口转发给官方 GameCore 保证游戏正常运行，同时在后台执行 `version.dll` 的安装逻辑（§1.3）。
+   - **首次安装（Loader 缺席）**：由于没有 Detour 拦截，引擎正常载入薄壳。薄壳自行导出 `DllCreateGameContext` 等接口转发给官方 GameCore 保证游戏正常运行，同时在后台执行 `winmm.dll` 的安装逻辑（§1.3）。
 
-薄壳**不会**主动启动 runtime——runtime 已经以 `version.dll` 的身份驻留于进程中。薄壳唯一的职责是在缺少 `version.dll` 时完成选举与复制，并提示重启生效。只要 EXE 目录已存在 `version.dll`，薄壳在整个会话中均不参与任何操作。
+薄壳**不会**主动启动 runtime——runtime 已经以 `winmm.dll` 的身份驻留于进程中。薄壳唯一的职责是在缺少
+`winmm.dll` 时完成选举与复制（并把旧代理名 `version.dll` 退役掉），并提示重启生效。只要 EXE 目录已存在
+我们的 `winmm.dll`，薄壳在整个会话中除补一次旧代理退役外不参与任何操作。
 
 - runtime：`Civ6DllLoader.runtime.dll`（产物在 `x64\Release\`），所有 hook / sidecar / 插件逻辑都在这里；
 - 薄壳：`GameCore_XP2_Shell_FinalRelease.dll`（同样在 `x64\Release\`），只有安装器（扫描 Mod + 版本
-  选举 + 补装 `version.dll` + 提示重启），**零 hook**、不启动 runtime；Loader 在位时不被加载。
+  选举 + 补装 `winmm.dll` + 退役旧代理 + 提示重启），**零 hook**、不启动 runtime；Loader 在位时不被加载。
 
-### 1.2 version.dll 的休眠检测
+### 1.2 winmm.dll 的休眠检测
 
 `RuntimeEntry.cpp` 的 DllMain 先做一次自检，**两个条件同时成立**才启动 Loader：
 
@@ -127,43 +141,72 @@ EXE 的静态导入表中包含 `version.dll`，Windows 加载器优先从 EXE �
    DX11/DX12 两个变体都命中）。
 
 任一不成立就"休眠"——不建线程、不读文件、不挂钩，避免把 Loader 逻辑泄漏到无关进程。
-只比目录不够：任何从游戏 exe 目录加载这份 `version.dll` 的进程（崩溃上报器、第三方工具、
+只比目录不够：任何从游戏 exe 目录加载这份 `winmm.dll` 的进程（崩溃上报器、第三方工具、
 覆盖层）都会被 ② 挡住。休眠时 Logger 还没初始化（它在工作线程里才 Init），所以只往
 `OutputDebugString` 留一行原因，用 DebugView 能看到；排查"loader 没生效"先看这里。
 **注意**：如果你用改名过的 exe 或第三方启动器拉起游戏，Loader 会静默休眠——这是 ② 的直接后果。
 
 ### 1.3 安装器与自更新
 
-两条相互独立的安装与维护通路：
+三条相互独立的安装/迁移通路，外加一条自更新：
 
 **① 薄壳侧的“补装与接管”（`DllLoader/ShellBootstrap.cpp`）**——仅在薄壳被引擎加载时执行一次：
 
 1. **版本探测与就绪判断（`RuntimePackage::ProbeVersionIncludingLoaded`）**：
    - 正常情况下，若 Loader 正常就位并成功装钩，`LoadDLL` Detour 会将其重定向至官方 GameCore，**薄壳根本不会被加载**；
-   - 薄壳一旦被加载，说明当前并没有发生重定向拦截。此时检查 `exe\version.dll`：
+   - 薄壳一旦被加载，说明当前并没有发生重定向拦截。此时检查 `exe\winmm.dll`：
      - 若文件不存在：判定为尚未安装，进入首次安装流程；
-     - 若文件存在且包含合规的 RC 105 资源（属于我们的 Loader）：说明 Loader 虽然已在位，但其 `LoadDLL` 钩子未能生效（如进程休眠跳过、Hook 安装失败等），因此保持现状，零动作（无需重复复制或弹窗，直接透传官方 GameCore）；
-     - 若文件存在但**不是我们的 Loader**（缺少合规的 RC 105 资源）：说明当前 `version.dll` 为外来代理或无关冲突文件，触发**接管流程**（带备份覆盖安装）；
-2. **收集候选与版本选举**：
+     - 若文件存在且包含合规的 RC 105 资源（属于我们的 Loader）：说明 Loader 虽然已在位，但其 `LoadDLL` 钩子未能生效（如进程休眠跳过、Hook 安装失败等），因此保持现状，零动作（只顺带补一次旧代理退役，见第 5 步，直接透传官方 GameCore）；
+     - 若文件存在但**不是我们的 Loader**（缺少合规的 RC 105 资源）：说明当前 `winmm.dll` 为外来代理或无关冲突文件，触发**接管流程**（带备份覆盖安装）；
+2. **旧代理探测**：`exe\version.dll` 若也是我们的 Loader，记一条 WARN——薄壳能跑到这里本身就说明
+   `version.dll` 没被引擎加载，这正是换 `winmm.dll` 要修的那批机器；
+3. **收集候选与版本选举**：
    - 收集 `Civ6DllLoader.runtime.dll` 候选（`ModScan::FindRuntimeCandidates()`，无参数）；
    - 逐个校验 PE 并读取 RC 资源 105，选举版本最高者（版本相同时取路径字典序较小者，候选不按 Mod 启用集过滤）；
-3. **分流原子发布（发布到 `version.dll`）**：
-   - **首次安装**（原文件不存在）：复制到 `version.tmp` 后直接原子重命名到位，并清理残留的 `version_Old.dll`；
-   - **接管外来文件**（原文件存在且正被系统映射）：复制到 `version.tmp` 后调用 `ReplaceFileW` 进行带备份原子替换，将原文件安全移至 `version_Old.dll` 后覆盖写入；
-4. **提示重启**：弹窗提示“已安装，点击确定立即重启游戏”并尝试启动新进程重启；
-5. **静默兜底**：任何一步失败均**只记日志、不弹窗、不阻塞游戏启动**，本次会话直接透传官方 GameCore 正常完成。
+4. **分流原子发布（发布到 `winmm.dll`）**：
+   - **首次安装**（原文件不存在）：复制到 `winmm.tmp` 后直接原子重命名到位，并清理残留的 `winmm_Old.dll`；
+   - **接管外来文件**（原文件存在且正被系统映射）：复制到 `winmm.tmp` 后调用 `ReplaceFileW` 进行带备份原子替换，将原文件安全移至 `winmm_Old.dll` 后覆盖写入；
+5. **退役旧代理（`RetireLegacyProxy`）**：只有确认 `version.dll` **是我们的 Loader** 才把它 `MoveFileW` 成
+   `version_Old.dll`（由 ③ 在下一会话删掉）；**外来 `version.dll` 一律不碰**——那是别人的安装，与 `winmm.dll` 并不冲突；
+6. **提示重启**：弹窗提示“已安装，点击确定立即重启游戏”并尝试启动新进程重启；
+7. **静默兜底**：任何一步失败均**只记日志、不弹窗、不阻塞游戏启动**，本次会话直接透传官方 GameCore 正常完成。
 
-**② runtime 侧的自更新（`LoaderUpdate::CheckAndApplyUpdate`）**——已在进程里跑的那份去换磁盘上的：
+**② 旧代理名自迁移（`DllLoaderRuntime/LegacyProxyMigration.cpp`）**——把“装成 `version.dll` 的老用户”搬过来：
 
-- 前提：自己的文件名必须是 `version.dll`（否则视为开发中的直接加载，跳过自更新）；
-- 启动时若发现 `version_Old.dll` 存在，说明**上一会话刚做完一次自更新**，直接删掉它（自愈）；
+- **为什么必须有它**：1.0.x 的老用户只要老 loader 还能工作，`LoadDLL` Detour 就会重定向，薄壳根本不进场 →
+  ① 永远跑不到；而新代码不会再往 `version.dll` 上装任何东西。所以这批机器只能靠自己把自己搬走。
+- **升级路径上的两跳**：老 loader 的 `LoaderUpdate` 把找到的新候选装到**它自己的文件名**上，也就是
+  磁盘上会短暂出现"新版二进制 + 旧名字 `version.dll`"。新版之所以还能被 exe 的 `VERSION.dll` 静态导入
+  接受，靠的就是 §1.1 里那 17 条附属导出。于是这一代升级**要经两次启动**：第一次（新内核、旧名字）
+  照常进游戏并在本次会话里把自己搬成 `winmm.dll`；第二次起才是 `winmm.dll` 的正式形态。
+- **触发**：阶段 A 早期（`InitEarly` 之后、`HavokScript` 之前）调用一次，且**仅当自身文件名是 `version.dll`**：
+  1. 删 `version_Old.dll`（老 loader 自更新/接管留下的备份）；
+  2. 若 `winmm.dll` 已存在：
+     - **是我们的 Loader**（RC 105 合规）→ **让位**：把自身退役成 `version_Old.dll`，下次启动只加载 `winmm.dll` 那一份。
+       不顶掉它，避免把可能更新的安装换成自己；
+     - **外来文件** → 删 `winmm_Old.dll` 后 `MoveFileW(winmm.dll → winmm_Old.dll)`，再让自身顶上；
+  3. **一步 `MoveFileW(自身 → winmm.dll)`**，不做版本比较（版本高低留给下一次自更新处理）；失败则回滚
+     `winmm_Old.dll → winmm.dll`，状态等价于迁移前；
+  4. **不重启、不弹窗**：本会话继续以 `version.dll` 的已映射映像跑完，改名只在下一次启动生效。
+- **为什么是一步改名而不是“复制到临时文件再发布”**：`RuntimePackage::StageCandidate` 要求源文件能以
+  独立数据映射打开（`LoadLibraryExW` 返回值的 `(module & 3) != 0`），而**自身此刻已被代码映射**，
+  探测必然失败。直接改名不探测源文件，绕开了这个坑；“重命名已映射映像”在 ① 的接管路径上已实测可行。
+
+**③ 旧文件清理（`LoaderUpdate::CheckAndApplyUpdate` 前半段）**：
+
+- 前提：自身文件名必须是 `winmm.dll`（以 `version.dll` 身份运行的会话天然跳过自更新与清理）；
+- 启动时删除 `winmm_Old.dll` 与 `version_Old.dll`（上一会话自更新/接管/迁移/退役留下的备份）。
+
+**④ runtime 侧的自更新（`LoaderUpdate::CheckAndApplyUpdate`）**——已在进程里跑的那份去换磁盘上的：
+
+- 前提：自己的文件名必须是 `winmm.dll`（否则视为开发中的直接加载，跳过自更新）；
 - 候选走同一个 `ModScan::FindRuntimeCandidates()`；排除自己（规范化路径比较）后
-  选更新的版本 → **先备份成 `version_Old.dll` 再原子替换**（`ReplaceFileW`：被替换文件被重命名到备份名、
-  替换文件顶替它的名字，磁盘上不会出现 "`version.dll` 不存在" 的中间态；`ReplaceFileW` 被拒时退回
+  选更新的版本 → **先备份成 `winmm_Old.dll` 再原子替换**（`ReplaceFileW`：被替换文件被重命名到备份名、
+  替换文件顶替它的名字，磁盘上不会出现 "`winmm.dll` 不存在" 的中间态；`ReplaceFileW` 被拒时退回
   旧的两步改名 + 失败回滚）→ 失败则回滚，当前安装保持不变；
 - 换完这一会话**仍在用内存里的旧版本**，必须重启才生效（日志写 `update applied ... (restart to take effect)`）。
 
-版本号与协议常量在 `common/LoaderProtocol.h` + `common/LoaderVersion.h`（`1.0.0`、RC 资源 id 105）。
+版本号与协议常量在 `common/LoaderProtocol.h` + `common/LoaderVersion.h`（`1.1.0`、RC 资源 id 105）。
 薄壳拿到的候选版本号也来自同一份 RC 资源——**安装器不执行候选 DLL 的 `DllMain`/TLS/导出**，只读资源。
 
 候选**不按 Mod 启用集过滤**（`ModScan::FindRuntimeCandidates` 中不调用 `FilterByEnabledMods`）：
@@ -507,6 +550,14 @@ ruleset 日志但插件一条没加载"时，要先确认不是被这个标志�
 >
 > ⚠️ **破坏性要求**：插件 DLL 必须带 `VERSIONINFO` 文件版本，否则不会被加载。补版本的方式是给工程
 > 加一个 `.rc`（VS 资源视图 → 添加资源 → Version），不是加 `RCDATA`。
+>
+> **资源名必须是数字 ID 1**：`GetFileVersionInfo*` 只按 `MAKEINTRESOURCE(1)` 查 `RT_VERSION`。
+> `.rc` 第一列写成 `VS_VERSION_INFO VERSIONINFO` 时，RC 把它当**字符串资源名**（那个名字在
+> `verrsrc.h` 里确实是 1，但只有 `#include` 了才会被展开），资源本身合法、版本 API 却一律返回 0，
+> 插件于是被判成"没有版本"直接丢弃——本仓库的三个插件就这样中过招。`common/PluginVersion.cpp`
+> 因此加了一层兜底：API 返回 0 时改用 `LOAD_LIBRARY_AS_DATAFILE` 枚举**任意资源名**的
+> `RT_VERSION` 并解析块数据（仍然不加载模块、不跑 `DllMain`）。但正确写法仍是 `1 VERSIONINFO`：
+> 资源管理器"属性→详细信息"、`sigcheck`、PowerShell 的 `VersionInfo` 都只认 ID 1。
 
 **游戏安装根不是内容根**：它不是模组容器（直接子目录 `Base`/`CTP`/`DLC`/`Debug`/`LaunchPad`
 都不含 `Binaries\Win64`，实测候选取集恒为空）。游戏自己 `Mods.sqlite` 的 `ScannedFiles` 记录的
@@ -830,7 +881,7 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 容器）也各自成立——把 Release 的数值写死只会让 Debug 编不过（曾经的 Debug 构建失败就是这个原因）。
 
 这四条只挡**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它们保证——但该前提在本项目成立：
-stub 里嵌的是本进程的 `&HookSite`，而 `version.dll` 自更新会重启进程，新进程里不存在旧 stub。
+stub 里嵌的是本进程的 `&HookSite`，而 `winmm.dll` 自更新会重启进程，新进程里不存在旧 stub。
 
 **Stub 与 HookSite 节点的常驻原则（永不释放）**：
 1. **立即数指针内嵌**：Stub 机器码使用立即数 `mov r10, imm64(&HookSite)` 硬编码了站点节点地址；若释放节点，执行流将直接访问悬垂指针；
@@ -1334,7 +1385,7 @@ zlib 数据，由 Rust 侧 `include_bytes!` 在**编译期嵌入** exe —— �
 
 | 工程 | 产物 `TargetName` | 职责 |
 |---|---|---|
-| `DllLoader/DllLoader.vcxproj` | `GameCore_XP2_Shell_FinalRelease`（薄壳） | 首次使用该类 Mod 时的 Loader 安装器（扫描 Mod + 版本选举 + 补装 `version.dll` + 提示重启）；零 hook、不启动 runtime、不做运行时自更新 |
+| `DllLoader/DllLoader.vcxproj` | `GameCore_XP2_Shell_FinalRelease`（薄壳） | 首次使用该类 Mod 时的 Loader 安装器（扫描 Mod + 版本选举 + 补装 `winmm.dll` + 退役旧代理 `version.dll` + 提示重启）；零 hook、不启动 runtime、不做运行时自更新 |
 | `DllLoaderRuntime/DllLoaderRuntime.vcxproj` | `Civ6DllLoader.runtime`（Loader 本体） | 一切 hook / sidecar / HookAPI / 插件生命周期 |
 
 两个工程都是 x64、C++20（`/std:c++20`）、`/utf-8`。关键预处理宏：
@@ -1375,7 +1426,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 | 产物 | 目标位置 |
 |---|---|
-| `x64\<cfg>\Civ6DllLoader.runtime.dll`（改名 `version.dll`） | 游戏 exe 目录（`Base\Binaries\Win64Steam\` 或 `Win64\`） |
+| `x64\<cfg>\Civ6DllLoader.runtime.dll`（改名 `winmm.dll`） | 游戏 exe 目录（`Base\Binaries\Win64Steam\` 或 `Win64\`） |
 | `x64\<cfg>\GameCore_XP2_Shell_FinalRelease.dll` + `Civ6DllLoader.runtime.dll` | 启用 Mod 的 `Binaries\Win64\` |
 | `DllLoaderRuntime\Civ6DllLoader.symdb.bin.xp` | 由 `symdb.py all` 直接部署（编进 runtime 的 RCDATA 102） |
 | `DllLoaderRuntime\Resources\Civ6DllLoader_FrontEndUI.{lua,xml}` | RCDATA 103/104，由 `UiInject::ExtractResources` 释放到 `<exe 目录>\Civ6DllLoader\` |
@@ -1399,7 +1450,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | 8 | 开关 Mod 不生效，必须重启 | 没有 reconcile 通路 | 操作体验 | 有意：状态一致性优先于便利 |
 | 9 | UI 注入依赖特征码，匹配失败静默降级 | 游戏更新改了目标代码 | 面板不出现（日志有记录），其余功能正常 | 接受 |
 | 10 | 数据槽定位依赖 AOB 兜底指令序列 | 编译器 / 游戏更新 | 定位失败返回 0，对应功能降级 | 接受（有日志） |
-| 11 | 休眠检测要求宿主 exe 名形如 `CivilizationVI*.exe` | 防止"别的进程从 exe 目录加载这份 version.dll"时把 Loader + Global 插件拉进去 | 用改名 exe / 第三方启动器的会话里 Loader 静默休眠（不装钩）；`OutputDebugString` 有留痕 | 有意（严格优先） |
+| 11 | 休眠检测要求宿主 exe 名形如 `CivilizationVI*.exe` | 防止"别的进程从 exe 目录加载这份 winmm.dll"时把 Loader + Global 插件拉进去 | 用改名 exe / 第三方启动器的会话里 Loader 静默休眠（不装钩）；`OutputDebugString` 有留痕 | 有意（严格优先） |
 | 12 | 插件打的补丁**不由 Loader 自动回滚** | 自动回滚要在"插件已崩"的时刻往可能正执行的代码里写还原字节，且无 quiesce；存档还可能是别人的跳板字节 | 隔离/卸载后补丁留在游戏里直到进程退出；插件需自己管 `Unpatch` 时机 | 有意（§5.8） |
 
 ### 9.1 已知未处理的问题（实现缺陷，待修复）
@@ -1426,7 +1477,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 | 术语 | 含义 |
 |---|---|
 | 薄壳（shell） | `GameCore_XP2_Shell_FinalRelease.dll`：首次使用该类 Mod 时的 Loader 安装器；零 hook，只有 Loader 缺席时才会被引擎加载 |
-| Loader / runtime | `Civ6DllLoader.runtime.dll`：真正干活的模块，`version.dll` 是它的副本 |
+| Loader / runtime | `Civ6DllLoader.runtime.dll`：真正干活的模块，`winmm.dll` 是它的副本（1.0.x 时代用 `version.dll`） |
 | 站点（site） | 以**目标绝对地址**为键的一条记录，是钩子/捕获/记录三件事的共用载体 |
 | 插件插槽（detour slot） | 站点里"至多一个插件 detour"的位置，独占，后来者接管 |
 | 捕获（capture） | 站点里"读取某参数 / 写出参数"的插槽，可多个共享 |

@@ -10,9 +10,9 @@ This repository contains **loader infrastructure only**. Plugin examples live in
 
 ## How it works
 
-In one sentence: it disguises itself as `version.dll` to get into the process, takes over the ruleset-DLL load slot, and then mounts any number of third-party DLL plugins onto the game's lifecycle.
+In one sentence: it disguises itself as `winmm.dll` to get into the process, takes over the ruleset-DLL load slot, and then mounts any number of third-party DLL plugins onto the game's lifecycle.
 
-1. **Injection** — the game EXE has `version.dll` in its static import table, and the Windows loader resolves it from the EXE directory first. We deploy `Civ6DllLoader.runtime.dll` as `<exe dir>\version.dll`, so it loads at the earliest stage of process initialization; it forwards the system `version.dll` exports one by one, so version queries behave exactly as before.
+1. **Injection** — the game EXE has `winmm.dll` in its static import table (ordinal 15), and the Windows loader resolves it from the EXE directory first. We deploy `Civ6DllLoader.runtime.dll` as `<exe dir>\winmm.dll`, so it loads in the early stage of process initialization; it forwards all 181 system `winmm.dll` exports one by one, so timers, multimedia, audio and everything else behave exactly as before. Earlier builds used `version.dll`, which some machines skip in favour of the system copy; since 1.1.0 the target is `winmm.dll`, and legacy installs migrate themselves.
 2. **Self-check, then start** — `DllMain` first verifies that "its own directory == the process exe directory" and that "the host exe name looks like `CivilizationVI*.exe`"; otherwise it goes dormant silently (no thread, no file I/O, no hooks). Once it passes, it spawns a **one-shot** worker thread to finish initialization — avoiding the loader lock, and the main loader thread never blocks waiting on it.
 3. **Take over the slot** — the worker thread resolves the symbol DB, initializes MinHook, installs detours on `LoadDLL` / `UnloadDLL` (`LoadUI` is installed separately by the UI-injection module), and then loads Global plugins. From that point on, when the engine asks to load `GameCore_XP2_FinalRelease.dll`, the detour rewrites the path back to the **stock** DLL — so the shell is **never loaded** in the installed state, and vanilla sessions run untouched.
 4. **Load plugins** — once GameCore is mapped, phase B begins: scan the Documents `Mods` root and the Steam Workshop content roots, accept only `Binaries/Win64/Plugins/{Global,GameCore}/*.dll` under **enabled mods**, read each DLL's `VERSIONINFO`, keep only the highest version per basename, then load by category and call its `OnLoad`.
@@ -20,7 +20,7 @@ In one sentence: it disguises itself as `version.dll` to get into the process, t
 6. **Resolve addresses** — plugins locate in-game addresses by symbol name / RVA / AOB / vtable slot. Symbol names and old RVAs come from the embedded sidecar symbol DB; across game updates `PdataMatch` corrects them onto the current image using the PE exception unwind tables (`.pdata`), with AOB as fallback and verification.
 7. **Teardown** — when the engine calls `UnloadDLL`, the detour first runs a full reverse-order teardown (restore entry bytes → notify plugins → call the original function to unload GameCore and its Lua environments → release plugin modules), then lets the original call through.
 
-The very first run (no `version.dll` in the EXE directory yet) takes another path: a mod shipping the shell rewrites the ruleset `DllPrefix` to `GameCore_XP2_Shell` via the stock `Config.sql`, so the engine loads the shell; the shell installs no hooks — it only scans runtime candidates, elects the highest version by static version resource (RCDATA 105), copies it to `exe\version.dll` and asks for a restart. After the restart the steady-state path above takes over and the shell no longer participates.
+The very first run (no `winmm.dll` in the EXE directory yet) takes another path: a mod shipping the shell rewrites the ruleset `DllPrefix` to `GameCore_XP2_Shell` via the stock `Config.sql`, so the engine loads the shell; the shell installs no hooks — it only scans runtime candidates, elects the highest version by static version resource (RCDATA 105), copies it to `exe\winmm.dll`, retires a legacy `version.dll` (only if that file is our loader too), and asks for a restart. After the restart the steady-state path above takes over and the shell no longer participates.
 
 For the full mechanism see [docs/ARCHITECTURE.en.md](docs/ARCHITECTURE.en.md).
 
@@ -58,7 +58,7 @@ Outputs (typical):
 - `x64\Release\Civ6DllLoader.runtime.dll`
 
 Copy both into a Workshop mod under `Binaries\Win64\`. On the first launch the shell elects the
-highest-version runtime, copies it to `<game exe dir>\version.dll` and asks to restart; after that
+highest-version runtime, copies it to `<game exe dir>\winmm.dll` and asks to restart; after that
 restart the proxy DLL is what pulls the loader in. Once the loader is in place the shell is never
 loaded at all — the `LoadDLL` detour redirects the Expansion2 slot straight to the stock GameCore
 DLL, vanilla sessions included (see `docs/ARCHITECTURE.en.md` §1.1).
@@ -73,3 +73,33 @@ roots); the game install root is not a mod container and is not scanned. The ins
 (plugin loading still does). The metadata identifies the package format; it is not a
 publisher signature, and `ProbeVersion` only checks PE + RC 105 — so only distribute
 runtime DLLs from sources you trust.
+
+## Upgrading from 1.0.x (proxy name version.dll → winmm.dll)
+
+Since 1.1.0 the loader is installed as `<exe dir>\winmm.dll` and no longer uses `version.dll`.
+Existing installs need no manual work:
+
+- **Normal case**: an old loader (`version.dll`) notices at startup that it still carries the legacy
+  name and renames itself to `winmm.dll` (backing up whatever occupied that name first). It does
+  **not** restart — the current match keeps running, and the next launch uses the new name. Leftover
+  `version_Old.dll` / `winmm_Old.dll` files are deleted by the next startup's cleanup step.
+- **When the shell runs**: if `version.dll` really failed to pull the loader in (which is why the shell
+  was loaded), the shell installs `winmm.dll` and retires the old `version.dll` to `version_Old.dll`.
+- **The hop through the old loader's self-update**: the old loader only knows its own file name, so it
+  installs the new build as `version.dll` — for a while the disk holds a "new kernel under the old
+  name". The new runtime still exports the 17 `version.dll` functions (6 of them are exactly what the
+  exe imports: `GetFileVersionInfo*`/`VerQueryValue*`), so that launch boots normally; during the same
+  session it renames itself to `winmm.dll`, and the launch after that runs in the final form. **In
+  other words this generation of the upgrade needs two launches to settle.**
+
+Rules for manual installs/migrations:
+
+- **Either do not copy anything yourself, or copy `winmm.dll` and immediately remove the old
+  `version.dll`** (renaming it to `version_Old.dll` works too). With both present the game loads
+  `version.dll` first (import ordinal 8) and `winmm.dll` second (ordinal 15), so two loader copies
+  enter the same process. The code has a fallback for that (the legacy copy yields and retires
+  itself), but do not count on it — it takes an extra launch to converge and the logs trample
+  each other in the meantime.
+- To uninstall, just delete `<exe dir>\winmm.dll` (plus any `version.dll` / `version_Old.dll` /
+  `winmm_Old.dll`). There is no registry or service residue.
+

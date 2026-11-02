@@ -10,11 +10,12 @@
 
 ## 基本运作原理
 
-一句话：把自己伪装成 `version.dll` 进进程，接管规则集 DLL 的加载槽位，再把多个第三方 DLL 插件按生命周期挂进去。
+一句话：把自己伪装成 `winmm.dll` 进进程，接管规则集 DLL 的加载槽位，再把多个第三方 DLL 插件按生命周期挂进去。
 
-1. **注入** —— 游戏 EXE 的静态导入表里有 `version.dll`，Windows 加载器优先从 EXE 目录解析它。
-   我们把 `Civ6DllLoader.runtime.dll` 部署成 `<exe 目录>\version.dll`，于是它在进程初始化最早阶段自动载入；
-   它同时把系统 `version.dll` 的导出逐条转发出去，操作系统的版本查询行为不变。
+1. **注入** —— 游戏 EXE 的静态导入表里有 `winmm.dll`（导入序号 15），Windows 加载器优先从 EXE 目录解析它。
+   我们把 `Civ6DllLoader.runtime.dll` 部署成 `<exe 目录>\winmm.dll`，于是它在进程初始化早期自动载入；
+   它同时把系统 `winmm.dll` 的 181 条导出逐条转发出去，计时器/多媒体/音频等系统行为不变。
+   早期版本用的是 `version.dll`，但它在部分机器上会被跳过（系统版抢先），1.1.0 起改为 `winmm.dll`，老安装会自动迁移。
 2. **自检后启动** —— `DllMain` 先确认「自身目录 == 进程 exe 目录」且「宿主 exe 名形如 `CivilizationVI*.exe`」，
    否则静默休眠（不建线程、不读文件、不挂钩）。通过后建一条**一次性**工作线程完成初始化——
    避开 Loader Lock，主加载线程绝不阻塞等它。
@@ -32,9 +33,10 @@
 7. **退场** —— 引擎调 `UnloadDLL` 时，detour 先做一次完整的逆序 teardown
    （还原入口字节 → 通知插件 → 调原函数卸 GameCore 及其 Lua 环境 → 释放插件模块），再放行原调用。
 
-首次使用（EXE 目录里还没有 `version.dll`）时走另一条路：带薄壳的 Mod 通过官方 `Config.sql`
+首次使用（EXE 目录里还没有 `winmm.dll`）时走另一条路：带薄壳的 Mod 通过官方 `Config.sql`
 把规则集 `DllPrefix` 改写成 `GameCore_XP2_Shell`，引擎因此加载薄壳；薄壳不做任何 hook，
-只扫描候选 runtime、按静态版本资源（RCDATA 105）选举最高版本、复制为 `exe\version.dll` 并提示重启。
+只扫描候选 runtime、按静态版本资源（RCDATA 105）选举最高版本、复制为 `exe\winmm.dll`，
+顺带把旧的 `version.dll`（仅当它也是我们的 loader）退役成 `version_Old.dll`，并提示重启。
 重启后即进入上面的稳态路径，薄壳不再参与。
 
 完整机制见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
@@ -81,7 +83,7 @@ DllLoader.sln        只含薄壳 + runtime 两个工程
 - `x64\Release\Civ6DllLoader.runtime.dll`
 
 两个都复制进 Workshop mod 的 `Binaries\Win64\`。首次启动时薄壳会选举版本最高的 runtime，
-复制成 `<游戏 exe 目录>\version.dll` 并提示重启；重启之后就是那个代理 DLL 把 loader 拉进进程。
+复制成 `<游戏 exe 目录>\winmm.dll` 并提示重启；重启之后就是那个代理 DLL 把 loader 拉进进程。
 loader 在位时薄壳根本不会被加载 —— `LoadDLL` 的 detour 会把 Expansion2 槽位直接指回官方
 GameCore DLL，原版对局也一样（见 `docs/ARCHITECTURE.md` §1.1）。
 
@@ -92,3 +94,27 @@ runtime 候选带静态版本元数据（RCDATA 105）。安装与更新只读�
 候选来自扫描根（我的文档 Mods 与 Steam Workshop 内容根）；游戏安装根不是模组容器，不参与扫描。
 安装器 / 自更新**不**按 Mod 启用状态过滤（插件加载仍然会）。这份元数据只标识包格式，
 不是发布者签名，且 `ProbeVersion` 只校验 PE + RC 105 —— 所以**只从你信任的来源分发 runtime DLL**。
+
+## 从 1.0.x 升级（代理名 version.dll → winmm.dll）
+
+1.1.0 起 loader 装在 `<exe 目录>\winmm.dll`，不再使用 `version.dll`。老安装不需要手工干预：
+
+- **正常情况**：老 loader（`version.dll`）启动时发现自己还是旧名字，就把自己改名成 `winmm.dll`
+  （目标名已被占用时先进备份），**不重启**，本次对局照常；下一次启动起就走新名字。留下的
+  `version_Old.dll` / `winmm_Old.dll` 由下一次启动的清理段删掉。
+- **薄壳进场时**：如果 `version.dll` 确实没能把 loader 拉进进程（薄壳因此被加载），薄壳装好
+  `winmm.dll` 后会把旧的 `version.dll` 退役成 `version_Old.dll`。
+- **老 loader 自更新那一跳**：老 loader 只认自己的文件名，所以它会把新版装成 `version.dll`——磁盘上会短暂
+  出现"新内核 + 旧名字"。新版运行库仍然导出 `version.dll` 的 17 条函数（其中 6 条正是 exe 静态导入的
+  `GetFileVersionInfo*`/`VerQueryValue*`），所以这一次启动照常进游戏；同一会话里它把自己改名成
+  `winmm.dll`，再下一次启动才是正式形态。**换句话说，这一代升级要经两次启动才彻底稳定。**
+
+手工安装/迁移时的规矩：
+
+- **要么别自己复制，要么复制 `winmm.dll` 后立刻删掉旧的 `version.dll`**（改名成 `version_Old.dll` 也行）。
+  两个都留着，游戏会先加载 `version.dll`（导入序号 8）、再加载 `winmm.dll`（序号 15），
+  于是同一个进程里进两份 loader。代码里对这种情况有兜底（旧名字的自己会让位并退役），
+  但别指望它——多一次启动才收敛，且中间的日志会互相踩。
+- 只想卸载时，删掉 `<exe 目录>\winmm.dll`（以及 `version.dll` / `version_Old.dll` / `winmm_Old.dll`）
+  即可，没有注册表和服务残留。
+

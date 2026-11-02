@@ -2,7 +2,7 @@
 
 > English | [中文](ARCHITECTURE.md)
 
-- Applicable version: pre-release `1.0.0` (`common/LoaderVersion.h`), plugin ABI `CIV6_HOOK_API_VERSION = 1`.
+- Applicable version: pre-release `1.1.0` (`common/LoaderVersion.h`), plugin ABI `CIV6_HOOK_API_VERSION = 1`.
 - This document is the **sole authoritative architecture description**.
 - Convention: this document locates things by `file` / `file:function name` and avoids hard-coding line numbers wherever possible (line numbers drift as the code changes).
 - **⚠️ marker = key caveats and design constraints**: covers lifecycle boundaries, cross-platform struct layout differences, and hard constraints on cross-thread calls.
@@ -15,7 +15,7 @@
 Civilization VI uses a two-layer execution model: the main process (`CivilizationVI.exe`) is resident throughout and handles the front-end UI and engine rendering, while the core game match logic (`GameCore_XP2_FinalRelease.dll`) is a dynamic module that the engine loads when a match begins (`LoadDLL`) and unloads when the match ends (`UnloadDLL`).
 
 **Civ6DllLoader** is a native C++ plugin extension platform built for Civilization VI:
-1. **Injection bootstrap**: loaded at the earliest stage of process initialization through a `version.dll` proxy in the game directory (a copy of `Civ6DllLoader.runtime.dll`), assisted by a dedicated "thin shell installer" that takes its place automatically on first use;
+1. **Injection bootstrap**: loaded in the early stage of process initialization through a `winmm.dll` proxy in the game directory (a copy of `Civ6DllLoader.runtime.dll`; import ordinal 15, right after `Localization`/`HavokScript`), assisted by a dedicated "thin shell installer" that takes its place automatically on first use;
 2. **Hooking infrastructure**: intercepts key lifecycle functions (`LoadDLL` / `UnloadDLL` / `LoadUI`) and maintains a unified "hook site registry (HookSite Registry)", managing native hooks and parameter capture with unified stubs and trampolines;
 3. **Plugin extension surface**: through a read-only function pointer table (`HookAPI`), provides third-party plugins with module address resolution, hook installation, memory patches, and engine event callbacks.
 
@@ -28,7 +28,7 @@ The vast majority of DLL mods in the community rely on the officially provided r
 2. **Single-instance exclusivity and LoadOrder contention**: the engine allows only one DLL to be mounted per ruleset (e.g. `Expansion2`). Multiple DLL mods cannot coexist unless they are merged at the source level, and they must compete over `LoadOrder` priority to win the right to take effect.
 
 **Core advantages of Civ6DllLoader**:
-1. **Breaking out of the GameCore limits (whole-domain extension)**: entering the process through an EXE import table proxy (`version.dll`) frees plugin capability from the GameCore scope, making it possible to intercept the main program EXE, inject into the front-end UI, and keep a resident monitor;
+1. **Breaking out of the GameCore limits (whole-domain extension)**: entering the process through an EXE import table proxy (`winmm.dll`) frees plugin capability from the GameCore scope, making it possible to intercept the main program EXE, inject into the front-end UI, and keep a resident monitor;
 2. **Fully taking over the load logic, eliminating LoadOrder contention**: intercepts `GameCore::LoadDLL` inside the EXE, redirects the ruleset slot back to the official vanilla DLL, and takes over the plugin scan and load pipeline at the same time. Multiple conforming independent DLL plugins can be loaded in parallel and coexist safely, eliminating contention for the ruleset `LoadOrder` between mods;
 3. **Comprehensive cross-version function auto-matching (strong resistance to updates)**: built-in cross-version auto-correction mechanism (`PdataMatch`) based on the PE exception unwind table (`.pdata`), combined with sliding-window anchor chains, linear interpolation/extrapolation, normalized function header hashing, and vtable back-inference, which can effectively cope with future game version updates and greatly reduces the maintenance and adaptation cost of Mod symbols going stale after a game update.
    > The match ratio has **no built-in statistics**: `PdataMatch` only emits a per-entry `matched %zu` count log,
@@ -37,7 +37,7 @@ The vast majority of DLL mods in the community rely on the officially provided r
 
 **Known limitations and trade-offs**:
 1. **Strict specification constraints**: the Loader will not load arbitrary DLLs that do not follow the configured rules; plugins must integrate with this project's specification (follow the directory structure layout, export `Civ6PluginKind` to declare the category, interact via `HookAPI`);
-2. **First install still depends on the official mechanism**: in the initial state where `version.dll` has not yet been generated in the EXE directory, the thin shell installer still needs to enter once through the official `GameCores` override mechanism to complete election and deployment; therefore the first install still requires a game restart to take effect, and the thin shell itself still has to take part in the official `LoadOrder` contention on its first entry.
+2. **First install still depends on the official mechanism**: in the initial state where `winmm.dll` has not yet been generated in the EXE directory, the thin shell installer still needs to enter once through the official `GameCores` override mechanism to complete election and deployment; therefore the first install still requires a game restart to take effect, and the thin shell itself still has to take part in the official `LoadOrder` contention on its first entry.
 3. **Currently only the Steam version is supported**
 
 ### 0.3 The Three Core Architecture Principles
@@ -57,7 +57,7 @@ What is in the process (see §1.1 for details):
 | Module | Role |
 |---|---|
 | `CivilizationVI.exe` | The game proper; the Loader's hook targets (LoadDLL / UnloadDLL / LoadUI…) |
-| `version.dll` | **The Loader itself** (a copy of `Civ6DllLoader.runtime.dll` placed in the exe directory): the exe statically imports it, and it forwards the system `version.dll` exports one by one, so system version query behavior is unchanged |
+| `winmm.dll` | **The Loader itself** (a copy of `Civ6DllLoader.runtime.dll` placed in the exe directory): the exe statically imports it, and it forwards all **181** system `winmm.dll` exports one by one, so timers, multimedia, audio and everything else depending on it behave unchanged; its export table also carries the 17 legacy `version.dll` names so that a "new binary under the old name" boot still works. Builds up to 1.0.x installed under the legacy name `version.dll` and are migrated automatically by §1.3 ② |
 | `GameCore_XP2_Shell_FinalRelease.dll` | **The Loader installer on first use of this kind of Mod** (zero hooks, does not start the runtime): it is loaded by the engine only when the Loader is absent; when the Loader is in place it never enters the process (see below) |
 | `GameCore_XP2_FinalRelease.dll` | The game's match logic (the "short-lived domain", swapped out on every match entry) |
 | `Localization_FinalRelease.dll` / `HavokScript_FinalRelease.dll` | Localization / Lua VM (resident, resolved by export name) |
@@ -100,9 +100,17 @@ Key file index (the entry point for reading the code):
 There are two mutually independent entry paths in the process:
 
 #### 1. Loader injection path (based on import table hijacking)
-The EXE's static import table contains `version.dll`, and the Windows loader resolves that dependency from the EXE directory first.
-- We deploy `Civ6DllLoader.runtime.dll` as `version.dll` in the EXE directory, so that the Loader is loaded automatically at the earliest stage of process initialization (`DllLoaderRuntime/ProxyExports.cpp`);
-- That module forwards the native `version.dll` exports one by one to the real system library, with no impact at all on the operating system's version query behavior.
+The EXE's static import table contains `winmm.dll` (import ordinal 15), and the Windows loader resolves that dependency from the EXE directory first.
+- We deploy `Civ6DllLoader.runtime.dll` as `winmm.dll` in the EXE directory, so that the Loader is loaded automatically in the early stage of process initialization (`DllLoaderRuntime/ProxyExports.cpp`);
+- That module forwards the native `winmm.dll` exports one by one to the real system library, with no impact at all on timers, multimedia, audio or any other dependent behavior;
+- The same export table also carries the **17 named `version.dll` exports (ordinals 183~199)**, forwarded to
+  `System32\version.dll.<name>` as well. The new binary may be installed under the legacy name — the old loader's
+  self-update only knows its own file name (§1.3 ②) — while the exe statically imports 6 functions from
+  `VERSION.dll` (`VerQueryValueW/A`, `GetFileVersionInfoExW`, `GetFileVersionInfoSizeExW`,
+  `GetFileVersionInfoW`, `GetFileVersionInfoSizeW`, imported by name). Without them the game dies in the loader
+  before a single line of our code runs, so the extra exports let the new build boot whether it is named
+  `winmm.dll` or `version.dll`;
+- **Why not `version.dll` any more**: `version.dll` is a proxy name shared by many injection tools; on some machines (third-party launchers, security software, DLL preload policies) the copy in the EXE directory is skipped and the system file in `System32` is used instead, which shows up as "the loader is installed but does nothing". `winmm.dll` resolves correctly from the same location (verified on real machines). Bonus: `winmm`'s ordinal comes after `Localization`(10)/`HavokScript`(11), so the Loader loads after them, removing their startup race in phase A where they call `GetModuleHandle` for their own module. The cost is starting about 7 imports later, with no observable effect in practice.
 
 #### 2. Thin shell load path (based on mod configuration redirection)
 The thin shell (`GameCore_XP2_Shell_FinalRelease.dll`) steps in on demand through the official mod mechanism:
@@ -110,15 +118,15 @@ The thin shell (`GameCore_XP2_Shell_FinalRelease.dll`) steps in on demand throug
 2. **Mod configuration redirection**: the mod rewrites the `DllPrefix` in the database to `GameCore_XP2_Shell` via `Config.sql`, making the engine request the thin shell DLL in the mod directory instead;
 3. **Dual-state load branch**:
    - **Normal state (Loader already in place)**: the Loader's `LoadDLL` detour intercepts the call and directly rewrites the request path back to the absolute path of the official GameCore. Therefore **the thin shell is never loaded into memory**;
-   - **First install (Loader absent)**: with no detour interception, the engine loads the thin shell normally. The thin shell exports interfaces such as `DllCreateGameContext` itself and forwards them to the official GameCore to keep the game running, while carrying out the `version.dll` installation logic in the background (§1.3).
+   - **First install (Loader absent)**: with no detour interception, the engine loads the thin shell normally. The thin shell exports interfaces such as `DllCreateGameContext` itself and forwards them to the official GameCore to keep the game running, while carrying out the `winmm.dll` installation logic in the background (§1.3).
 
-The thin shell does **not** start the runtime on its own — the runtime is already resident in the process under the identity of `version.dll`. The thin shell's only duty is to complete the election and copy when `version.dll` is missing, and to prompt for a restart to take effect. As long as `version.dll` already exists in the EXE directory, the thin shell takes no part in any operation for the entire session.
+The thin shell does **not** start the runtime on its own — the runtime is already resident in the process under the identity of `winmm.dll`. The thin shell's only duty is to complete the election and copy when `winmm.dll` is missing (and retire the legacy `version.dll` proxy once), and to prompt for a restart to take effect. As long as our `winmm.dll` already exists in the EXE directory, the thin shell takes no part in any operation for the entire session apart from that one legacy retirement.
 
 - runtime: `Civ6DllLoader.runtime.dll` (artifacts under `x64\Release\`); all hook / sidecar / plugin logic lives here;
 - thin shell: `GameCore_XP2_Shell_FinalRelease.dll` (also under `x64\Release\`), installer only (scan Mods + version
-  election + re-install `version.dll` + prompt restart), **zero hooks**, does not start the runtime; not loaded when the Loader is in place.
+  election + re-install `winmm.dll` + retire legacy proxies + prompt restart), **zero hooks**, does not start the runtime; not loaded when the Loader is in place.
 
-### 1.2 version.dll Dormancy Detection
+### 1.2 winmm.dll Dormancy Detection
 
 `RuntimeEntry.cpp`'s DllMain performs a self-check first, and starts the Loader **only when both conditions hold**:
 
@@ -127,43 +135,72 @@ The thin shell does **not** start the runtime on its own — the runtime is alre
    both the DX11 and DX12 variants match).
 
 If either does not hold, it "sleeps" — no thread creation, no file reads, no hooks — avoiding leaking Loader logic into unrelated processes.
-Comparing the directory alone is not enough: any process that loads this `version.dll` from the game exe directory (crash reporters, third-party tools,
+Comparing the directory alone is not enough: any process that loads this `winmm.dll` from the game exe directory (crash reporters, third-party tools,
 overlays) is blocked by ②. While dormant the Logger is not initialized yet (it is Init'ed only in the worker thread), so only a single line
 with the reason is left in `OutputDebugString`, visible with DebugView; when investigating "the loader did not take effect", look here first.
 **Note**: if you launch the game with a renamed exe or a third-party launcher, the Loader will silently sleep — a direct consequence of ②.
 
 ### 1.3 Installer and Self-Update
 
-Two mutually independent installation and maintenance paths:
+Three independent installation/migration paths, plus one self-update:
 
 **① Shell-side "re-installation and takeover" (`DllLoader/ShellBootstrap.cpp`)** — executed only once, when the thin shell is loaded by the engine:
 
 1. **Version probing and readiness determination (`RuntimePackage::ProbeVersionIncludingLoaded`)**:
    - Normally, if the Loader is properly in place and the hook installation succeeds, the `LoadDLL` detour redirects it to the official GameCore, and **the thin shell is never loaded at all**;
-   - Once the thin shell is loaded, it means no redirection interception has happened. At that point `exe\version.dll` is checked:
+   - Once the thin shell is loaded, it means no redirection interception has happened. At that point `exe\winmm.dll` is checked:
      - If the file does not exist: judged as not yet installed, and the first-install flow is entered;
-     - If the file exists and contains a compliant RC 105 resource (it is our Loader): it means the Loader is in place but its `LoadDLL` hook failed to take effect (e.g. the process slept and skipped it, hook installation failed, etc.), so the status quo is kept with zero action (no need to copy again or show a dialog, just pass through to the official GameCore);
-     - If the file exists but **is not our Loader** (missing the compliant RC 105 resource): it means the current `version.dll` is a foreign proxy or an unrelated conflicting file, and the **takeover flow** is triggered (overwrite install with backup);
-2. **Candidate collection and version election**:
+     - If the file exists and contains a compliant RC 105 resource (it is our Loader): the Loader is in place but its `LoadDLL` hook failed to take effect (e.g. the process slept and skipped it, hook installation failed, etc.), so the status quo is kept with zero action (apart from one legacy-proxy retirement, see step 5; the session just passes through to the official GameCore);
+     - If the file exists but **is not our Loader** (missing the compliant RC 105 resource): the current `winmm.dll` is a foreign proxy or an unrelated conflicting file, and the **takeover flow** is triggered (overwrite install with backup);
+2. **Legacy proxy probe**: if `exe\version.dll` is also our Loader, log a WARN — the very fact that the thin shell ran means
+   `version.dll` was not loaded by the engine, which is exactly the class of machine that switching to `winmm.dll` fixes;
+3. **Candidate collection and version election**:
    - Collect `Civ6DllLoader.runtime.dll` candidates (`ModScan::FindRuntimeCandidates()`, no parameters);
    - Validate each PE and read RC resource 105, electing the highest version (on a version tie, take the one with the smaller path lexicographic order; candidates are not filtered by the Mod enabled set);
-3. **Split atomic publication (publishing to `version.dll`)**:
-   - **First install** (original file does not exist): copy to `version.tmp`, then atomically rename into place directly, and clean up any leftover `version_Old.dll`;
-   - **Takeover of a foreign file** (original file exists and is currently mapped by the system): copy to `version.tmp`, then call `ReplaceFileW` for an atomic replacement with backup, safely moving the original file to `version_Old.dll` before writing over it;
-4. **Prompt for restart**: show a dialog "Installed. Click OK to restart the game immediately" and try to start a new process to restart;
-5. **Silent fallback**: if any step fails, it **only logs, shows no dialog, and does not block game startup**; this session simply passes through to the official GameCore and completes normally.
+4. **Split atomic publication (publishing to `winmm.dll`)**:
+   - **First install** (original file does not exist): copy to `winmm.tmp`, then atomically rename into place directly, and clean up any leftover `winmm_Old.dll`;
+   - **Takeover of a foreign file** (original file exists and is currently mapped by the system): copy to `winmm.tmp`, then call `ReplaceFileW` for an atomic replacement with backup, safely moving the original file to `winmm_Old.dll` before writing over it;
+5. **Retire the legacy proxy (`RetireLegacyProxy`)**: only when `version.dll` is confirmed to be **our Loader** is it `MoveFileW`'d to
+   `version_Old.dll` (deleted by ③ in the next session); **a foreign `version.dll` is never touched** — that is somebody else's installation and does not conflict with `winmm.dll`;
+6. **Prompt for restart**: show a dialog "Installed. Click OK to restart the game immediately" and try to start a new process to restart;
+7. **Silent fallback**: if any step fails, it **only logs, shows no dialog, and does not block game startup**; this session simply passes through to the official GameCore and completes normally.
 
-**② Runtime-side self-update (`LoaderUpdate::CheckAndApplyUpdate`)** — the copy already running in the process replaces the one on disk:
+**② Legacy proxy name self-migration (`DllLoaderRuntime/LegacyProxyMigration.cpp`)** — moves players still installed as `version.dll` over:
 
-- Precondition: its own file name must be `version.dll` (otherwise it is treated as a direct load during development and the self-update is skipped);
-- At startup, if `version_Old.dll` is found to exist, it means **the previous session has just completed a self-update**, so it is deleted directly (self-healing);
+- **Why it has to exist**: as long as an old 1.0.x loader still works, its `LoadDLL` detour redirects and the thin shell never loads
+  → ① can never run; and the new code never installs anything under `version.dll` again. Those machines can only move themselves.
+- **The two hops of the upgrade path**: the old loader's `LoaderUpdate` installs the new candidate under **its own file name**,
+  so for a while the disk holds a "new binary under the old name `version.dll`". The exe's static `VERSION.dll` imports still
+  resolve thanks to the 17 auxiliary exports from §1.1. This upgrade therefore **takes two starts**: the first (new kernel, old
+  name) plays normally and renames itself to `winmm.dll` during that session; from the second start on it runs as `winmm.dll`.
+- **Trigger**: called once early in phase A (after `InitEarly`, before `HavokScript`), and **only when its own file name is `version.dll`**:
+  1. delete `version_Old.dll` (the backup left by the old loader's self-update/takeover);
+  2. if `winmm.dll` already exists:
+     - **it is our Loader** (compliant RC 105) → **yield**: retire itself to `version_Old.dll`, so the next start loads only the `winmm.dll` copy.
+       Never displace it — that would replace a possibly newer installation with this one;
+     - **foreign file** → delete `winmm_Old.dll`, then `MoveFileW(winmm.dll → winmm_Old.dll)` and take its place;
+  3. **one-step `MoveFileW(self → winmm.dll)`**, with no version comparison (higher/lower is settled by the next self-update); on failure roll back
+     `winmm_Old.dll → winmm.dll`, leaving the state equivalent to before the migration;
+  4. **no restart, no dialog**: this session keeps running on the mapped `version.dll` image; the rename only takes effect on the next start.
+- **Why a one-step rename instead of "copy to a temp file then publish"**: `RuntimePackage::StageCandidate` requires the source to open as an
+  independent data mapping (`(module & 3) != 0` on the `LoadLibraryExW` return value), but **this module is already mapped as code**,
+  so the probe would always fail. A direct rename never probes the source and sidesteps that; renaming a mapped image is already proven on ①'s takeover path.
+
+**③ Legacy file cleanup (first half of `LoaderUpdate::CheckAndApplyUpdate`)**:
+
+- Precondition: its own file name must be `winmm.dll` (a session running as `version.dll` naturally skips self-update and cleanup);
+- At startup, delete `winmm_Old.dll` and `version_Old.dll` (backups left by the previous session's self-update/takeover/migration/retirement).
+
+**④ Runtime-side self-update (`LoaderUpdate::CheckAndApplyUpdate`)** — the copy already running in the process replaces the one on disk:
+
+- Precondition: its own file name must be `winmm.dll` (otherwise it is treated as a direct load during development and the self-update is skipped);
 - Candidates go through the same `ModScan::FindRuntimeCandidates()`; after excluding itself (normalized path comparison),
-  a newer version is selected → **first backed up as `version_Old.dll`, then atomically replaced** (`ReplaceFileW`: the replaced file is renamed to the backup name and
-  the replacement file takes over its name, so there is no intermediate state on disk where "`version.dll` does not exist"; if `ReplaceFileW` is rejected, it falls back to
+  a newer version is selected → **first backed up as `winmm_Old.dll`, then atomically replaced** (`ReplaceFileW`: the replaced file is renamed to the backup name and
+  the replacement file takes over its name, so there is no intermediate state on disk where "`winmm.dll` does not exist"; if `ReplaceFileW` is rejected, it falls back to
   the old two-step rename + rollback on failure) → on failure it rolls back and the current installation stays unchanged;
 - After the swap, this session **still uses the old version in memory**, and a restart is required for it to take effect (the log writes `update applied ... (restart to take effect)`).
 
-Version numbers and protocol constants are in `common/LoaderProtocol.h` + `common/LoaderVersion.h` (`1.0.0`, RC resource id 105).
+Version numbers and protocol constants are in `common/LoaderProtocol.h` + `common/LoaderVersion.h` (`1.1.0`, RC resource id 105).
 The candidate version number obtained by the thin shell also comes from the same RC resource — **the installer does not execute the candidate DLL's `DllMain`/TLS/exports**, it only reads the resource.
 
 Candidates are **not filtered by the Mod enabled set** (`FilterByEnabledMods` is not called in `ModScan::FindRuntimeCandidates`):
@@ -507,6 +544,15 @@ under each root it looks for `<mod>\Binaries\Win64\Plugins\<Global|GameCore>\*.d
 >
 > ⚠️ **Breaking requirement**: a plugin DLL must carry a `VERSIONINFO` file version, otherwise it will not be loaded. The way to add a version is to give the project
 > a `.rc` (VS resource view → Add Resource → Version), not to add `RCDATA`.
+>
+> **The resource name must be the numeric ID 1**: `GetFileVersionInfo*` only looks up `RT_VERSION` via
+> `MAKEINTRESOURCE(1)`. When the first column of the `.rc` reads `VS_VERSION_INFO VERSIONINFO`, RC treats it as a
+> **string resource name** (that name really is 1 in `verrsrc.h`, but only after an `#include` expands it), so the
+> resource is perfectly legal while every version API returns 0 — the plugin is then judged version-less and dropped.
+> All three plugins in this repo hit exactly that. `common/PluginVersion.cpp` therefore carries a fallback: when the
+> API returns 0 it enumerates `RT_VERSION` under **any** resource name with `LOAD_LIBRARY_AS_DATAFILE` and parses the
+> block directly (still no module loading, no `DllMain`). The correct spelling remains `1 VERSIONINFO`, because
+> Explorer's file properties, `sigcheck` and PowerShell's `VersionInfo` only read ID 1.
 
 **The game install root is not a content root**: it is not a mod container (none of the direct subdirectories `Base`/`CTP`/`DLC`/`Debug`/`LaunchPad`
 contain `Binaries\Win64`, and the measured candidate set is always empty). The in-install mod roots recorded by `ScannedFiles` in the game's own `Mods.sqlite`
@@ -832,7 +878,7 @@ though their STL layouts differ (the iterator debug layer pads the containers) �
 compile (which is exactly why the Debug build once failed).
 
 These four only guard against layout drift **within a single build**. Stub reuse across binaries is not guaranteed by them — but that premise
-holds in this project: what the stub embeds is this process's `&HookSite`, and a `version.dll` self-update restarts the process, so no old
+holds in this project: what the stub embeds is this process's `&HookSite`, and a `winmm.dll` self-update restarts the process, so no old
 stub exists in the new process.
 
 **Residency principle for stubs and HookSite nodes (never released)**:
@@ -1378,7 +1424,7 @@ the selected one. Rebuild: `python tools/gen_rva_map.py` then `tools/rva_to_symb
 
 | Project | Output `TargetName` | Responsibility |
 |---|---|---|
-| `DllLoader/DllLoader.vcxproj` | `GameCore_XP2_Shell_FinalRelease` (shell) | Loader installer for the first use of this class of mod (scan mods + version election + install `version.dll` + prompt restart); zero hooks, does not start the runtime, does no runtime self-update |
+| `DllLoader/DllLoader.vcxproj` | `GameCore_XP2_Shell_FinalRelease` (shell) | Loader installer for the first use of this class of mod (scan mods + version election + install `winmm.dll` + retire the legacy `version.dll` + prompt restart); zero hooks, does not start the runtime, does no runtime self-update |
 | `DllLoaderRuntime/DllLoaderRuntime.vcxproj` | `Civ6DllLoader.runtime` (the Loader proper) | all hooks / sidecar / HookAPI / plugin lifecycle |
 
 Both projects are x64, C++20 (`/std:c++20`), `/utf-8`. Key preprocessor macros:
@@ -1419,7 +1465,7 @@ call "E:\VisualStudio\Products\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 | Artifact | Target location |
 |---|---|
-| `x64\<cfg>\Civ6DllLoader.runtime.dll` (renamed `version.dll`) | the game exe directory (`Base\Binaries\Win64Steam\` or `Win64\`) |
+| `x64\<cfg>\Civ6DllLoader.runtime.dll` (renamed `winmm.dll`) | the game exe directory (`Base\Binaries\Win64Steam\` or `Win64\`) |
 | `x64\<cfg>\GameCore_XP2_Shell_FinalRelease.dll` + `Civ6DllLoader.runtime.dll` | `Binaries\Win64\` of the enabled mod |
 | `DllLoaderRuntime\Civ6DllLoader.symdb.bin.xp` | deployed directly by `symdb.py all` (compiled into the runtime's RCDATA 102) |
 | `DllLoaderRuntime\Resources\Civ6DllLoader_FrontEndUI.{lua,xml}` | RCDATA 103/104, extracted by `UiInject::ExtractResources` into `<exe directory>\Civ6DllLoader\` |
@@ -1443,7 +1489,7 @@ The following are design constraints and known trade-offs that the system archit
 | 8 | toggling a mod does not take effect; a restart is required | there is no reconcile path | user experience | intentional: state consistency takes priority over convenience |
 | 9 | UI injection depends on signatures, and a match failure degrades silently | a game update changed the target code | the panel does not appear (there is a log record), everything else works normally | accepted |
 | 10 | data slot location depends on the AOB fallback instruction sequence | compiler / game updates | a location failure returns 0 and the corresponding feature degrades | accepted (logged) |
-| 11 | sleep detection requires the host exe name to look like `CivilizationVI*.exe` | prevents "another process loading this `version.dll` from the exe directory" from pulling the Loader + Global plugins in | in sessions using a renamed exe / a third-party launcher, the Loader sleeps silently (installs no hooks); `OutputDebugString` leaves a trace | intentional (strict first) |
+| 11 | sleep detection requires the host exe name to look like `CivilizationVI*.exe` | prevents "another process loading this `winmm.dll` from the exe directory" from pulling the Loader + Global plugins in | in sessions using a renamed exe / a third-party launcher, the Loader sleeps silently (installs no hooks); `OutputDebugString` leaves a trace | intentional (strict first) |
 | 12 | patches applied by plugins are **not rolled back automatically by the Loader** | automatic rollback would have to write restore bytes into possibly executing code at the moment "the plugin has already crashed", with no quiesce; and the saved bytes may be someone else's trampoline bytes | after quarantine/unload the patch stays in the game until process exit; plugins must manage the `Unpatch` timing themselves | intentional (§5.8) |
 
 ### 9.1 Known unhandled issues (implementation defects, to be fixed)
@@ -1470,7 +1516,7 @@ The table above is "accepted trade-offs". The ones below are **not design outcom
 | Term | Meaning |
 |---|---|
 | shell | `GameCore_XP2_Shell_FinalRelease.dll`: the Loader installer for the first use of this class of mod; zero hooks, loaded by the engine only when the Loader is absent |
-| Loader / runtime | `Civ6DllLoader.runtime.dll`: the module that actually does the work; `version.dll` is its copy |
+| Loader / runtime | `Civ6DllLoader.runtime.dll`: the module that actually does the work; `winmm.dll` is its copy (1.0.x used `version.dll`) |
 | site | a record keyed by the **target absolute address**, the shared carrier for the three things hook / capture / record |
 | detour slot | the position inside a site for "at most one plugin detour", exclusive, taken over by a later arrival |
 | capture | the slot inside a site for "read some parameter / write some parameter", several of them can be shared |
