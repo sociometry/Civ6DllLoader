@@ -18,6 +18,7 @@
 #include "PluginBoundary.h"
 #include "PluginDomain.h"
 #include "Runtime.h"
+#include "PatchRegistry.h"     // 站点创建时的补丁区间仲裁（review #2）
 #include "ScriptBridge.h"      // WaitForDetourDrain / ResetForTeardown
 #include "AddressResolve.h"
 #include "TeardownWindow.h"
@@ -129,6 +130,10 @@ static_assert(offsetof(HookSite, hasCapture) <= (std::numeric_limits<int32_t>::m
               offsetof(HookSite, captureParamIndex) <= (std::numeric_limits<int32_t>::max)() &&
               sizeof(HookSite) <= (std::numeric_limits<int32_t>::max)(),
               "stub 的字段偏移/结构体大小必须落在 int32 内（asmjit 位移宽度）");
+
+// teardown 等在途 detour 归零的上限。超过就不摘 MinHook 记录（fail-closed：宁可让站点
+// 停在 recordStale 等下个会话重建，也不释放可能仍在使用的跳板）。
+static constexpr ULONGLONG kDetourDrainTimeoutMs = 2000;
 
 // ==== BuildHookHubStub ====
 // 生成统一中转 stub（裸 x64 机器码，Windows x64 调用约定）。
@@ -251,6 +256,46 @@ static bool BuildHookHubStub(HookSite* site, void** outStub) {
     return true;
 }
 
+// ==== BuildDetourActivityThunk ====
+// 插件 detour 的「在途计数」包壳（裸 x64 机器码）。stub 的 nextTarget 指向它，它做：
+//   push r10 / sub rsp,0x20
+//   mov r10, imm64(site) ; lock inc [r10 + off(activeDetourCalls)]
+//   mov r10, imm64(detour) ; call r10
+//   mov r10, imm64(site) ; lock dec [r10 + off(activeDetourCalls)]
+//   add rsp,0x20 / pop r10 / ret
+// 退出时 r10 逐位还原，rax / xmm0-5 / 标志位一概不碰 —— detour 的返回值原样回到调用方。
+// 栈：入口 rsp ≡ 8；push r10 → ≡ 0；sub 0x20 → ≡ 0，call 时 16 字节对齐，且 0x20 正好是
+// callee 的 shadow space。
+//
+// **为什么不直接尾跳 detour**：尾跳之后就回不来了，减不了计数；而 teardown 释放跳板前
+// 必须能证明「没有线程还停在 detour 里」（review #1）。多一次 call/ret 换这个证明。
+// 实测只看插件 detour 站点，热路径成本是一次 lock inc + 一次 lock dec。
+static bool BuildDetourActivityThunk(HookSite* site, void* detour, void** outThunk) {
+    using namespace asmjit;
+    CodeHolder code;
+    if (code.init(g_captureRuntime.environment(), g_captureRuntime.cpu_features()) != Error::kOk) {
+        return false;
+    }
+    x86::Assembler a(&code);
+    const int32_t offCalls = static_cast<int32_t>(offsetof(HookSite, activeDetourCalls));
+    a.push(x86::r10);
+    a.sub(x86::rsp, 0x20);
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
+    a.lock().inc(x86::dword_ptr(x86::r10, offCalls));
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(detour));
+    a.call(x86::r10);
+    a.mov(x86::r10, reinterpret_cast<uintptr_t>(site));
+    a.lock().dec(x86::dword_ptr(x86::r10, offCalls));
+    a.add(x86::rsp, 0x20);
+    a.pop(x86::r10);
+    a.ret();
+
+    void* thunk = nullptr;
+    if (g_captureRuntime.add(&thunk, &code) != Error::kOk || !thunk) return false;
+    *outThunk = thunk;
+    return true;
+}
+
 // ==== GetOrCreateHookSiteLocked ====
 // 取/建 target 上的统一站点。调用方必须持有 Runtime::MinHookMutex()（站点锁）。
 // 首次建站（或 recordStale 强制重建）才 MH_CreateHook + MH_EnableHook。
@@ -276,6 +321,17 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
         return site;   // 既有、可用
     }
 
+    // 补丁仲裁（review #2）：插件 detour / 捕获 / 共享 detour 三条建站路径都汇集到这里，
+    // 所以把「目标前导窗口压着已登记补丁」的检查放在这一处，三条路径口径一致。此前只有
+    // 插件 detour 在 InstallHookImpl 里查过，先 Patch 再装捕获/共享钩可以绕过去。
+    // 调用方已持 MinHookMutex；PatchRegistry 的临界区是叶子锁（固定顺序 MinHook -> Patch）。
+    if (PatchRegistry::OverlapsRegistered(target, kHookPrologueWindow)) {
+        Logger::Log("HookSite: target %p overlaps a registered patch; refusing (%s)",
+            target, why ? why : "");
+        if (created) g_hookSites.erase(it);
+        return nullptr;
+    }
+
     if (!created && site->recordStale) {
         // recordStale：上一次 GameCore teardown 没能摘掉这条 MinHook 记录（目标映像当时
         // 已卸载 -> Disable/Remove 都失败）。此刻 target 是调用方刚解析出来的地址，可读。
@@ -296,6 +352,15 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
                         "拒绝触碰它的 MinHook 记录 (fail-closed) (%s)", target, why ? why : "");
             return nullptr;
         }
+        // 上一代 detour 仍有人停在里面：这条记录背后的跳板还在被使用，此刻 MH_DisableHook /
+        // MH_RemoveHook 会把旧字节写回目标并释放跳板。fail-closed：把这个地址标记为不可再碰。
+        if (site->activeDetourCalls != 0) {
+            site->poisoned = true;
+            Logger::Log("HookSite: recordStale target=%p still has %u in-flight detour call(s); "
+                        "refusing to touch its MinHook record (fail-closed) (%s)",
+                target, site->activeDetourCalls, why ? why : "");
+            return nullptr;
+        }
         Logger::Log("HookSite: recordStale rebuild target=%p (%s)", target, why ? why : "");
         if (site->hookInstalled && Runtime::IsReadableSpan(target, 1)) {
             MH_DisableHook(target);
@@ -309,6 +374,11 @@ static HookSite* GetOrCreateHookSiteLocked(void* target, const char* why) {
         site->minhookTrampoline = nullptr;
         site->activeDetour = nullptr;
         site->detourOwner.clear();
+        // 重建 = 上一代 detour 的生命周期已经结束（它的插件模块随后被释放）：清零在途计数，
+        // 否则一次排空超时留下来的非零值会让这个站点永远拒绝摘记录。旧包壳是 JIT 代码，
+        // 与 stub 同一条纪律：不释放，只丢引用。
+        site->activeDetourCalls = 0;
+        site->detourThunk = nullptr;
         // 绝不可置 nullptr：recordStale 只证明"入口字节已还原"，不能证明"没有调用者停在 stub 里"。
         // 指向 target = 让在途调用者直接执行原函数（与 RemoveHookSiteRecordLocked 的 b 步同理）。
         site->nextTarget = target;
@@ -440,12 +510,11 @@ size_t RetireHookSiteDetoursForOwnerLocked(const std::wstring& owner) {
 // 调用方不得持 Runtime::MinHookMutex()（内部自己取）。只看统一的站点表：
 // Loader 共享钩（ScriptData / ForUI / PushMethods）与插件 detour 都是站点，
 // 只有站点的 MinHook 侧（hookInstalled）才改写过目标前导字节。
-bool OverlapsHookPrologue(const void* target, size_t len) {
+bool OverlapsHookPrologueLocked(const void* target, size_t len) {
     if (!target || len == 0) return false;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(target);
     const uintptr_t end = begin + len;
     if (end < begin) return true;   // 地址回绕：按冲突处理
-    lock_guard<mutex> lock(Runtime::MinHookMutex());
     for (const auto& [siteTarget, site] : g_hookSites) {
         if (!site.hookInstalled) continue;   // 未 Enable 的站点尚未改写前导字节
         const uintptr_t hookBegin = reinterpret_cast<uintptr_t>(siteTarget);
@@ -453,6 +522,12 @@ bool OverlapsHookPrologue(const void* target, size_t len) {
         if (begin < hookEnd && hookBegin < end) return true;
     }
     return false;
+}
+
+bool OverlapsHookPrologue(const void* target, size_t len) {
+    if (!target || len == 0) return false;
+    lock_guard<mutex> lock(Runtime::MinHookMutex());
+    return OverlapsHookPrologueLocked(target, len);
 }
 
 // ==== InstallHookImpl ====
@@ -509,9 +584,19 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
     // 置为 detour 才是"插件 detour 开始生效"的那一刻。必须先备好跳板（*original）再发布，
     // 否则另一线程可能在这两行之间进入 detour，读到的 original 还是插件侧的未初始化值。
     if (original) *original = site->minhookTrampoline;
+    // 插件 detour 经「计数包壳」进入：stub 尾跳 thunk，thunk 记一笔再 call detour。包壳生成
+    // 失败才退化成直连——那时 activeDetourCalls 恒为 0，teardown 的排空等不到证据，只能按
+    // 旧行为处理，日志里会明确记一条。
+    void* thunk = nullptr;
+    if (!BuildDetourActivityThunk(site, detour, &thunk) || !thunk) {
+        Logger::Log("InstallHook: activity thunk unavailable target=%p detour=%p; "
+                    "detour runs uncounted (trampoline drain unprovable)", target, detour);
+        thunk = detour;
+    }
+    site->detourThunk = (thunk == detour) ? nullptr : thunk;
     site->activeDetour = detour;
     site->detourOwner = owner->ownerId;
-    site->nextTarget = detour;
+    site->nextTarget = thunk;
     Logger::Log("InstallHook: target=%p detour=%p original=%p owner=%ls (hub stub=%p)",
         target, detour, original ? *original : nullptr, owner->ownerId.c_str(), site->stubCode);
     return true;
@@ -527,7 +612,9 @@ bool InstallHookImpl(void* target, void* detour, void** original) {
 //      不成立；
 //   b) site.nextTarget = target：入口字节已还原，此刻仍在 stub 里的在途调用者改去
 //      执行原函数——安全且语义正确，且此后不会再有人引用这块跳板；
-//   c) MH_RemoveHook(target)：释放跳板。必须排在 b 之后，否则在途线程会从 stub 直接
+//   b2) 等在途插件 detour 排空（activeDetourCalls 归零，见 BuildDetourActivityThunk）；
+//      超时不摘记录，按失败返回（调用方打 recordStale）。
+//   c) MH_RemoveHook(target)：释放跳板。必须排在 b/b2 之后，否则在途线程会从 stub 直接
 //      跳进已释放的跳板（UAF）。
 // 摘除失败时保留站点记账（hookInstalled 等不动）；teardown 路径会给该站点打
 // recordStale，交给下次在同一地址取站时强制重建。
@@ -544,6 +631,18 @@ bool RemoveHookSiteRecordLocked(void* target, HookSite& site) {
         return false;
     }
     site.nextTarget = target;   // 入口已还原：在途调用走原函数，不再碰跳板
+
+    // b2) 核对在途插件 detour 是否已排空（review #1）。b 只保证「之后进来的调用走原函数」；已经
+    // 进了 detour 的线程手里还攥着 original（= 这块跳板）。真正的等待发生在 teardown 的
+    // WaitForPluginDetourDrain（那时不持任何锁）；这里只做**非阻塞**复核：不为零就说明排空没
+    // 做成，于是保留记录、交给调用方打 recordStale —— 绝不在持 MinHook / lifecycle 锁时 Sleep。
+    if (site.activeDetourCalls != 0) {
+        Logger::Log("RemoveHookSiteRecord: %p still has %u in-flight detour call(s); "
+                    "record retained, trampoline NOT freed",
+            target, site.activeDetourCalls);
+        return false;
+    }
+
     const MH_STATUS remove = MH_RemoveHook(target);
     if (remove != MH_OK && remove != MH_ERROR_NOT_CREATED) {
         Logger::Log("RemoveHookSiteRecord: MH_RemoveHook(%p) -> %s", target, MH_StatusToString(remove));
@@ -926,6 +1025,47 @@ void DisableGameCoreDomainSites() {
         candidates, readable, queued, unreadable, MH_StatusToString(applied));
 }
 
+// ==== WaitForPluginDetourDrain ====
+// 见 HookEngine.h 的契约：不持任何业务锁等待，取样时只短暂取 MinHook 锁。
+// 只统计**本次要拆除的映像**上的站点：exe 域站点永不被摘除，它们上面的高频 detour 若也计入，
+// 这里会永远等不到零，反而把 GameCore 的记录逼成 recordStale。
+static size_t CountInFlightDetoursLocked() {
+    size_t total = 0;
+    for (const auto& kv : g_hookSites) {
+        if (!PluginDomain::TargetInTearingDownGameCore(kv.first)) continue;
+        total += kv.second.activeDetourCalls;
+    }
+    return total;
+}
+
+bool WaitForPluginDetourDrain(uint32_t timeoutMs) {
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    size_t inFlight = 0;
+    for (;;) {
+        {
+            lock_guard<mutex> lock(Runtime::MinHookMutex());
+            inFlight = CountInFlightDetoursLocked();
+        }
+        if (inFlight == 0) break;
+        if (GetTickCount64() >= deadline) {
+            Logger::Log("WaitForPluginDetourDrain: timeout, %zu call(s) still in flight", inFlight);
+            return false;
+        }
+        Sleep(1);
+    }
+    // 归零后再复核一次：覆盖「stub 已取到 nextTarget、还没进入 detour」的几条指令窗口。
+    Sleep(1);
+    {
+        lock_guard<mutex> lock(Runtime::MinHookMutex());
+        inFlight = CountInFlightDetoursLocked();
+    }
+    if (inFlight != 0) {
+        Logger::Log("WaitForPluginDetourDrain: %zu call(s) entered during the grace window", inFlight);
+        return false;
+    }
+    return true;
+}
+
 // ==== RemoveGameCoreDomainSiteRecords ====
 // 第 2 步：物理摘除 GameCore 域的站点记录（释放 MinHook 跳板），并复位共享钩状态。
 // 骨架沿用被本步替换掉的共享钩复位函数（该函数已删除）：
@@ -955,6 +1095,12 @@ void RemoveGameCoreDomainSiteRecords(
     // 排空在途共享 detour：计数与等待原语归 ScriptBridge 私有（阶段 4）。
     // 不能在持 lifecycle/hook 锁时等待 —— 已在此前 unlock。
     ScriptBridge::WaitForDetourDrain();
+    // 再等插件 detour 退出——同样在 lifecycle 锁之外（在途 detour 可能正要用它）。失败不回滚：
+    // 下面的逐站点摘除会因计数不为零而保留记录并打 recordStale（fail-closed，不释放在用跳板）。
+    if (!WaitForPluginDetourDrain(static_cast<uint32_t>(kDetourDrainTimeoutMs))) {
+        Logger::Log("RemoveGameCoreDomainSiteRecords: plugin detour drain timed out; "
+                    "site records will be retained (recordStale) instead of freed");
+    }
     lifecycleLock.lock();
 
     // 排空后才真正摘除站点记录（释放跳板）；顺序理由见 RemoveHookSiteRecordLocked。

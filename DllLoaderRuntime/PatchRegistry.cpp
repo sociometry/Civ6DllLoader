@@ -3,6 +3,9 @@
 #include "pch.h"
 #include "PatchRegistry.h"
 
+#include "HookEngine.h"   // OverlapsHookPrologueLocked（与装钩侧的仲裁，review #2）
+#include "Runtime.h"      // MinHookMutex：两侧仲裁必须在同一临界区里完成
+
 #include <Windows.h>
 
 #include "../common/Logger.h"
@@ -210,6 +213,16 @@ bool Apply(void* target, const void* bytes, size_t len, const wchar_t* owner) {
     }
     if (!owner || !*owner) {
         owner = L"unknown";
+    }
+
+    // 与装钩侧的仲裁要和「写字节」在同一个临界区里完成（review #2）。装钩方持 MinHook 锁、
+    // 在锁内检查补丁表并建站；这里持同一把锁检查已装钩站点再写。锁序固定 MinHook -> Patch
+    // （站点创建在 MinHook 内取 Patch 临界区），反向没有路径，不会死锁。
+    std::lock_guard<std::mutex> hookLock(Runtime::MinHookMutex());
+    if (HookEngine::OverlapsHookPrologueLocked(target, len)) {
+        Logger::Log("PatchRegistry::Apply: target %p len=%zu overlaps a hooked prologue; "
+                    "refusing (unhook it first)", target, len);
+        return false;
     }
 
     CsGuard csGuard;

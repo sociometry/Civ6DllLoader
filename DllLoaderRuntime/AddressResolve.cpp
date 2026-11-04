@@ -364,6 +364,17 @@ void* ResolveByRvaImpl(HookImageId image, uintptr_t rva, size_t span) {
     if (!caller || !PluginDomain::IsImageOpenToCaller(caller->category, image, "ResolveByRva")) return nullptr;
     lock_guard<std::recursive_mutex> lock(LoaderCore::LifecycleMutex());
     PluginBoundary::LoaderLockScope pbLockScope;
+    // 插件侧是"矫正型"解析：没有该映像的符号上下文时，传进来的旧 RVA 已经不可信，
+    // 直接解析成 base + rva 会返回一个看似合法、实则可能是另一个函数的地址，并把
+    // ResolveByHookInfo 的 AOB 兜底一起吞掉。所以这里 fail-closed 返回 nullptr，
+    // 与 docs/ARCHITECTURE.md §1.4 的约定一致。确实要"已按新映像坐标算好的原始 RVA"
+    // 的调用方走 ResolveByRvaEx（kSectionImage），那条路径不宣称做矫正。
+    if (!PdataMatch::HasContext(image)) {
+        Logger::Log("ResolveByRva rejected: no symbol database for image=%u rva=0x%llX span=%zu "
+                    "(raw image-relative RVAs must use ResolveByRvaEx)",
+            static_cast<unsigned>(image), static_cast<unsigned long long>(rva), span);
+        return nullptr;
+    }
     return AddressResolve::ResolveByRvaCore(image, rva, span);
 }
 

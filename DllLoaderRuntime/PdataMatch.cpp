@@ -147,7 +147,9 @@ constexpr uint32_t kMaxAobBytes = 64;
 // ---- 磁盘缓存（exe 目录 Civ6DllLoader\pdata_cache.bin）----
 
 constexpr char kCacheMagic[4] = { 'C', '6', 'P', 'C' };
-constexpr uint32_t kCacheVersion = 1;
+// v2：缓存自校验改为"有头 hash 就必须核头 hash"，不再用尺寸+unwind 相等代替。版本号
+// 变化会让旧的 cache 文件整体失效（LoadCache 见版本不符直接丢弃），这是刻意的。
+constexpr uint32_t kCacheVersion = 2;
 constexpr wchar_t kCacheDirName[] = L"Civ6DllLoader";
 constexpr wchar_t kCacheFileName[] = L"pdata_cache.bin";
 
@@ -1545,16 +1547,25 @@ static bool ValidateCachedMap(const std::vector<PdataSig>& oldTable,
         if (static_cast<size_t>(ni) >= newTable.size()) { ++outBad; return false; }
         const PdataSig& oe = oldTable[oi];
         const PdataSig& ne = newTable[ni];
-        if (oe.size == ne.size && oe.unwind_hash == ne.unwind_hash) return true;   // ①
+        // 有头 hash 证据时**以它为准**：SizeOfImage 之外，函数尺寸 + unwind hash 相同并不
+        // 意味着同一段代码——函数体被换位、或两个函数碰巧同尺寸同展开信息时，只凭这两项
+        // 相等就接受缓存，等于把已有的更强证据丢掉（review #3 的复现正是这种构造）。
         const auto hit = headHashByRva.find(oe.begin_rva);
-        if (hit != headHashByRva.end() && newBase != nullptr) {                    // ②
+        const bool haveHead = (hit != headHashByRva.end() && newBase != nullptr && ne.prologSize != 0);
+        if (haveHead) {
             const size_t headLen = ne.prologSize < 32 ? ne.prologSize : 32;
-            if (headLen != 0 &&
-                static_cast<uint64_t>(ne.begin_rva) + headLen <= newImageSize &&
+            if (static_cast<uint64_t>(ne.begin_rva) + headLen <= newImageSize &&
                 NormHash::NormalizedHeadHash(newBase + ne.begin_rva, headLen) == hit->second) {
                 return true;
             }
+            ++outBad;
+            return false;   // 头字节不符：缓存已过期，不降级到 ①/③
         }
+        // 没有头 hash 的条目（sidecar 只给函数符号带头 hash）：
+        //   ① pdata 签名完全相等 —— AlignTables 的窗口锚点 / 插值 / 外推都产出这种映射；
+        //   ③ 有函数体 AOB 记录 —— AlignTables 的 AOB 恢复路径。逐条重跑 AOB 搜索代价等于
+        //      重新匹配，所以这里只在"没有更强证据"时接受。
+        if (oe.size == ne.size && oe.unwind_hash == ne.unwind_hash) return true;   // ①
         if (g_aobByRva.find(oe.begin_rva) != g_aobByRva.end()) return true;        // ③
         ++outBad;
         return false;

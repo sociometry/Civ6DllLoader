@@ -232,7 +232,10 @@ EXE 的静态导入表中包含 `winmm.dll`（导入序号 15），Windows 加�
    建档这一步（`RuntimeEntry.cpp` 的 `IdentifyExecutable()` 分支）容易被漏掉：`PdataMatch::Init` 成功
    只是让 sidecar 可用，还要为**当前进程实际是 DX11 还是 DX12** 建一份 exe 符号表，供插件按旧 exe
    RVA 作跨版本矫正。缺模块或建档失败一律 fail-closed：该映像的 `ResolveByRva`/`ResolveByName`
-   返回 `nullptr`，**不回退原 RVA**（原 RVA 在更新后本就是错的），所以这两种情况都会留醒目日志；
+   返回 `nullptr`，**不回退原 RVA**（原 RVA 在更新后本就是错的），所以这两种情况都会留醒目日志。
+   `ResolveByRva` 的这条 fail-closed 只加在**插件侧入口**（`ResolveByRvaImpl`）；确实要「已按新映像
+   坐标算好的原始 RVA」的调用方用 `ResolveByRvaEx(kSectionImage)`，Loader 内部基于已确认版本锚的取址
+   走各自的 `*Core`，都不受这条影响；
 **1.2)** `hks::InitHavokScript()` + `Localization::InitScript()`：两个**进程级静态导入**解析一次
    （缺失只降级各自的 API，不影响插件加载；为什么放这一阶段见 §1.5）；
 **1.5)** `UiInject::ExtractResources()`：把内嵌的 FrontEnd UI 资源释放到 `<exe 目录>\Civ6DllLoader\` 子目录；
@@ -440,7 +443,10 @@ DllLoader.SetGameCoreState(false) --> boolean
 8. 重新拿 lifecycle 锁；
 9. `RemoveGameCoreDomainSiteRecords()` 执行站点清理与解绑：
    - **设置窗口与解绑**：进入 teardown 窗口（内部设防）并执行 `ImageAddress::DetachGameCore()`；
-   - **排空在途调用**：临时释放 lifecycle 锁，等待 `g_activeSharedDetours` 归零以排空在途共享 detour；
+   - **排空在途共享 detour**：临时释放 lifecycle 锁，等待 `g_activeSharedDetours` 归零；
+   - **排空在途插件 detour**：`WaitForPluginDetourDrain` 在 lifecycle 锁之外轮询所有**待拆映像**站点的
+     `activeDetourCalls`（插件 detour 走计数包壳，见 §5.2）；之后的逐站点摘除只做非阻塞复核，不为零就
+     保留记录、改打 `recordStale`——宁可下次同址重建，也不释放可能仍在用的跳板；
    - **重锁并扫表复位**：重新获取 lifecycle 锁，重新扫描站点表以物理摘钩。成功则 `MH_RemoveHook` 并**原地复位站点**（保留并复用节点及 stub，清空 capture 槽；**绝不 erase**，因为 stub 机器码硬编码了 `&HookSite`）；失败则标记 `recordStale` 并拔除 detour 槽；
    - **复位共享入口**：复位 `g_origRegisterScriptData(/ForUI)` 与 16 个 PushMethods 槽位；
    - **窗口存续**：**teardown 窗口不在此处清除**，必须维持到引擎真正完成卸载——由 `UnloadDllDetour`
@@ -821,7 +827,8 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 - **capture 槽**：`hasCapture` / `captureParamIndex` / `captureOuts`（同一地址 1 个 detour + N 个捕获订阅共存）；
 - **MinHook 侧**：`stubCode` / `minhookTrampoline` / `hookInstalled`。
 
-`nextTarget` 是 stub 的尾跳目标（有 detour 时=detour，否则=跳板）；`recordStale` 表示"上一次 teardown
+`nextTarget` 是 stub 的尾跳目标：插件 detour 存在时指向**计数包壳**（见 §5.2），共享 detour 指向 detour
+本体，没有 detour 时指向跳板；`recordStale` 表示"上一次 teardown
 没能摘掉这条 MinHook 记录"（下次同地址取站时强制重建）。
 
 ### 5.2 stub（loader 生成的中转代码）
@@ -883,9 +890,26 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 这四条只挡**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它们保证——但该前提在本项目成立：
 stub 里嵌的是本进程的 `&HookSite`，而 `winmm.dll` 自更新会重启进程，新进程里不存在旧 stub。
 
+**插件 detour 的计数包壳（`BuildDetourActivityThunk`）。** 插件 detour 不直接当 `nextTarget`，而是先跳到
+一段每次安装现生成的包壳：`push r10` → `sub rsp,0x20` → `lock inc [site+activeDetourCalls]` →
+`call detour` → `lock dec` → 还原 r10 → `ret`。stub 的尾跳对包壳而言等价于一次普通 `call`：参数寄存器、
+影子空间、返回值（rax）与 xmm 全不用动，实测 1000 次调用返回值与计数都正确。
+
+代价是每次插件 detour 调用多一对 `lock inc/dec` 和一次 `call/ret`；换来的是 teardown 释放跳板前能
+**证明**没有线程还停在 detour 里——这正是 review #1 指出的 UAF 窗口。共享 detour 由
+`ScriptBridge::SharedDetourActivity` 自己计数，不套包壳；包壳生成失败时退化为直连，并在日志里记明
+"trampoline drain unprovable"。
+
+**摘钩顺序**：先 `MH_DisableHook`（入口字节还原，此后不会再有新调用进入 detour）；teardown 再在**不持任何
+业务锁**的前提下调 `WaitForPluginDetourDrain`（上限 2 s，1 ms 轮询，归零后静默 1 ms 复核，防止「已从 stub
+取到目标、还没跳进去」的窗口）；确认归零后才 `nextTarget = target` → `MH_RemoveHook` 释放跳板。若排空超时，
+摘除路径只做非阻塞复核，发现计数仍不为零就**保留记录**并打 `recordStale`——既不在持锁时 Sleep，也绝不释放
+可能仍在用的跳板。
+
 **Stub 与 HookSite 节点的常驻原则（永不释放）**：
 1. **立即数指针内嵌**：Stub 机器码使用立即数 `mov r10, imm64(&HookSite)` 硬编码了站点节点地址；若释放节点，执行流将直接访问悬垂指针；
-2. **缺乏无锁静默判定机制**：系统无法证明“当前已无任何线程正停留在 Stub 执行流或跳板内”（缺少可靠的原子引用计数），释放内存会产生释放后使用（UAF）隐患；
+2. **stub 没有“静默”判定**：stub 的执行窗口只有几条指令、又是所有调用者的必经之路，逐次计数不划算；
+   而**跳板**另有 `activeDetourCalls` 计数（§5.2），teardown 等它归零才调用 `MH_RemoveHook`；
 3. **分配器生命周期限制**：AsmJit 采用块状内存分配模型，多组 Stub 共享底层内存页，无法进行单条 Stub 粒度的释放归还。
 
 因此，在 GameCore 卸载清理（Teardown）时，系统仅对 `HookSite` 执行**原地状态复位**以供复用，保留底层 Stub 机器码与节点本身。
@@ -931,7 +955,7 @@ stub 的慢路径把第 `paramIndex` 个**整数**寄存器参数（rcx/rdx/r8/r
 3. owner 探针（`ResolvePluginOwnerForAddress(detour)`）；
 4. **地址域门**（§4.1）；
 5. 取 MinHook 锁 → 站点取/建（必要时 `MH_CreateHook` + `MH_EnableHook`）→ 独占性检查；
-6. 写槽，顺序：先备 `*original`（=跳板）→ `activeDetour`/`detourOwner` → **最后** `nextTarget`。
+6. 写槽，顺序：先备 `*original`（=跳板）→ 生成计数包壳并写 `detourThunk` → `activeDetour`/`detourOwner` → **最后** `nextTarget`（=包壳）。
    顺序理由：站点首建后 MinHook 侧已 enable，但那一刻 `nextTarget` 只是跳板（纯透传）；detour 只有靠
    "把 nextTarget 置为 detour"才被激活，所以必须先把跳板交给插件再发布。
 
@@ -997,10 +1021,14 @@ target 返回这个状态。它有两种可能来源，处理方式相反：
 
 **与 MinHook 的双向互斥**（同一段前导字节被两套机制各存一份"原始字节"会互相覆盖）：
 
-- 装钩前：`InstallHookImpl` 查 `PatchRegistry::OverlapsRegistered(target, kHookPrologueWindow)`；
-- 打补丁前：`HookPatch` 查 `OverlapsHookPrologue(target, len)`——**只看 `hookInstalled == true`
-  的站点**（未 Enable 的站点尚未改写前导字节）。因此**已被挂钩的点位不可能再打上补丁**，
-  反之亦然。窗口取 `PluginBoundary::kMinHookTargetSpan`（32 字节，与可读探测同口径）。
+- 装钩一侧：检查放在**建站的唯一入口** `GetOrCreateHookSiteLocked`（调用方已持 MinHook 锁），所以插件
+  detour、`RegisterGlobalCapture` 与共享 detour 三条路径口径一致。此前只有 `InstallHookImpl` 查过，
+  先 Patch 再装捕获/共享钩能绕过去（review #2）；
+- 打补丁一侧：`PatchRegistry::Apply` 在**同一把 MinHook 锁**内先查 `OverlapsHookPrologueLocked` 再写字节，
+  使「检查 + 写」与「检查 + 建站」互斥，不再留 TOCTOU 窗口。锁序固定为 MinHook -> Patch 临界区；
+- 判据只看 `hookInstalled == true` 的站点（未 Enable 的站点尚未改写前导字节）。窗口取
+  `PluginBoundary::kMinHookTargetSpan`（32 字节，与可读探测同口径）。因此**已被挂钩的点位不可能再打上
+  补丁**，反之亦然。
 
 **约定**：
 
@@ -1304,8 +1332,10 @@ detour 把插件的 C 闭包按 `exposedName` 写进游戏给的那张表；每�
      - **序言与 AOB 校验补全**：计算新函数序言哈希，比对 `normHeadHash` 剔除失配项；随后执行头哈希局部恢复、函数体 AOB 恢复，最终合并叶子函数 AOB 与虚表槽位反推结果（并入 `leafMap`）。
   
   *关于去 DRM 视图的补充说明*：上述构建判定使用的 `SizeOfImage` 均经过 `NormalizedSizeOfImage` 归一化处理（从末节向前剥离连续的 `.bind` 段后按节对齐重算）。原版 EXE 携带 `.bind` 段，其原始 `SizeOfImage` 比去 DRM 修改版大 0x33000，但两者的代码与 `.pdata` 逐字节相同。因此，凡涉及“该映像是否为同一构建”的判定（如 `BuildNewTable`、`ExeMatchesAnchor`），两端必须统一使用归一化尺寸进行比对；而所有内存越界与缓冲区边界检查，则必须使用 PE 原始尺寸（`OptionalHeader.SizeOfImage`）。
-- 缓存命中后按头/尾 + 最多 64 个等距条目做一次抽样自校验（`ValidateCachedMap`）。它只保证「结构上像
-  本次匹配的产出」（索引不越界、签名/头 hash/AOB 至少一条成立），**不是对缓存可信度的保证**：缓存文件
+- 缓存命中后按头/尾 + 最多 64 个等距条目做一次抽样自校验（`ValidateCachedMap`）。判定规则是「证据取强」：
+  sidecar 给该 `old_rva` 带了 `normHeadHash` 时**必须**核新映像同一位置的头字节，不符即判缓存失效（不再
+  退让到「尺寸 + unwind 相等」）；只有没有头 hash 的条目才允许用 pdata 签名相等或「存在函数体 AOB 记录」
+  通过。缓存文件格式版本随这条规则升到 2，旧缓存自动作废。**仍然不是对缓存可信度的保证**：缓存文件
   与 sidecar 同在游戏目录、权限相同，能改写它的人也能直接换掉 runtime；
 - `CorrectRva` / `CorrectByName` / `CorrectVTableByName` 只查表；构建期（vtable 反推）与运行期查询共用
   同一份 `CorrectRvaInTables` 口径（二分 + 封顶 64 条回扫；只有 `size` 不变时才允许函数内偏移；

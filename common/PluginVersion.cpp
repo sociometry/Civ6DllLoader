@@ -59,15 +59,24 @@ bool ExtractFixed(const void* block, VS_FIXEDFILEINFO& out) {
 //
 // 只枚举、只读块数据，仍然不加载模块、不跑 DllMain（LOAD_LIBRARY_AS_DATAFILE 把文件当
 // 数据映射，DllMain 不会执行）。
+// 枚举回调里【必须】把名字抄走，不能存回调参数指针：
+// EnumResourceNamesW 的文档写明"传进来的名字只在回调内部有效；若是字符串指针，它指向
+// 一个会被所有回调复用的内部缓冲区"。整数 ID 用 MAKEINTRESOURCE 表示，没有这个问题。
 struct FirstVersionName {
-    const void* name = nullptr;
+    WORD id = 0;                 // 非 0：资源名是整数 ID
+    std::wstring text;           // 非空：资源名是字符串（已复制）
     bool found = false;
 };
 
 BOOL CALLBACK FindFirstVersionName(HMODULE module, LPCWSTR /*type*/, LPWSTR name, LONG_PTR param) {
     auto* state = reinterpret_cast<FirstVersionName*>(param);
     if (!state || state->found) return FALSE;
-    state->name = name;
+    if (!name) return TRUE;
+    if (IS_INTRESOURCE(name)) {
+        state->id = static_cast<WORD>(reinterpret_cast<uintptr_t>(name));
+    } else {
+        state->text.assign(name);
+    }
     state->found = true;
     return FALSE;  // 只取第一个
 }
@@ -82,7 +91,10 @@ bool ReadFixedFromAnyVersionResource(const std::wstring& path, VS_FIXEDFILEINFO&
 
     bool ok = false;
     if (first.found) {
-        HRSRC resource = FindResourceW(module, static_cast<LPCWSTR>(first.name), MAKEINTRESOURCEW(16));
+        LPCWSTR resourceName = first.text.empty()
+            ? MAKEINTRESOURCEW(first.id)
+            : first.text.c_str();
+        HRSRC resource = FindResourceW(module, resourceName, MAKEINTRESOURCEW(16));
         if (resource) {
             const DWORD size = SizeofResource(module, resource);
             HGLOBAL loaded = LoadResource(module, resource);

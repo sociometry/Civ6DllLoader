@@ -61,6 +61,18 @@ struct HookSite {
     bool prologueValid = false;
     // 前导字节对不上（或当时没读到）：本会话不再碰这个地址，绝不冒险写回旧字节（fail-closed）。
     bool poisoned = false;
+
+    // ---- 插件 detour 的在途计数（review #1）----
+    // 插件 detour 的调用一律经过 detourThunk（见 BuildDetourActivityThunk）：它进入 detour
+    // 之前把 activeDetourCalls 加 1、detour 返回之后减 1。teardown 摘 MinHook 记录（= 释放
+    // 跳板）之前必须等这个计数归零，否则仍停在 detour 里的线程一旦调 original 就会跳进已
+    // 释放的内存。共享 detour 由 ScriptBridge::SharedDetourActivity 自己计数，不走这里。
+    // 计数在 stub 里用 lock inc/dec 维护，故类型是普通 uint32_t（节点只被这些机器码与持
+    // MinHookMutex 的 C++ 代码访问）。
+    uint32_t activeDetourCalls = 0;
+    // 该站点当前 detour 的包壳入口；生成后**永不释放**（与 stub 同一条纪律），换 detour 时
+    // 重新生成一个新的，旧的自然被在途调用者用完即弃。nullptr = 走直连（未装包壳）。
+    void* detourThunk = nullptr;
 };
 
 // 地址前导窗口（字节数）：装钩前检查目标前导窗口是否与已登记补丁重叠，
@@ -88,6 +100,16 @@ size_t RetireHookSiteDetoursForOwnerLocked(const std::wstring& owner);
 
 // 目标前导窗口 [target, target+len) 是否与已登记的补丁区间重叠（装钩前的仲裁）。
 bool OverlapsHookPrologue(const void* target, size_t len);
+
+// 同上，但调用方**已持有** Runtime::MinHookMutex()（补丁侧要在同一临界区里完成
+// "检查 + 写字节"，见 PatchRegistry::Apply）。自行取锁的版本会让检查与写入之间留出窗口。
+bool OverlapsHookPrologueLocked(const void* target, size_t len);
+
+// 等在途插件 detour 全部退出（review #1）。调用方**不得**持 lifecycle / MinHook / capture 锁——
+// 在途 detour 可能正要用这些锁退出，持锁等待就是死锁。实现按 1 ms 轮询、每次只在读计数时短暂
+// 取 MinHook 锁；归零后再静默 1 ms 复核一次（收窄「已从 stub 取到跳板、还没跳进去」的窗口）。
+// 返回 false = 超时，证明不了排空：调用方应保留 MinHook 记录（打 recordStale），绝不释放跳板。
+bool WaitForPluginDetourDrain(uint32_t timeoutMs);
 
 // 摘除某 target 的 MinHook 记录（释放跳板），但**保留站点节点** ——
 // stub 的机器码里用 imm64 永久内嵌了 &HookSite。
