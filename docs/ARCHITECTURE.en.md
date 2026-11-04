@@ -887,19 +887,31 @@ These four only guard against layout drift **within a single build**. Stub reuse
 holds in this project: what the stub embeds is this process's `&HookSite`, and a `winmm.dll` self-update restarts the process, so no old
 stub exists in the new process.
 
-**Known limitation (review #1, deferred).** Teardown removes the MinHook record, which frees the trampoline, while there is no
-decidable evidence that no thread is still inside a plugin detour: `MH_DisableHook` only guarantees that no *new* call enters, and
-cannot stop a thread that already entered from calling `original`. A counting thunk (stub tail-jump doing `push/sub/call`) was tried
-and **changed the stack layout**: on Win64 arguments 5+ live at `[rsp+0x28]`, and the extra 0x28 bytes made the detour read wrong
-arguments (measured: `Detour_CreateIB`'s `pName` became 0x40 and `strstr` faulted), so it was reverted. A correct implementation must
-replace only the return address and leave the stack untouched (swap RA for a dec-stub, keep the original RA in TLS, handle
-re-entrancy) — that is a hot-path rewrite with real risk, so it is deferred.
+**Why no in-flight synchronization is needed here (review #1, re-examined).** The only place that frees a trampoline is
+`RemoveGameCoreDomainSiteRecords`, and it only touches sites for which `PluginDomain::TargetInTearingDownGameCore` is true —
+**sites in the exe image and in resident modules are never removed** (which is where plugin detours overwhelmingly live: `CreateIB`
+is exe RVA `0x944FE0`, `AddResource` is `0x9408A1`), so their trampolines live until process exit. The GameCore-domain sites that
+*are* removed are torn down only after `DisableGameCoreDomainSites()` has restored every entry byte in one batch, and the GameCore
+plugin modules are merely **queued** at that point (`FreePendingPluginModules` runs after the engine has dropped the Lua
+environment), not `FreeLibrary`'d on the spot. Those functions are called only on the simulation thread — and `ResetForReload` runs
+on that very thread (it is the engine's `LoadDLL`/`UnloadDLL` caller), so it cannot also be inside a detour. Hence `a → b → c`
+(restore entry → repoint → remove record) cannot produce a use-after-free.
+
+> Historical note: two in-flight counting designs were implemented here and both have been deleted — the counting thunk (stub
+> tail-jump doing `push`+`call`, which shifted stack arguments 5+) and the return-address swap (writing a decrement block into
+> `[rsp]`, which corrupted the function's own frame slot at **mid-function** sites). Both were solving a problem this architecture
+> does not have: the premise they relied on (`[rsp]` is a return address) only holds for entry hooks, and no runtime in-flight test
+> is required here at all.
+
+The one remaining risk is not the loader's: **a plugin's own thread calling `original` after `OnUnload`** — that is the plugin
+contract (`PluginInFlight.h`: "threads created by the plugin must be stopped in `OnUnload`").
 
 **Residency principle for stubs and HookSite nodes (never released)**:
 1. **Immediate pointer embedded**: the stub machine code hard-codes the site node address with the immediate `mov r10, imm64(&HookSite)`; if
    the node were released, the execution flow would dereference a dangling pointer;
-2. **No quiescence test for the stub itself**: its execution window is a few instructions and every caller passes through it, so counting
-   per call is not worth it. The **trampoline** has no provable drain protocol either — see "Known limitation" in §5.2;
+2. **The stub does not count, and the trampoline needs no in-flight test**: the stub's execution window is a few instructions, and a
+   trampoline is only freed when a GameCore-domain site is removed — by which time the entry bytes are restored and the only thread
+   that calls those functions is the simulation thread running the teardown (see §5.2);
    (there is no reliable atomic reference count), so freeing the memory carries a use-after-free (UAF) hazard;
 3. **Allocator lifetime constraints**: AsmJit uses a block memory allocation model in which multiple stubs share the underlying memory pages, so
    freeing cannot be done at the granularity of a single stub.

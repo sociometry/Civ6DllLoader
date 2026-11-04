@@ -889,17 +889,27 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 这四条只挡**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它们保证——但该前提在本项目成立：
 stub 里嵌的是本进程的 `&HookSite`，而 `winmm.dll` 自更新会重启进程，新进程里不存在旧 stub。
 
-**已知限制（review #1，暂缓修复）。** teardown 摘 MinHook 记录会释放跳板，而「当前没有线程停在插件
-detour 里」缺少可判定的证据：`MH_DisableHook` 只保证之后不再进入，挡不住已经进入的线程继续调用
-`original`。曾试过「计数包壳」（stub 尾跳 `push/sub/call`）来计数，但**它改变了栈布局**——Win64 下第 5
-个及以后的参数在 `[rsp+0x28]` 起，包壳多压的 0x28 字节让 detour 读到错误参数（实测 `Detour_CreateIB`
-的 `pName` 变成 0x40，`strstr` 当场 AV），已整体回退。要正确实现必须做到「只替换返回地址、不动栈」
-（返回地址换成 dec-stub + TLS 记原地址，并处理可重入），热路径与风险都要重做，暂缓。
+**为什么这里不需要「在途调用」的同步（review #1 的复核结论）。** 会释放跳板的只有
+`RemoveGameCoreDomainSiteRecords`，而它只处理 `PluginDomain::TargetInTearingDownGameCore` 为真的站点
+——**exe 域与常驻模块上的站点永不摘除**（插件 detour 绝大多数挂在这里：`CreateIB` 是 exe RVA
+`0x944FE0`、`AddResource` 是 `0x9408A1`），它们的跳板活到进程退出。会摘的 GameCore 域站点，时机也
+已经在 `DisableGameCoreDomainSites()` 一次性还原入口字节之后，且 GameCore 插件模块此时只是**排队**
+（`FreePendingPluginModules` 等引擎拆完 Lua 环境才释放），不是当场 `FreeLibrary`；而这些函数只在
+模拟线程上被调用，`ResetForReload` 本身就跑在该线程上（引擎 `LoadDLL`/`UnloadDLL` 的调用者），
+不可能同时在 detour 里。所以 `a → b → c`（还原入口 → 改指向 → 摘记录）之后没有可发生的 UAF。
+
+> 历史注记：这里先后试过两种「在途计数」实现并都已删除——计数包壳（stub 尾跳 `push`+`call`，
+> 让第 5 个及以后的栈参数错位）与换返回地址（把 `[rsp]` 换成减数块，在**函数中段**的站点上改坏了
+> 函数自己的帧槽）。两次都是在解一个本架构里不存在的问题：真正会崩的站点点位前提（`[rsp]` 是返回
+> 地址）只对入口 hook 成立，而这里根本不需要在运行时判定在途状态。
+
+剩下的唯一风险不在 loader：**插件自建线程在 `OnUnload` 之后仍去调 `original`**——那是插件契约
+（`PluginInFlight.h`：「插件自建线程仍须在 OnUnload 中停止」）。
 
 **Stub 与 HookSite 节点的常驻原则（永不释放）**：
 1. **立即数指针内嵌**：Stub 机器码使用立即数 `mov r10, imm64(&HookSite)` 硬编码了站点节点地址；若释放节点，执行流将直接访问悬垂指针；
-2. **stub 没有「静默」判定**：stub 的执行窗口只有几条指令、又是所有调用者的必经之路，逐次计数不划算；
-   跳板的在途判定同样没有可证明的协议，见上面 §5.2 的「已知限制」；
+2. **stub 不计数、跳板也不需要「在途」判定**：stub 的执行窗口只有几条指令；跳板只在 GameCore 域
+   站点被摘除时释放，而那时入口字节已还原、调用它的线程就是执行 teardown 的模拟线程（见 §5.2）；
 3. **分配器生命周期限制**：AsmJit 采用块状内存分配模型，多组 Stub 共享底层内存页，无法进行单条 Stub 粒度的释放归还。
 
 因此，在 GameCore 卸载清理（Teardown）时，系统仅对 `HookSite` 执行**原地状态复位**以供复用，保留底层 Stub 机器码与节点本身。
