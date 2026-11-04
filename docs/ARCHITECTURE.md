@@ -444,9 +444,7 @@ DllLoader.SetGameCoreState(false) --> boolean
 9. `RemoveGameCoreDomainSiteRecords()` 执行站点清理与解绑：
    - **设置窗口与解绑**：进入 teardown 窗口（内部设防）并执行 `ImageAddress::DetachGameCore()`；
    - **排空在途共享 detour**：临时释放 lifecycle 锁，等待 `g_activeSharedDetours` 归零；
-   - **排空在途插件 detour**：`WaitForPluginDetourDrain` 在 lifecycle 锁之外轮询所有**待拆映像**站点的
-     `activeDetourCalls`（插件 detour 走计数包壳，见 §5.2）；之后的逐站点摘除只做非阻塞复核，不为零就
-     保留记录、改打 `recordStale`——宁可下次同址重建，也不释放可能仍在用的跳板；
+   - **排空在途调用**：临时释放 lifecycle 锁，等待 `g_activeSharedDetours` 归零以排空在途共享 detour；
    - **重锁并扫表复位**：重新获取 lifecycle 锁，重新扫描站点表以物理摘钩。成功则 `MH_RemoveHook` 并**原地复位站点**（保留并复用节点及 stub，清空 capture 槽；**绝不 erase**，因为 stub 机器码硬编码了 `&HookSite`）；失败则标记 `recordStale` 并拔除 detour 槽；
    - **复位共享入口**：复位 `g_origRegisterScriptData(/ForUI)` 与 16 个 PushMethods 槽位；
    - **窗口存续**：**teardown 窗口不在此处清除**，必须维持到引擎真正完成卸载——由 `UnloadDllDetour`
@@ -827,8 +825,7 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 - **capture 槽**：`hasCapture` / `captureParamIndex` / `captureOuts`（同一地址 1 个 detour + N 个捕获订阅共存）；
 - **MinHook 侧**：`stubCode` / `minhookTrampoline` / `hookInstalled`。
 
-`nextTarget` 是 stub 的尾跳目标：插件 detour 存在时指向**计数包壳**（见 §5.2），共享 detour 指向 detour
-本体，没有 detour 时指向跳板；`recordStale` 表示"上一次 teardown
+`nextTarget` 是 stub 的尾跳目标（有 detour 时=detour，否则=跳板）；`recordStale` 表示"上一次 teardown
 没能摘掉这条 MinHook 记录"（下次同地址取站时强制重建）。
 
 ### 5.2 stub（loader 生成的中转代码）
@@ -890,26 +887,17 @@ Loader 在 `OnLoad` **之前** `GetProcAddress` 读它、**只判类别**（高 
 这四条只挡**同一次构建内**的布局漂移。跨二进制的 stub 复用不由它们保证——但该前提在本项目成立：
 stub 里嵌的是本进程的 `&HookSite`，而 `winmm.dll` 自更新会重启进程，新进程里不存在旧 stub。
 
-**插件 detour 的计数包壳（`BuildDetourActivityThunk`）。** 插件 detour 不直接当 `nextTarget`，而是先跳到
-一段每次安装现生成的包壳：`push r10` → `sub rsp,0x20` → `lock inc [site+activeDetourCalls]` →
-`call detour` → `lock dec` → 还原 r10 → `ret`。stub 的尾跳对包壳而言等价于一次普通 `call`：参数寄存器、
-影子空间、返回值（rax）与 xmm 全不用动，实测 1000 次调用返回值与计数都正确。
-
-代价是每次插件 detour 调用多一对 `lock inc/dec` 和一次 `call/ret`；换来的是 teardown 释放跳板前能
-**证明**没有线程还停在 detour 里——这正是 review #1 指出的 UAF 窗口。共享 detour 由
-`ScriptBridge::SharedDetourActivity` 自己计数，不套包壳；包壳生成失败时退化为直连，并在日志里记明
-"trampoline drain unprovable"。
-
-**摘钩顺序**：先 `MH_DisableHook`（入口字节还原，此后不会再有新调用进入 detour）；teardown 再在**不持任何
-业务锁**的前提下调 `WaitForPluginDetourDrain`（上限 2 s，1 ms 轮询，归零后静默 1 ms 复核，防止「已从 stub
-取到目标、还没跳进去」的窗口）；确认归零后才 `nextTarget = target` → `MH_RemoveHook` 释放跳板。若排空超时，
-摘除路径只做非阻塞复核，发现计数仍不为零就**保留记录**并打 `recordStale`——既不在持锁时 Sleep，也绝不释放
-可能仍在用的跳板。
+**已知限制（review #1，暂缓修复）。** teardown 摘 MinHook 记录会释放跳板，而「当前没有线程停在插件
+detour 里」缺少可判定的证据：`MH_DisableHook` 只保证之后不再进入，挡不住已经进入的线程继续调用
+`original`。曾试过「计数包壳」（stub 尾跳 `push/sub/call`）来计数，但**它改变了栈布局**——Win64 下第 5
+个及以后的参数在 `[rsp+0x28]` 起，包壳多压的 0x28 字节让 detour 读到错误参数（实测 `Detour_CreateIB`
+的 `pName` 变成 0x40，`strstr` 当场 AV），已整体回退。要正确实现必须做到「只替换返回地址、不动栈」
+（返回地址换成 dec-stub + TLS 记原地址，并处理可重入），热路径与风险都要重做，暂缓。
 
 **Stub 与 HookSite 节点的常驻原则（永不释放）**：
 1. **立即数指针内嵌**：Stub 机器码使用立即数 `mov r10, imm64(&HookSite)` 硬编码了站点节点地址；若释放节点，执行流将直接访问悬垂指针；
-2. **stub 没有“静默”判定**：stub 的执行窗口只有几条指令、又是所有调用者的必经之路，逐次计数不划算；
-   而**跳板**另有 `activeDetourCalls` 计数（§5.2），teardown 等它归零才调用 `MH_RemoveHook`；
+2. **stub 没有「静默」判定**：stub 的执行窗口只有几条指令、又是所有调用者的必经之路，逐次计数不划算；
+   跳板的在途判定同样没有可证明的协议，见上面 §5.2 的「已知限制」；
 3. **分配器生命周期限制**：AsmJit 采用块状内存分配模型，多组 Stub 共享底层内存页，无法进行单条 Stub 粒度的释放归还。
 
 因此，在 GameCore 卸载清理（Teardown）时，系统仅对 `HookSite` 执行**原地状态复位**以供复用，保留底层 Stub 机器码与节点本身。
