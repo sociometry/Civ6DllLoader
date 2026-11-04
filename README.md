@@ -62,6 +62,9 @@
 - **免编译的前端 UI**：`UI/FrontEnd/FrontEndUI_*.xml` + `.lua` 放进 Mod 目录即被挂进主菜单，不需要编译任何 DLL。
 - **可运维性**：`config.ini` 提供 `ENABLE_GLOBAL` / `ENABLE_GAMECORE` / `ENABLE_DEBUG_LOG` / `ENABLE_PROFILER`
   四个开关；符号库匹配状态、耗时分析、结构化日志都直接可查；`tools/rva_to_symbol.exe` 单文件反查符号名。
+- **主菜单设置面板**：右上角齿轮里有开关面板，底部还有一枚「卸载加载器」——它把自身改名成
+  `winmm_Old.dll`，重启后生效；tooltip 会列出**当前已启用且在用本加载器**的 Mod（这些 Mod 下次进
+  对局会把加载器装回来，需要先禁用或取消订阅）。
 
 ## 目录结构
 

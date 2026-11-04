@@ -35,6 +35,9 @@ For the full mechanism see [docs/ARCHITECTURE.en.md](docs/ARCHITECTURE.en.md).
 - **Crash quarantine and safe unload ordering**: a plugin that crashes in `OnLoad` or returns 0 is quarantined with its registrations rolled back and is never retried; match exit follows a strict reverse-order teardown, avoiding dangling calls into unloaded plugin code after the engine drops its Lua environments.
 - **Front-end UI without compiling**: drop `UI/FrontEnd/FrontEndUI_*.xml` + `.lua` into a mod directory and they are mounted into the main menu — no DLL required.
 - **Operable by design**: `config.ini` exposes `ENABLE_GLOBAL` / `ENABLE_GAMECORE` / `ENABLE_DEBUG_LOG` / `ENABLE_PROFILER`; symbol-DB match state, timing profiles and structured logs are all inspectable; `tools/rva_to_symbol.exe` is a single-file RVA → symbol lookup.
+- **Main-menu settings panel**: the gear button at the top right opens a panel whose bottom row is "Uninstall Loader" —
+  it renames the proxy to `winmm_Old.dll` (effective on the next launch), and its tooltip lists the currently **enabled** mods
+  that use this loader (their thin shell would install it again on the next match, so disable or unsubscribe them first).
 
 ## Layout
 

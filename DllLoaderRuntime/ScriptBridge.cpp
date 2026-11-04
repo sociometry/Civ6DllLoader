@@ -18,7 +18,9 @@
 #include "Civ6MessageBus.h"
 #include "HavokScript.h"
 #include "ImageAddress.h"
+#include "LoaderUsage.h"      // 卸载加载器 / 使用本加载器的 Mod 列表
 #include "Localization.h"
+#include "../common/ModScan.h"   // WideToNarrow（跨 Lua 边界只走 UTF-8）
 #include "PatchRegistry.h"
 #include "PdataMatch.h"
 #include "PluginBoundary.h"
@@ -1145,12 +1147,52 @@ int __fastcall lSetGameCoreState(void* L) {
     return 1;
 }
 
+// 使用本加载器的 Mod 列表（含已禁用的），每项是 { name = "四环", enabled = true }。
+// name 已由 C++ 按当前语言从 Mods.sqlite.LocalizedText 解析好，Lua 侧只做展示。
+// 每次都重算：面板打开时才调，且用户在主菜单改过启用集后必须能看到新结果（缓存会让列表过期）。
+int __fastcall lGetLoaderUserMods(void* L) {
+    // 可选参数 1：当前语言的 Locale 串（Lua 侧传 Locale.GetCurrentLanguage().Type）。
+    // 用来从 Mods.sqlite 的 LocalizedText 里挑对应语言的名字；缺省则只退 en_US。
+    std::wstring language;
+    if (LuaTypeImpl(L, 1) == 4 /*LUA_TSTRING*/) {
+        unsigned long long len = 0;
+        const char* text = LuaCheckLStringImpl(L, 1, &len);
+        if (text && len > 0) language = ModScan::NarrowToWide(std::string(text, static_cast<size_t>(len)));
+    }
+    const std::vector<LoaderUsage::UserMod> mods = LoaderUsage::CollectUserMods(language);
+    LuaCreateTableImpl(L, static_cast<int>(mods.size()), 0);
+    int index = 1;
+    for (const auto& mod : mods) {
+        const std::string utf8 = ModScan::WideToNarrow(mod.name.empty() ? mod.folder : mod.name);
+        LuaPushIntegerImpl(L, index++);              // [arr, i]
+        LuaCreateTableImpl(L, 0, 2);                 // [arr, i, t]
+        LuaPushFStringImpl(L, "name");
+        LuaPushFStringImpl(L, "%s", utf8.c_str());
+        LuaSetTableImpl(L, -3);                      // t.name = ...
+        LuaPushFStringImpl(L, "enabled");
+        LuaPushBooleanImpl(L, mod.enabled);
+        LuaSetTableImpl(L, -3);                      // t.enabled = ...
+        LuaSetTableImpl(L, -3);                      // arr[i] = t
+    }
+    return 1;
+}
+
+// 卸载：把自身文件名改成 winmm_Old.dll。返回 (ok, errCode)：
+//   errCode 0 且 ok=false = 当前不是以 winmm.dll 身份运行（开发期），不是系统错误。
+int __fastcall lUninstallLoader(void* L) {
+    DWORD err = 0;
+    const bool ok = LoaderUsage::UninstallSelf(LoaderCore::RuntimeModuleHandle(), err);
+    LuaPushBooleanImpl(L, ok);
+    LuaPushIntegerImpl(L, static_cast<int>(err));
+    return 2;
+}
+
 }  // namespace
 
 void ExposeLoaderLuaGlobals(void* L) {
     if (!L) return;
     // 伪索引 kHookApiLuaGlobal：不随压栈漂移，直接写全局表。
-    LuaNewGlobalTableImpl(L, "DllLoader", 0, 4);
+    LuaNewGlobalTableImpl(L, "DllLoader", 0, 6);
     LuaPushCFunctionFieldImpl(L, -1, "GetGlobalState",
         reinterpret_cast<void*>(&lGetGlobalState), "lGetGlobalState");
     LuaPushCFunctionFieldImpl(L, -1, "SetGlobalState",
@@ -1159,6 +1201,10 @@ void ExposeLoaderLuaGlobals(void* L) {
         reinterpret_cast<void*>(&lGetGameCoreState), "lGetGameCoreState");
     LuaPushCFunctionFieldImpl(L, -1, "SetGameCoreState",
         reinterpret_cast<void*>(&lSetGameCoreState), "lSetGameCoreState");
+    LuaPushCFunctionFieldImpl(L, -1, "GetLoaderUserMods",
+        reinterpret_cast<void*>(&lGetLoaderUserMods), "lGetLoaderUserMods");
+    LuaPushCFunctionFieldImpl(L, -1, "UninstallLoader",
+        reinterpret_cast<void*>(&lUninstallLoader), "lUninstallLoader");
     LuaPopImpl(L, 1);
 }
 

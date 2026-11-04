@@ -160,7 +160,12 @@ bool WriteWholeFile(const std::wstring& path, const void* data, size_t len) {
 //   · 磁盘版本 == 内嵌版本  -> 保留（用户可能改过）
 //   · 磁盘版本 <  内嵌版本  -> 覆盖（Loader 升级过资源）
 //   · 磁盘没有标记          -> 覆盖（旧版资源，或用户重写过）
-constexpr int kUiResourceVersion = 1;
+// 版本历史：v2 = 设置面板加「卸载加载器」按钮；v3 = 该按钮的 tooltip 改为每行一个 Mod；
+// v4 = Mod 名改由 Loader 从 Mods.sqlite 解析（Locale.Lookup 拿不到 <LocalizedText> 的键）；
+// v5 = 卸载按钮换成本体的 ButtonRed 样式；v6 = Mod 列表每项加圆点、已禁用项标红。
+// 改 Resources 下的 .lua/.xml 时必须同步 +1，并把两份文件头的 @ui-version 一起改，
+// 否则老安装会一直保留旧面板（新控件 / 新排版 / 新逻辑出不来）。
+constexpr int kUiResourceVersion = 6;
 // 只扫文件头这么多字节：标记一定在最前面，避免整份读进来。
 constexpr DWORD kVersionScanBytes = 256;
 

@@ -421,6 +421,8 @@ DllLoader.GetGlobalState()        --> boolean
 DllLoader.SetGlobalState(true)    --> boolean（写盘成功与否）
 DllLoader.GetGameCoreState()      --> boolean
 DllLoader.SetGameCoreState(false) --> boolean
+DllLoader.GetLoaderUserMods(lang) --> { { name = "四环", enabled = true }, ... }
+DllLoader.UninstallLoader()       --> boolean ok, number win32Error
 ```
 
 这条通路与插件用的 `RegisterGlobalScript` 分开：后者用 `RequirePluginOwner` 按回调地址
@@ -1244,8 +1246,10 @@ detour 把插件的 C 闭包按 `exposedName` 写进游戏给的那张表；每�
 主菜单的前端 UI 不走插件 ABI：它是 loader 自己往游戏的 ForgeUI 树里挂 context。
 
 1. **资源**：`UiInject::ExtractResources()`（阶段 A，见 §1.4）把 RCDATA 103/104 的
-   `Civ6DllLoader_FrontEndUI.{lua,xml}` 释放到 `<exe 目录>\Civ6DllLoader\`；目标文件已存在就跳过
-   （用户可以在磁盘上改），写入用 `CREATE_NEW`，"已被别人放好"按良性竞态处理；
+   `Civ6DllLoader_FrontEndUI.{lua,xml}` 释放到 `<exe 目录>\Civ6DllLoader\`。是否覆盖由文件头的
+   `@ui-version=N` 决定（见 `kUiResourceVersion`）：磁盘版本号小于内嵌版本才覆盖，相等就保留——
+   这样「用户改过副本」与「Loader 升级了面板」两个需求不会互相踩。**改资源必须同时 +1 并把两份
+   文件头的标记一起改**，否则老安装会一直保留旧面板（新控件不出现）；
 2. **钩子**：`UiInject::Install()` detour `MainMenuState::LoadUI`（exe 域独立钩，与站点表无关，
    见 §5.5）。detour 先调原函数（FrontEnd 与 InvitePopup 由游戏自己建），再 `RunInjectionSafely`；
 3. **注入**（`InjectFrontEndUi`，只在游戏/UI 线程执行；重入时置 `g_refreshRequested` 留到下次
@@ -1266,6 +1270,32 @@ detour 把插件的 C 闭包按 `exposedName` 写进游戏给的那张表；每�
 6. **已知残留**：判"是不是新 FrontEnd"用的是**指针身份比较**；若游戏释放旧对象后新对象恰好落在同一
    地址（ABA），这次刷新会被判成"同一对象"而早退，Mod UI 只会在下一次 FrontEnd 地址变化时回来。
    改判据需要游戏侧的对象代次，loader 拿不到。
+
+### 6.8 卸载加载器（设置面板底部的按钮）
+
+面板底部有一枚「卸载加载器」，改名即卸载：
+
+- **动作**：`LoaderUsage::UninstallSelf` 把 `<exe>\winmm.dll` 改成 `<exe>\winmm_Old.dll`。映像以
+  `FILE_SHARE_DELETE` 打开（与 §1.1 的代理迁移同一机制），改名不影响本会话；下次启动 exe 目录里
+  没有 `winmm.dll`，游戏直接加载系统那个。**不碰** `version.dll`：能走到这一步的安装，旧代理在启动时
+  就已经被自更新与迁移退役掉了；
+- **前提**：自身文件名必须是 `winmm.dll`。开发期从 `x64\Release` 直接 LoadLibrary 时拒绝执行，
+  避免把开发产物改名；
+- **二次确认**：第一次点击只把按钮文字换成「再次点击确认卸载」，第二次才真正改名（改名不可撤销，
+  除非重装）。关面板或按 ESC 会把确认状态清回初始；
+- **为什么是改名而不是删除**：可逆，也不会因「文件正在使用」失败；`winmm_Old.dll` 由下一次 loader
+  启动时的清理段（§2.4 的 `LoaderUpdate`）回收；
+- **名单的来源**：`DllLoader.GetLoaderUserMods(language)` 现场扫所有 Mod 的 `Binaries\Win64`
+  （薄壳 / runtime / 插件 DLL 任一命中即算，判据见 `LoaderUsage::UsesThisLoader`），返回
+  `{ { name = "四环", enabled = true }, ... }`。名字由 C++ 按当前语言查 `Mods.sqlite` 的
+  `LocalizedText`（当前语言 → `en_US` → 原始 `<Name>`）——**不能**用 `Locale.Lookup`：`.modinfo`
+  的 `<LocalizedText>` 块只进 `Mods.sqlite`，不进运行期 `Localization` 表。现实依据：
+  启用中的 Mod 薄壳会在下次进对局时发现 `winmm.dll` 不在，直接把它装回来；
+- **已禁用的 Mod 也列出来**，tooltip 里在名字后面加红色「(已禁用)」（`[ICON_BULLET]` 圆点 +
+  `[COLOR_RED]...[ENDCOLOR]`，都是本体 UI 的写法）。理由：用户需要看到「这个 Mod 同样依赖加载器，
+  只是现在关着」，否则以后启用之后加载器又回来了却不知道为什么；
+- **边界**：`Mods.sqlite` 读不到时列表为空，tooltip 退化成「当前没有 Mod 使用本加载器」；三个名字
+  候选都取不到时按剥掉 `LOC_` 前缀与下划线显示，不会把 `LOC_XXX_NAME` 原样甩给用户。
 
 ---
 

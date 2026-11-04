@@ -119,6 +119,7 @@
     <ClInclude Include="framework.h" />
     <ClInclude Include="ImageAddress.h" />
     <ClInclude Include="LoaderUpdate.h" />
+    <ClInclude Include="LoaderUsage.h" />
     <ClInclude Include="PatchRegistry.h" />
     <ClInclude Include="PluginBoundary.h" />
     <ClInclude Include="PluginInFlight.h" />
@@ -131,6 +132,7 @@
     <ClCompile Include="ProxyExports.cpp" />
     <ClCompile Include="LoaderUpdate.cpp" />
     <ClCompile Include="LegacyProxyMigration.cpp" />
+    <ClCompile Include="LoaderUsage.cpp" />
     <ClCompile Include="ImageAddress.cpp" />
     <ClCompile Include="LoaderHooks.cpp" />
     <ClCompile Include="PatchRegistry.cpp" />

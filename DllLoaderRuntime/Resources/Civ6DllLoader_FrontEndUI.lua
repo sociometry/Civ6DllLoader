@@ -1,4 +1,4 @@
---@ui-version=1
+--@ui-version=6
 -- ===========================================================================
 -- Civ6DllLoader_FrontEndUI.lua —— Loader 的主菜单设置面板
 --
@@ -94,6 +94,56 @@ local kText = {
         zh_Hans_CN = "启用游戏核心插件时，不会加载不符合本加载器规则的插件，也可能导致部分 mod 功能丢失。",
         zh_Hant_HK = "啟用遊戲核心插件時，不會載入不符合本載入器規則的插件，也可能導致部分 mod 功能遺失。",
     },
+
+    -- ---- 卸载加载器 ----
+    LOC_CIV6DLLLOADER_UNINSTALL = {
+        en_US = "Uninstall Loader",
+        zh_Hans_CN = "卸载加载器",
+        zh_Hant_HK = "解除安裝載入器",
+    },
+    -- 二次确认：第一次点击只换成这句，第二次才真正执行（改名不可撤销）。
+    LOC_CIV6DLLLOADER_UNINSTALL_CONFIRM = {
+        en_US = "Click again to confirm uninstall",
+        zh_Hans_CN = "再次点击确认卸载",
+        zh_Hant_HK = "再按一次確認解除安裝",
+    },
+    LOC_CIV6DLLLOADER_UNINSTALL_HEAD = {
+        en_US = "After uninstalling, disable or unsubscribe the mods that use this loader, "
+            .. "otherwise the next match will install it again.",
+        zh_Hans_CN = "卸载后需要禁用或取消订阅使用本加载器的 Mod，否则下次进入游戏对局将再次安装加载器。",
+        zh_Hant_HK = "解除安裝後需要停用或取消訂閱使用本載入器的 Mod，否則下次進入遊戲對局將再次安裝載入器。",
+    },
+    LOC_CIV6DLLLOADER_UNINSTALL_MODS = {
+        en_US = "Mods using this loader:",
+        zh_Hans_CN = "使用本加载器的 Mod：",
+        zh_Hant_HK = "使用本載入器的 Mod：",
+    },
+    LOC_CIV6DLLLOADER_UNINSTALL_NOMODS = {
+        en_US = "No mod uses this loader.",
+        zh_Hans_CN = "当前没有 Mod 使用本加载器。",
+        zh_Hant_HK = "目前沒有 Mod 使用本載入器。",
+    },
+    -- 列表里「在磁盘上、用本加载器、但当前没勾选」的 Mod 后缀
+    LOC_CIV6DLLLOADER_UNINSTALL_DISABLED = {
+        en_US = "(disabled)",
+        zh_Hans_CN = "(已禁用)",
+        zh_Hant_HK = "(已停用)",
+    },
+    LOC_CIV6DLLLOADER_UNINSTALL_DONE = {
+        en_US = "Uninstalled. Restart the game for it to take effect.",
+        zh_Hans_CN = "已卸载，重启游戏后生效。",
+        zh_Hant_HK = "已解除安裝，重新啟動遊戲後生效。",
+    },
+    LOC_CIV6DLLLOADER_UNINSTALL_FAILED = {
+        en_US = "Uninstall failed (system error %s).",
+        zh_Hans_CN = "卸载失败（系统错误 %s）。",
+        zh_Hant_HK = "解除安裝失敗（系統錯誤 %s）。",
+    },
+    LOC_CIV6DLLLOADER_UNINSTALL_NOTPROXY = {
+        en_US = "Uninstall failed: not running as winmm.dll.",
+        zh_Hans_CN = "卸载失败：当前不是以 winmm.dll 身份运行。",
+        zh_Hant_HK = "解除安裝失敗：目前不是以 winmm.dll 身分執行。",
+    },
 }
 
 -- 语言只判定一次：切换语言要重开游戏，运行期不会变。
@@ -133,6 +183,143 @@ local function Text(tag)
     return entry[g_language] or entry.en_US or tag;
 end
 
+-- ---------------------------------------------------------------------------
+-- 卸载加载器
+--
+-- 两个状态：待确认（第一次点击）、已卸载。改名不可撤销（除非重装），所以强制两步。
+-- Mod 名单每次打开面板都重新问 Loader：用户在 Additional Content 里改过启用集
+-- 再回到主菜单时必须看到新结果。名字统一走 Locale.Lookup —— Mod 的 <Name> 通常
+-- 是 LOC_ 键（Mod 自己的 LocalizedText 里有对应语言的翻译）。
+-- ---------------------------------------------------------------------------
+local g_uninstallArmed = false;
+local g_uninstalled = false;
+
+
+-- LOC_ 键交给 Locale.Lookup；查不到就剥掉前缀与下划线，别把 LOC_XXX_NAME 直接甩给用户。
+local function ResolveModName(raw)
+    if type(raw) ~= "string" or raw == "" then
+        return "?";
+    end
+    if Locale ~= nil and Locale.Lookup ~= nil then
+        local looked = Locale.Lookup(raw);
+        if type(looked) == "string" and looked ~= "" and looked ~= raw then
+            return looked;
+        end
+    end
+    if raw:find("^LOC_") ~= nil then
+        local stripped = raw:gsub("^LOC_", "");
+        stripped = stripped:gsub("_NAME$", "");
+        return (stripped:gsub("_", " "));
+    end
+    return raw;
+end
+
+-- 返回 { { text = "四环", enabled = true }, ... }；C++ 侧已解析好名字，这里只兜底。
+local function CollectModEntries()
+    local entries = {};
+    if not (HasLoaderApi() and DllLoader.GetLoaderUserMods ~= nil) then
+        return entries;
+    end
+    -- 语言串一起传过去：Mod 名从 Mods.sqlite 的 LocalizedText 里取，需要知道当前语言。
+    if g_language == nil then
+        g_language = DetectLanguage();
+    end
+    local ok, list = pcall(DllLoader.GetLoaderUserMods, g_language);
+    if not ok or type(list) ~= "table" then
+        return entries;
+    end
+    for _, item in ipairs(list) do
+        if type(item) == "table" then
+            entries[#entries + 1] = {
+                text = ResolveModName(item.name),
+                enabled = item.enabled ~= false,
+            };
+        else
+            -- 兼容只回字符串的旧签名（不该出现，兜底当启用）
+            entries[#entries + 1] = { text = ResolveModName(item), enabled = true };
+        end
+    end
+    return entries;
+end
+
+-- tooltip 断行用 [NEWLINE]（Civ6 的 TextControl 认这个标记，本体 tooltip 也这么写）：
+--   第 1 行：警告正文
+--   第 2 行：「使用本加载器的 Mod：」
+--   之后：每个 Mod 独占一行
+local function BuildUninstallTooltip()
+    local lines = { Text("LOC_CIV6DLLLOADER_UNINSTALL_HEAD") };
+    local entries = CollectModEntries();
+    if #entries == 0 then
+        lines[#lines + 1] = Text("LOC_CIV6DLLLOADER_UNINSTALL_NOMODS");
+    else
+        lines[#lines + 1] = Text("LOC_CIV6DLLLOADER_UNINSTALL_MODS");
+        for _, entry in ipairs(entries) do
+            -- [ICON_BULLET] 是本体列表用的圆点图标（随字号缩放，比字面量 • 稳），
+            -- 红字用本体的 [COLOR_RED]...[ENDCOLOR]（mods.lua 里同款写法）。
+            local line = "[ICON_BULLET] " .. entry.text;
+            if not entry.enabled then
+                line = line .. " [COLOR_RED]"
+                    .. Text("LOC_CIV6DLLLOADER_UNINSTALL_DISABLED") .. "[ENDCOLOR]";
+            end
+            lines[#lines + 1] = line;
+        end
+    end
+    return table.concat(lines, "[NEWLINE]");
+end
+
+local function UpdateUninstallButton()
+    local button = Controls.LoaderUninstallButton;
+    if button == nil then
+        return;
+    end
+    if g_uninstalled then
+        button:SetText(Text("LOC_CIV6DLLLOADER_UNINSTALL_DONE"));
+    elseif g_uninstallArmed then
+        button:SetText(Text("LOC_CIV6DLLLOADER_UNINSTALL_CONFIRM"));
+    else
+        button:SetText(Text("LOC_CIV6DLLLOADER_UNINSTALL"));
+    end
+    button:SetToolTipString(BuildUninstallTooltip());
+end
+
+local function SetUninstallStatus(text)
+    local label = Controls.LoaderUninstallStatus;
+    if label ~= nil then
+        label:SetText(text);
+    end
+end
+
+local function OnUninstallClicked()
+    if g_uninstalled then
+        return;
+    end
+    if not (HasLoaderApi() and DllLoader.UninstallLoader ~= nil) then
+        SetUninstallStatus(Text("LOC_CIV6DLLLOADER_UNINSTALL_NOTPROXY"));
+        return;
+    end
+
+    -- 第一次点击只进入待确认，第二次才真正改名。
+    if not g_uninstallArmed then
+        g_uninstallArmed = true;
+        UpdateUninstallButton();
+        UI.PlaySound("Play_UI_Click");
+        return;
+    end
+
+    g_uninstallArmed = false;
+    local ok, code = DllLoader.UninstallLoader();
+    if ok then
+        g_uninstalled = true;
+        SetUninstallStatus(Text("LOC_CIV6DLLLOADER_UNINSTALL_DONE"));
+    elseif code == nil or code == 0 then
+        SetUninstallStatus(Text("LOC_CIV6DLLLOADER_UNINSTALL_NOTPROXY"));
+    else
+        SetUninstallStatus(string.format(Text("LOC_CIV6DLLLOADER_UNINSTALL_FAILED"), tostring(code)));
+    end
+    UpdateUninstallButton();
+    UI.PlaySound("Play_UI_Click");
+end
+
 local function ApplyLocalizedText()
     -- Label / Button / GridButton 都有 SetText；逐个显式列出而不是遍历 Controls，
     -- 写错 ID 时能立刻在日志里看出是哪个控件没生效。
@@ -162,6 +349,8 @@ local function ApplyLocalizedText()
         -- 不是 SetText，也不是 SetToolTip。
         Controls.LoaderOpenButton:SetToolTipString(Text("LOC_CIV6DLLLOADER_OPEN_TOOLTIP"));
     end
+    -- 卸载按钮的文字与 tooltip 都在这里落地（tooltip 含 Mod 名单，要走一次 Loader）。
+    UpdateUninstallButton();
 end
 
 local function ReadGlobalState()
@@ -251,6 +440,12 @@ local function SetPanelOpen(open)
     Controls.LoaderPanelRoot:SetHide(not open);
     if open then
         RefreshCheckBoxes();
+        -- 每次打开都重问一次 Mod 名单（用户可能刚在 Additional Content 里改过启用集），
+        -- 同时把二次确认状态清回初始：上次没点第二下的确认不该留到这次。
+        g_uninstallArmed = false;
+        UpdateUninstallButton();
+    else
+        g_uninstallArmed = false;
     end
 
     UI.PlaySound(open and "UI_Screen_Open" or "UI_Screen_Close");
@@ -291,6 +486,8 @@ function OnInit(isReload)
     AddClickAndHover(Controls.LoaderPanelClose, function()
         SetPanelOpen(false);
     end);
+
+    AddClickAndHover(Controls.LoaderUninstallButton, OnUninstallClicked);
 
     -- 文本必须在 BindCheckBox 之前落地：BindCheckBox 会 SetSelected，
     -- 但不碰文字；顺序其实无所谓，这里放前面是为了让"界面先有字"更直观。

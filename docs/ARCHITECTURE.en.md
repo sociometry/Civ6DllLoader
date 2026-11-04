@@ -415,6 +415,8 @@ DllLoader.GetGlobalState()        --> boolean
 DllLoader.SetGlobalState(true)    --> boolean (whether the disk write succeeded)
 DllLoader.GetGameCoreState()      --> boolean
 DllLoader.SetGameCoreState(false) --> boolean
+DllLoader.GetLoaderUserMods(lang) --> { { name = "FourRing", enabled = true }, ... }
+DllLoader.UninstallLoader()       --> boolean ok, number win32Error
 ```
 
 This path is separate from the `RegisterGlobalScript` used by plugins: the latter uses `RequirePluginOwner` to
@@ -1275,8 +1277,11 @@ arguments **pushed on the spot** by the plugin's `pushFn` (the loader is the one
 The main menu's frontend UI does not go through the plugin ABI: it is the loader itself hanging a context into the game's ForgeUI tree.
 
 1. **Resources**: `UiInject::ExtractResources()` (phase A, see §1.4) extracts the
-   `Civ6DllLoader_FrontEndUI.{lua,xml}` of RCDATA 103/104 into `<exe directory>\Civ6DllLoader\`; it skips if the target file already
-   exists (users may edit it on disk), writes with `CREATE_NEW`, and treats "someone else already put it there" as a benign race;
+   `Civ6DllLoader_FrontEndUI.{lua,xml}` of RCDATA 103/104 into `<exe directory>\Civ6DllLoader\`. Whether to overwrite is decided by the
+   `@ui-version=N` marker in the file header (see `kUiResourceVersion`): only a disk version lower than the embedded one is overwritten,
+   an equal one is kept — so "the user edited the copy" and "the loader upgraded the panel" do not fight each other. **Changing the
+   resources requires bumping that constant and both file-header markers together**, otherwise existing installs keep the old panel and new
+   controls never appear;
 2. **Hook**: `UiInject::Install()` detours `MainMenuState::LoadUI` (an independent exe-domain hook, unrelated to the site table,
    see §5.5). The detour calls the original function first (FrontEnd and InvitePopup are created by the game itself), then
    `RunInjectionSafely`;
@@ -1300,6 +1305,32 @@ The main menu's frontend UI does not go through the plugin ABI: it is the loader
    happens to land at the same address (ABA), that refresh is judged "the same object" and returns early, and the Mod UI only comes back the
    next time the FrontEnd address changes. Changing the criterion would need a game-side object generation counter, which the loader cannot
    obtain.
+
+### 6.8 Uninstalling the loader (button at the bottom of the settings panel)
+
+The panel has an "Uninstall Loader" button; uninstalling means renaming the file:
+
+- **Action**: `LoaderUsage::UninstallSelf` renames `<exe>\winmm.dll` to `<exe>\winmm_Old.dll`. The image is opened with
+  `FILE_SHARE_DELETE` (the same mechanism as the proxy migration in §1.1), so the rename does not affect the current session; on the next
+  launch there is no `winmm.dll` in the exe directory and the game loads the system one. It **does not touch** `version.dll`: any install
+  that reaches this point already had its legacy proxy retired by the self-update and the migration at startup;
+- **Precondition**: the module's own file name must be `winmm.dll`. Loading it directly from `x64\Release` during development is refused,
+  so a development build is never renamed;
+- **Two-step confirmation**: the first click only changes the button text to "Click again to confirm uninstall"; the second one performs
+  the rename (which is not reversible except by reinstalling). Closing the panel or pressing ESC resets the confirmation state;
+- **Why rename instead of delete**: it is reversible and cannot fail with "file is in use"; `winmm_Old.dll` is reclaimed by the cleanup
+  section of the next loader start (`LoaderUpdate`, §2.4);
+- **Where the list comes from**: `DllLoader.GetLoaderUserMods(language)` scans the `Binaries\Win64` of **all** mods at call time
+  (shell / runtime / plugin DLL, any match counts; see `LoaderUsage::UsesThisLoader`) and returns
+  `{ { name = "FourRing", enabled = true }, ... }`. C++ resolves the name from `Mods.sqlite`'s `LocalizedText` in the current language,
+  then `en_US`, then the raw `<Name>` — **not** with `Locale.Lookup`: a `.modinfo` `<LocalizedText>` block goes into `Mods.sqlite` only,
+  never into the runtime `Localization` table. The warning is grounded in reality: an enabled mod's thin shell will find `winmm.dll`
+  missing on the next match and install it right back;
+- **Disabled mods are listed too**, followed by a red "(disabled)" (`[ICON_BULLET]` bullet + `[COLOR_RED]...[ENDCOLOR]`, both standard
+  game UI markup). Reason: the user should see that the mod also depends on the loader even while it is switched off, otherwise the
+  loader reappearing after they re-enable it looks inexplicable;
+- **Boundaries**: if `Mods.sqlite` is unreadable the list is empty and the tooltip degrades to "no mod uses this loader"; names none of
+  the three candidates resolve are shown with the `LOC_` prefix and underscores stripped, so a raw `LOC_XXX_NAME` is never shown.
 
 ---
 

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--@ui-version=1-->
+<!--@ui-version=6-->
 <!--
   ===========================================================================
   Civ6DllLoader_FrontEndUI.xml —— Loader 的主菜单设置面板
@@ -70,7 +70,7 @@
              警告 FontNormal18 暗红。说明与警告都比初版大两档，因为这是玩家
              真正需要读进去的"什么时候生效 / 关掉会有什么代价"。
              布局不用 Stack（Stack 横向永远左对齐，说明文字要居中）。 -->
-        <Grid ID="LoaderPanelFrame" Anchor="C,C" Size="780,400" Padding="0,0"
+        <Grid ID="LoaderPanelFrame" Anchor="C,C" Size="780,440" Padding="0,0"
               Style="WindowFrameTitle" ConsumeAllMouse="1">
 
             <Button ID="LoaderPanelClose" Anchor="R,T" Offset="0,0"
@@ -138,6 +138,22 @@
                    Anchor="C,T" Offset="0,272" WrapWidth="700" Align="Center"
                    Color="128,32,32,255" EffectColor="255,255,255,160"
                    String="LOC_CIV6DLLLOADER_WARN_GAMECORE" />
+
+            <!-- 卸载按钮。lua 里二次确认：第一次点变「再次点击确认卸载」，第二次才执行。
+                 ToolTip 在面板打开时动态拼（含「使用本加载器的 Mod」名单），这里给的
+                 LOC_ 只是打开前占位。
+                 Style 用本体的 ButtonRed（红底 + DenyButton 红色发光字，见 Civ6_Styles.xml:682），
+                 本体凡「删除 / 取消 / 宣战」这类破坏性按钮都用它（Options.xml:502、Mods.xml:186），
+                 尺寸一律 200,41；这里保持宽度 260、取同一高度 41，9-slice 才不会被压扁。 -->
+            <GridButton ID="LoaderUninstallButton" Style="ButtonRed"
+                        Anchor="C,T" Offset="0,330" Size="260,41"
+                        String="LOC_CIV6DLLLOADER_UNINSTALL"
+                        ToolTip="LOC_CIV6DLLLOADER_UNINSTALL_HEAD" />
+
+            <!-- 卸载结果：成功=绿字提示重启，失败=暗红字带错误码 -->
+            <Label ID="LoaderUninstallStatus" Style="FontNormal16" FontStyle="Stroke"
+                   Anchor="C,T" Offset="0,382" WrapWidth="700" Align="Center"
+                   Color="28,48,72,255" EffectColor="255,255,255,180" />
 
         </Grid>
 
